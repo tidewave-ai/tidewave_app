@@ -44,6 +44,12 @@
           "description": "Specify the port where Tidewave Web will be served.",
           "short": "p",
           "takesValue": true
+        },
+        {
+          "name": "debug",
+          "description": "Enable debug logging",
+          "short": "d",
+          "takesValue": false
         }
       ],
       "subcommands": {
@@ -55,6 +61,12 @@
               "description": "Specify the port where Tidewave Web will be served.",
               "short": "p",
               "takesValue": true
+            },
+            {
+              "name": "debug",
+              "description": "Enable debug logging",
+              "short": "d",
+              "takesValue": false
             }
           ]
         }

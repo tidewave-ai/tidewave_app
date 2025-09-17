@@ -8,67 +8,89 @@ use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
+use tracing::{debug, info, error};
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|_app, args, _cwd| {
-            println!("a new app instance was opened with {args:?} and the deep link event was already triggered");
+            debug!("a new app instance was opened with {args:?} and the deep link event was already triggered");
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let mut port = 3000;
             let mut serve_only = false;
+            let mut debug_mode = false;
 
             match app.cli().matches() {
                 Ok(matches) => {
-                    println!("CLI matches: {:?}", matches);
+                    // Check for debug flag at root level
+                    if let Some(debug_arg) = matches.args.get("debug") {
+                        if let Some(value) = debug_arg.value.as_bool() {
+                            debug_mode = value;
+                        }
+                    }
 
                     // Check for port argument at root level
                     if let Some(port_arg) = matches.args.get("port") {
-                        println!("Port arg found at root: {:?}", port_arg);
                         if let Some(port_str) = port_arg.value.as_str() {
                             if let Ok(p) = port_str.parse::<u16>() {
                                 port = p;
-                                println!("Using port from root args: {}", port);
                             }
                         }
                     }
 
                     // Check if serve subcommand was used
                     if let Some(subcommand) = matches.subcommand {
-                        println!("Subcommand: {:?}", subcommand.name);
                         if subcommand.name == "serve" {
                             serve_only = true;
 
-                            // Check for port argument in subcommand args
-                            if let Some(port_arg) = subcommand.matches.args.get("port") {
-                                println!("Port arg found in subcommand: {:?}", port_arg);
-                                if let Some(port_str) = port_arg.value.as_str() {
-                                    if let Ok(p) = port_str.parse::<u16>() {
-                                        port = p;
-                                        println!("Using port from subcommand args: {}", port);
-                                    }
+                            // Check for debug flag in subcommand args
+                            if let Some(debug_arg) = subcommand.matches.args.get("debug") {
+                                if let Some(value) = debug_arg.value.as_bool() {
+                                    debug_mode = value;
                                 }
                             }
 
-                            println!("Starting in server-only mode on port {}", port);
+                            // Check for port argument in subcommand args
+                            if let Some(port_arg) = subcommand.matches.args.get("port") {
+                                if let Some(port_str) = port_arg.value.as_str() {
+                                    if let Ok(p) = port_str.parse::<u16>() {
+                                        port = p;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    println!("CLI parse error: {:?}", e);
-                }
+                Err(_) => {}
+            }
+
+            // Initialize tracing
+            let filter = if debug_mode {
+                "debug"
+            } else {
+                "info"
+            };
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+
+            if debug_mode {
+                debug!("Debug logging enabled");
+                debug!("Port: {}", port);
+                debug!("Serve only: {}", serve_only);
             }
 
             // If serve subcommand, run only the HTTP server
             if serve_only {
+                info!("Starting in server-only mode on port {}", port);
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
                 rt.block_on(async move {
                     if let Err(e) = server::start_http_server(port).await {
-                        eprintln!("HTTP server error: {}", e);
+                        error!("HTTP server error: {}", e);
                         std::process::exit(1);
                     }
                 });
@@ -111,14 +133,14 @@ pub fn run() {
             .icon(app.default_window_icon().unwrap().clone())
             .on_menu_event(|app, event| match event.id.as_ref() {
                 "quit" => {
-                    dbg!("quit menu item was clicked");
+                    debug!("quit menu item was clicked");
                     app.exit(0);
                 }
                 "test" => {
-                    println!("test menu item clicked");
+                    debug!("test menu item clicked");
                 }
                 _ => {
-                    println!("menu item {:?} not handled", event.id);
+                    debug!("menu item {:?} not handled", event.id);
                 }
             })
             .build(app)?;
@@ -136,7 +158,7 @@ fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
             url.as_str().replacen("tidewave://", "https://", 1)
         };
 
-        dbg!(&s);
+        debug!("Handling tidewave URL: {}", s);
 
         app_handle
             .opener()
