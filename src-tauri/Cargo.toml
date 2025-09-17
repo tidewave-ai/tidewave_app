@@ -30,6 +30,9 @@ tokio = { version = "1", features = ["full"] }
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
 tauri-plugin-single-instance = { version = "2.0.0", features = ["deep-link"] }
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-cli = "2"
+
 [patch.crates-io]
 # TODO: upstream
 tao = { git = "https://github.com/wojtekmach/tao.git", branch = "wm-bundled-activation-policy" }
