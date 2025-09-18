@@ -66,6 +66,7 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
                 proxy_handler(params, req, client)
             })
         )
+        .route("/acp", get(crate::acp::acp_handler))
         .layer(middleware::from_fn(move |mut req: Request, next| {
             req.extensions_mut().insert(config.clone());
             verify_origin(req, next)
