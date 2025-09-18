@@ -1,7 +1,8 @@
 use axum::{
     body::Body,
     extract::{Query, Request},
-    http::{StatusCode},
+    http::{header, StatusCode},
+    middleware,
     response::{Html, Response},
     routing::get,
     Router,
@@ -17,8 +18,45 @@ struct ProxyParams {
     url: String,
 }
 
+#[derive(Clone)]
+struct ServerConfig {
+    allowed_origins: Vec<String>,
+}
+
+async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
+    let headers = req.headers();
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        let config = req
+            .extensions()
+            .get::<ServerConfig>()
+            .ok_or_else(|| {
+                error!("ServerConfig not found in request extensions");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if !config.allowed_origins.contains(&origin_str.to_string()) {
+            debug!("Rejected request with origin: {}", origin_str);
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        return Ok(next.run(req).await);
+    }
+
+    Ok(next.run(req).await)
+}
+
 pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
+
+    let config = ServerConfig {
+        allowed_origins: vec![
+            format!("http://localhost:{}", port),
+            format!("http://127.0.0.1:{}", port),
+        ],
+    };
 
     let app = Router::new()
         .route("/", get(root))
@@ -27,9 +65,13 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
                 let client = client.clone();
                 proxy_handler(params, req, client)
             })
-        );
+        )
+        .layer(middleware::from_fn(move |mut req: Request, next| {
+            req.extensions_mut().insert(config.clone());
+            verify_origin(req, next)
+        }));
 
-    let listener = TcpListener::bind(&format!("0.0.0.0:{}", port)).await?;
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
     info!("HTTP server running on port {}", port);
     axum::serve(listener, app).await?;
     Ok(())
