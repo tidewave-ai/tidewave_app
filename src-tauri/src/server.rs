@@ -114,6 +114,7 @@ async fn root() -> Html<String> {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="tidewave:source" content="cli" />
     <script type="module" src="{}/tc/tc.js"></script>
   </head>
   <body></body>
