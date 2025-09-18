@@ -337,7 +337,7 @@ pub async fn mcp_remote_client_handler(
 
     // If this is a request, wait for the response
     if let Some(response_rx) = response_rx {
-        match timeout(Duration::from_secs(30), response_rx).await {
+        match timeout(Duration::from_secs(60), response_rx).await {
             Ok(Ok(response)) => Ok(Json(response)),
             Ok(Err(_)) => {
                 error!("Response channel closed unexpectedly");
@@ -345,7 +345,16 @@ pub async fn mcp_remote_client_handler(
             }
             Err(_) => {
                 error!("Timeout waiting for response");
-                Err(StatusCode::REQUEST_TIMEOUT)
+                // Return proper JSON-RPC error format for timeout
+                let timeout_error = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": json_rpc_message.get("id"),
+                    "error": {
+                        "code": -32000,
+                        "message": "timed out waiting for answer"
+                    }
+                });
+                Ok(Json(timeout_error))
             }
         }
     } else {
