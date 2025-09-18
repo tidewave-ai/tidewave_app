@@ -20,7 +20,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let mut port = 3000;
+            let mut port = 9999;
             let mut serve_only = false;
             let mut debug_mode = false;
 
