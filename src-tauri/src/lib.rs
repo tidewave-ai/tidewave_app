@@ -6,7 +6,7 @@ use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
-use tracing::{debug, info, error};
+use tracing::{debug, error, info};
 
 pub fn run() {
     tauri::Builder::default()

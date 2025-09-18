@@ -1,7 +1,10 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Query},
-    response::Response,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query,
+    },
     http::StatusCode,
+    response::Response,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::Deserialize;
@@ -26,7 +29,10 @@ pub async fn acp_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("ACP WebSocket connection requested for command: {}", params.command);
+    info!(
+        "ACP WebSocket connection requested for command: {}",
+        params.command
+    );
 
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, params.command)))
 }
