@@ -26,9 +26,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
 tauri-plugin-single-instance = { version = "2.0.0", features = ["deep-link"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-cli = "2"
 
 [patch.crates-io]
 # TODO: upstream

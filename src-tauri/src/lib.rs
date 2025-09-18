@@ -1,26 +1,107 @@
+mod server;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_opener::OpenerExt;
+use tracing::{debug, info, error};
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|_app, args, _cwd| {
-            println!("a new app instance was opened with {args:?} and the deep link event was already triggered");
+            debug!("a new app instance was opened with {args:?} and the deep link event was already triggered");
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let mut port = 9999;
+            let mut serve_only = false;
+            let mut debug_mode = false;
+
+            match app.cli().matches() {
+                Ok(matches) => {
+                    // Check for debug flag at root level
+                    if let Some(debug_arg) = matches.args.get("debug") {
+                        if let Some(value) = debug_arg.value.as_bool() {
+                            debug_mode = value;
+                        }
+                    }
+
+                    // Check for port argument at root level
+                    if let Some(port_arg) = matches.args.get("port") {
+                        if let Some(port_str) = port_arg.value.as_str() {
+                            if let Ok(p) = port_str.parse::<u16>() {
+                                port = p;
+                            }
+                        }
+                    }
+
+                    // Check if serve subcommand was used
+                    if let Some(subcommand) = matches.subcommand {
+                        if subcommand.name == "serve" {
+                            serve_only = true;
+
+                            // Check for debug flag in subcommand args
+                            if let Some(debug_arg) = subcommand.matches.args.get("debug") {
+                                if let Some(value) = debug_arg.value.as_bool() {
+                                    debug_mode = value;
+                                }
+                            }
+
+                            // Check for port argument in subcommand args
+                            if let Some(port_arg) = subcommand.matches.args.get("port") {
+                                if let Some(port_str) = port_arg.value.as_str() {
+                                    if let Ok(p) = port_str.parse::<u16>() {
+                                        port = p;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+
+            // Initialize tracing
+            let filter = if debug_mode {
+                "debug"
+            } else {
+                "info"
+            };
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+
+            if debug_mode {
+                debug!("Debug logging enabled");
+                debug!("Port: {}", port);
+                debug!("Serve only: {}", serve_only);
+            }
+
+            // If serve subcommand, run only the HTTP server
+            if serve_only {
+                info!("Starting in server-only mode on port {}", port);
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+                rt.block_on(async move {
+                    if let Err(e) = server::start_http_server(port).await {
+                        error!("HTTP server error: {}", e);
+                        std::process::exit(1);
+                    }
+                });
+                return Ok(());
+            }
+
+            // Normal GUI mode
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             app.deep_link()
                 .register("tidewave")
                 .expect("failed to register tidewave:// handler");
-
-            let port = 3000;
 
             if let Some(urls) = app.deep_link().get_current()? {
                 handle_urls(&app.handle(), port, &urls);
@@ -33,7 +114,7 @@ pub fn run() {
 
             let app_handle_for_server = app.handle().clone();
             let _server_handle = tauri::async_runtime::spawn(async move {
-                if let Err(e) = start_http_server(port).await {
+                if let Err(e) = server::start_http_server(port).await {
                     app_handle_for_server.dialog()
                         .message(format!("HTTP server error: {}", e))
                         .kind(MessageDialogKind::Error)
@@ -52,14 +133,14 @@ pub fn run() {
             .icon(app.default_window_icon().unwrap().clone())
             .on_menu_event(|app, event| match event.id.as_ref() {
                 "quit" => {
-                    dbg!("quit menu item was clicked");
+                    debug!("quit menu item was clicked");
                     app.exit(0);
                 }
                 "test" => {
-                    println!("test menu item clicked");
+                    debug!("test menu item clicked");
                 }
                 _ => {
-                    println!("menu item {:?} not handled", event.id);
+                    debug!("menu item {:?} not handled", event.id);
                 }
             })
             .build(app)?;
@@ -77,27 +158,14 @@ fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
             url.as_str().replacen("tidewave://", "https://", 1)
         };
 
-        dbg!(&s);
+        debug!("Handling tidewave URL: {}", s);
 
         app_handle
             .opener()
-            .open_path(&format!("http://localhost:{}?path={}", port, s), None::<&str>)
+            .open_path(
+                &format!("http://localhost:{}?path={}", port, s),
+                None::<&str>,
+            )
             .expect("could not open url");
     }
-}
-
-async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = axum::Router::new().route("/", axum::routing::get(root));
-
-    let listener = tokio::net::TcpListener::bind(&format!("0.0.0.0:{}", port))
-        .await?;
-    println!("HTTP server running on {}", port);
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn root() -> axum::response::Html<&'static str> {
-    axum::response::Html(
-        "<h1>Hello, World!</h1><p>This is a simple Axum web server running in Tauri.</p>",
-    )
 }

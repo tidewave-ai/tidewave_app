@@ -35,6 +35,42 @@
       "desktop": {
         "schemes": ["tidewave"]
       }
+    },
+    "cli": {
+      "description": "Tidewave CLI",
+      "args": [
+        {
+          "name": "port",
+          "description": "Specify the port where Tidewave Web will be served.",
+          "short": "p",
+          "takesValue": true
+        },
+        {
+          "name": "debug",
+          "description": "Enable debug logging",
+          "short": "d",
+          "takesValue": false
+        }
+      ],
+      "subcommands": {
+        "serve": {
+          "description": "Serve Tidewave Web at the configured --port.",
+          "args": [
+            {
+              "name": "port",
+              "description": "Specify the port where Tidewave Web will be served.",
+              "short": "p",
+              "takesValue": true
+            },
+            {
+              "name": "debug",
+              "description": "Enable debug logging",
+              "short": "d",
+              "takesValue": false
+            }
+          ]
+        }
+      }
     }
   }
 }
