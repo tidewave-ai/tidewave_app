@@ -1,5 +1,3 @@
-mod server;
-
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -89,7 +87,7 @@ pub fn run() {
                 info!("Starting in server-only mode on port {}", port);
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
                 rt.block_on(async move {
-                    if let Err(e) = server::start_http_server(port).await {
+                    if let Err(e) = tidewave_core::start_http_server(port).await {
                         error!("HTTP server error: {}", e);
                         std::process::exit(1);
                     }
@@ -114,7 +112,7 @@ pub fn run() {
 
             let app_handle_for_server = app.handle().clone();
             let _server_handle = tauri::async_runtime::spawn(async move {
-                if let Err(e) = server::start_http_server(port).await {
+                if let Err(e) = tidewave_core::start_http_server(port).await {
                     app_handle_for_server.dialog()
                         .message(format!("HTTP server error: {}", e))
                         .kind(MessageDialogKind::Error)
