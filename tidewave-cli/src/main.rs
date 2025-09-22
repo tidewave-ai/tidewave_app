@@ -35,9 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let filter = if debug { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if debug {
         debug!("Debug logging enabled");

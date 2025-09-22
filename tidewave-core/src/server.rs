@@ -23,19 +23,19 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
+async fn verify_origin(
+    req: Request,
+    next: axum::middleware::Next,
+) -> Result<Response<Body>, StatusCode> {
     let headers = req.headers();
 
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        let config = req
-            .extensions()
-            .get::<ServerConfig>()
-            .ok_or_else(|| {
-                error!("ServerConfig not found in request extensions");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+            error!("ServerConfig not found in request extensions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         if !config.allowed_origins.contains(&origin_str.to_string()) {
             debug!("Rejected request with origin: {}", origin_str);
