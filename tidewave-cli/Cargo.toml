@@ -1,0 +1,15 @@
+[package]
+name = "tidewave-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tidewave"
+path = "src/main.rs"
+
+[dependencies]
+tidewave-core = { path = "../tidewave-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "ai.tidewave.desktop",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": null
   },
   "app": {
     "withGlobalTauri": true,
