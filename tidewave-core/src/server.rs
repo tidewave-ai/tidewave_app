@@ -51,6 +51,7 @@ async fn verify_origin(
 pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
+    let acp_state = crate::acp_server::AcpServerState::new();
 
     let config = ServerConfig {
         allowed_origins: vec![
@@ -71,6 +72,17 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
         )
         .with_state(mcp_state);
 
+    // Create ACP routes
+    let acp_routes = Router::new()
+        .route("/acp/connections", post(crate::acp_server::create_connections))
+        .route("/acp/connections", get(crate::acp_server::list_connections))
+        .route("/acp/connections/sse", get(crate::acp_server::connection_updates_sse))
+        .route("/acp/sessions", post(crate::acp_server::create_session))
+        .route("/acp/sessions", get(crate::acp_server::list_sessions))
+        .route("/acp/:sessionId/update", post(crate::acp_server::session_update))
+        .route("/acp/:sessionId/sse", get(crate::acp_server::session_sse))
+        .with_state(acp_state);
+
     // Create the main app without state
     let app = Router::new()
         .layer(middleware::from_fn(move |mut req: Request, next| {
@@ -85,8 +97,8 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
                 proxy_handler(params, req, client)
             }),
         )
-        .route("/acp", get(crate::acp::acp_handler))
-        .merge(mcp_routes);
+        .merge(mcp_routes)
+        .merge(acp_routes);
 
     let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
     info!("HTTP server running on port {}", port);

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//oss/agent-client-protocol/rust/**)",
+      "Read(//oss/rust-sdk/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

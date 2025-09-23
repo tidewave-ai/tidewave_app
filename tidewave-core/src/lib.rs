@@ -1,4 +1,4 @@
-mod acp;
+mod acp_server;
 mod mcp_remote;
 pub mod server;
 

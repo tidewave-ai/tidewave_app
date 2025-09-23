@@ -14,3 +14,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+async-stream = "0.3"
+anyhow = "1.0"
+agent-client-protocol = "0.4.2"
+tokio-util = { version = "0.7", features = ["compat"] }
