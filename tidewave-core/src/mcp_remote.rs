@@ -5,7 +5,7 @@ use axum::{
         Query, State,
     },
     http::StatusCode,
-    response::{Json, Response},
+    response::{IntoResponse, Json, Response},
 };
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
@@ -298,7 +298,7 @@ pub async fn mcp_remote_client_handler(
     Query(params): Query<McpParams>,
     State(state): State<McpRemoteState>,
     body: Bytes,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let session_id = params.session_id.ok_or(StatusCode::BAD_REQUEST)?;
 
     debug!("MCP Remote client request for session: {}", session_id);
@@ -308,6 +308,12 @@ pub async fn mcp_remote_client_handler(
         error!("Failed to parse JSON-RPC message: {}", e);
         StatusCode::BAD_REQUEST
     })?;
+
+    // Basic validation that this looks like a JSON-RPC message
+    if json_rpc_message.get("jsonrpc").is_none() {
+        error!("Invalid JSON-RPC message: missing 'jsonrpc' field");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // Look up the session in the registry
     let session = state.registry.get(&session_id).ok_or_else(|| {
@@ -335,10 +341,13 @@ pub async fn mcp_remote_client_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // If this is a request, wait for the response
+    // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {
         match timeout(Duration::from_secs(60), response_rx).await {
-            Ok(Ok(response)) => Ok(Json(response)),
+            Ok(Ok(response)) => {
+                debug!("Got response: {:?}", response);
+                Ok(Json(response).into_response())
+            }
             Ok(Err(_)) => {
                 error!("Response channel closed unexpectedly");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -354,11 +363,14 @@ pub async fn mcp_remote_client_handler(
                         "message": "timed out waiting for answer"
                     }
                 });
-                Ok(Json(timeout_error))
+                Ok(Json(timeout_error).into_response())
             }
         }
     } else {
-        // This is a notification, no response expected
-        Ok(Json(serde_json::json!({"status": "ok"})))
+        // This is a notification or response - return HTTP 202 Accepted with no body
+        Ok(Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .body(axum::body::Body::empty())
+            .unwrap())
     }
 }

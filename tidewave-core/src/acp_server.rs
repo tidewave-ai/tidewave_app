@@ -1,17 +1,19 @@
-use agent_client_protocol as acp;
+use agent_client_protocol::{self as acp, Agent};
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        Json,
+        IntoResponse, Json,
     },
 };
 use dashmap::DashMap;
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -24,13 +26,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    process::{Child, Command},
+    process::Command,
     sync::{mpsc, oneshot, Mutex, RwLock},
     task::{JoinHandle, LocalSet},
     time::timeout,
 };
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, error, info};
 
 // ============================================================================
 // Types and State
@@ -41,13 +42,11 @@ pub struct AcpServerState {
     /// Active ACP connections (id -> connection)
     pub connections: Arc<DashMap<String, Arc<AcpConnection>>>,
     /// Active sessions (session_id -> session)
-    pub sessions: Arc<DashMap<String, Arc<AcpSession>>>,
-    /// SSE connections for sessions (session_id -> SSE sender)
-    pub sse_connections: Arc<DashMap<String, mpsc::UnboundedSender<SseMessage>>>,
+    pub sessions: Arc<DashMap<acp::SessionId, Arc<AcpSession>>>,
+    /// WebSocket connections for sessions (session_id -> WebSocket sender)
+    pub ws_connections: Arc<DashMap<acp::SessionId, mpsc::UnboundedSender<ServerMessage>>>,
     /// Connection status updates SSE
     pub connection_updates: Arc<RwLock<Vec<mpsc::UnboundedSender<ConnectionUpdate>>>>,
-    /// JSON-RPC ID counter
-    pub rpc_id_counter: Arc<AtomicU64>,
 }
 
 impl AcpServerState {
@@ -55,14 +54,9 @@ impl AcpServerState {
         Self {
             connections: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
-            sse_connections: Arc::new(DashMap::new()),
+            ws_connections: Arc::new(DashMap::new()),
             connection_updates: Arc::new(RwLock::new(Vec::new())),
-            rpc_id_counter: Arc::new(AtomicU64::new(1)),
         }
-    }
-
-    pub fn next_rpc_id(&self) -> u64 {
-        self.rpc_id_counter.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -82,32 +76,28 @@ pub struct AcpConnection {
     pub capabilities: Arc<RwLock<Option<acp::AgentCapabilities>>>,
     /// Channel to send requests to the agent task
     pub agent_tx: mpsc::UnboundedSender<AgentRequest>,
-    /// Handle to the process
-    pub process_handle: Arc<Mutex<Option<Child>>>,
     /// Handle to the local set running the agent
     pub local_set_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 pub struct AcpSession {
-    pub id: String,
+    pub id: acp::SessionId,
     pub acp_id: String,
-    pub acp_session_id: acp::SessionId,
-    pub pending_requests: Arc<DashMap<u64, oneshot::Sender<Value>>>,
-    pub message_buffer: Arc<RwLock<Vec<SseMessage>>>,
-    pub sse_id_counter: Arc<AtomicU64>,
+    pub pending_requests: Arc<DashMap<u64, oneshot::Sender<acp::ClientResponse>>>,
+    pub message_buffer: Arc<RwLock<Vec<ServerMessage>>>,
+    pub ws_id_counter: Arc<AtomicU64>,
 }
 
 /// Requests we can send to the agent task
 #[derive(Debug)]
 pub enum AgentRequest {
     NewSession {
-        session_id: String,
         response: oneshot::Sender<Result<acp::SessionId, String>>,
     },
     Prompt {
         session_id: acp::SessionId,
         messages: Vec<acp::ContentBlock>,
-        response: oneshot::Sender<Result<(), String>>,
+        response: oneshot::Sender<Result<acp::PromptResponse, String>>,
     },
 }
 
@@ -122,14 +112,48 @@ impl ClientImpl {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ClientMessage {
+    #[serde(rename = "prompt")]
+    Prompt {
+        id: u64,
+        messages: Vec<acp::ContentBlock>,
+    },
+    #[serde(rename = "permission-response")]
+    PermissionResponse {
+        id: u64,
+        response: acp::RequestPermissionResponse,
+    },
+    #[serde(rename = "ack")]
+    Ack {
+        #[serde(rename = "latestId")]
+        latest_id: u64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
-pub enum SseMessage {
-    #[serde(rename = "acp-jsonrpc")]
-    AcpJsonRpc {
+pub enum ServerMessage {
+    #[serde(rename = "session-notification")]
+    SessionNotification {
         id: u64,
-        #[serde(rename = "jsonRpcMessage")]
-        json_rpc_message: Value,
+        params: acp::SessionNotification,
+    },
+    #[serde(rename = "permission-request")]
+    PermissionRequest {
+        id: u64,
+        params: acp::RequestPermissionRequest,
+    },
+    #[serde(rename = "prompt-response")]
+    PromptResponse {
+        id: u64,
+        #[serde(rename = "response-type")]
+        response_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response: Option<acp::PromptResponse>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     #[serde(rename = "exit")]
     Exit { id: u64 },
@@ -170,24 +194,16 @@ pub struct CreateSessionRequest {
 
 #[derive(Serialize)]
 pub struct CreateSessionResponse {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<acp::SessionId>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct SessionUpdateRequest {
-    pub jsonrpc: String,
-    pub id: u64,
-    pub result: Option<Value>,
-    pub error: Option<Value>,
-}
-
 #[derive(Serialize)]
 pub struct SessionInfo {
-    pub id: String,
+    pub id: acp::SessionId,
     #[serde(rename = "acpId")]
     pub acp_id: String,
 }
@@ -196,6 +212,7 @@ pub struct SessionInfo {
 // ACP Client Implementation
 // ============================================================================
 
+#[async_trait::async_trait(?Send)]
 impl acp::Client for ClientImpl {
     async fn request_permission(
         &self,
@@ -206,53 +223,33 @@ impl acp::Client for ClientImpl {
             .state
             .sessions
             .iter()
-            .find(|entry| entry.value().acp_session_id == args.session_id)
+            .find(|entry| entry.value().id == args.session_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| acp::Error::Internal(anyhow!("Session not found")))?;
+            .ok_or_else(|| acp::Error::internal_error())?;
 
-        let rpc_id = self.state.next_rpc_id();
+        let ws_id = session.ws_id_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
 
-        session.pending_requests.insert(rpc_id, tx);
+        session.pending_requests.insert(ws_id, tx);
 
-        let sse_id = session.sse_id_counter.fetch_add(1, Ordering::Relaxed);
-        let json_rpc = json!({
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": session.id,
-                "toolCall": args.tool_call,
-                "options": args.options,
-            }
-        });
-
-        let message = SseMessage::AcpJsonRpc {
-            id: sse_id,
-            json_rpc_message: json_rpc,
+        let message = ServerMessage::PermissionRequest {
+            id: ws_id,
+            params: args,
         };
 
-        // Send to SSE or buffer
-        if let Some(sse_tx) = self.state.sse_connections.get(&session.id) {
-            let _ = sse_tx.send(message.clone());
+        // Send to WebSocket or buffer
+        if let Some(ws_tx) = self.state.ws_connections.get(&session.id) {
+            let _ = ws_tx.send(message.clone());
         } else {
             session.message_buffer.write().await.push(message.clone());
         }
 
         // Wait for response with timeout
         match timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(response)) => {
-                if let Some(result) = response.get("result") {
-                    serde_json::from_value(result.clone())
-                        .map_err(|e| acp::Error::Internal(anyhow!("Failed to parse response: {}", e)))
-                } else if let Some(error) = response.get("error") {
-                    Err(acp::Error::Internal(anyhow!("RPC error: {:?}", error)))
-                } else {
-                    Err(acp::Error::Internal(anyhow!("Invalid response format")))
-                }
-            }
-            Ok(Err(_)) => Err(acp::Error::Internal(anyhow!("Response channel closed"))),
-            Err(_) => Err(acp::Error::Internal(anyhow!("Request timed out"))),
+            Ok(Ok(acp::ClientResponse::RequestPermissionResponse(response))) => Ok(response),
+            Ok(Ok(_)) => Err(acp::Error::internal_error()), // Wrong response type
+            Ok(Err(_)) => Err(acp::Error::internal_error()),
+            Err(_) => Err(acp::Error::internal_error()),
         }
     }
 
@@ -260,50 +257,39 @@ impl acp::Client for ClientImpl {
         &self,
         _args: acp::WriteTextFileRequest,
     ) -> Result<acp::WriteTextFileResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "fs.writeTextFile".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
     async fn read_text_file(
         &self,
         _args: acp::ReadTextFileRequest,
     ) -> Result<acp::ReadTextFileResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "fs.readTextFile".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
-    async fn session_notification(
-        &self,
-        args: acp::SessionNotification,
-    ) -> Result<(), acp::Error> {
+    async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
         // Find the session by ACP session ID
         let session = self
             .state
             .sessions
             .iter()
-            .find(|entry| entry.value().acp_session_id == args.session_id)
+            .find(|entry| entry.value().id == args.session_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| acp::Error::Internal(anyhow!("Session not found")))?;
+            .ok_or_else(|| acp::Error::internal_error())?;
 
-        let sse_id = session.sse_id_counter.fetch_add(1, Ordering::Relaxed);
-        let json_rpc = json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": serde_json::to_value(&args)
-                .map_err(|e| acp::Error::Internal(anyhow!("Serialization error: {}", e)))?
-        });
+        let ws_id = session.ws_id_counter.fetch_add(1, Ordering::Relaxed);
 
-        let message = SseMessage::AcpJsonRpc {
-            id: sse_id,
-            json_rpc_message: json_rpc,
+        let message = ServerMessage::SessionNotification {
+            id: ws_id,
+            params: args,
         };
 
-        // Send to SSE or buffer
-        if let Some(sse_tx) = self.state.sse_connections.get(&session.id) {
-            let _ = sse_tx.send(message.clone());
+        // Send to WebSocket or buffer
+        if let Some(ws_tx) = self.state.ws_connections.get(&session.id) {
+            debug!("Got WebSocket connection, id {}", ws_id);
+            let _ = ws_tx.send(message.clone());
         } else {
+            debug!("Buffering message with id {}", ws_id);
             session.message_buffer.write().await.push(message.clone());
         }
 
@@ -314,60 +300,42 @@ impl acp::Client for ClientImpl {
         &self,
         _args: acp::CreateTerminalRequest,
     ) -> Result<acp::CreateTerminalResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "terminal".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
     async fn terminal_output(
         &self,
         _args: acp::TerminalOutputRequest,
     ) -> Result<acp::TerminalOutputResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "terminal".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
     async fn release_terminal(
         &self,
         _args: acp::ReleaseTerminalRequest,
     ) -> Result<acp::ReleaseTerminalResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "terminal".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
     async fn wait_for_terminal_exit(
         &self,
         _args: acp::WaitForTerminalExitRequest,
     ) -> Result<acp::WaitForTerminalExitResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "terminal".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
     async fn kill_terminal_command(
         &self,
         _args: acp::KillTerminalCommandRequest,
     ) -> Result<acp::KillTerminalCommandResponse, acp::Error> {
-        Err(acp::Error::CapabilityNotSupported {
-            capability: "terminal".to_string(),
-        })
+        Err(acp::Error::method_not_found())
     }
 
-    async fn ext_method(
-        &self,
-        _method: Arc<str>,
-        _params: Arc<serde_json::value::RawValue>,
-    ) -> Result<Arc<serde_json::value::RawValue>, acp::Error> {
-        Err(acp::Error::MethodNotFound)
+    async fn ext_method(&self, _args: acp::ExtRequest) -> Result<acp::ExtResponse, acp::Error> {
+        Err(acp::Error::method_not_found())
     }
 
-    async fn ext_notification(
-        &self,
-        _method: Arc<str>,
-        _params: Arc<serde_json::value::RawValue>,
-    ) -> Result<(), acp::Error> {
+    async fn ext_notification(&self, _args: acp::ExtNotification) -> Result<(), acp::Error> {
         Ok(())
     }
 }
@@ -383,14 +351,17 @@ pub async fn create_connections(
     let mut results = Vec::new();
 
     for req in requests {
+        let req_id = req.id.clone();
+        let req_name = req.name.clone();
+        let req_command = req.command.clone();
         match spawn_acp_process(&state, req).await {
             Ok(info) => results.push(info),
             Err(e) => {
-                error!("Failed to create connection {}: {}", req.id, e);
+                error!("Failed to create connection {}: {}", req_id, e);
                 results.push(ConnectionInfo {
-                    id: req.id.clone(),
-                    name: req.name,
-                    command: req.command,
+                    id: req_id,
+                    name: req_name,
+                    command: req_command,
                     status: ConnectionStatus::Error {
                         message: e.to_string(),
                     },
@@ -446,11 +417,12 @@ pub async fn connection_updates_sse(
     let stream = async_stream::stream! {
         while let Some(update) = rx.recv().await {
             let data = serde_json::to_string(&update).unwrap_or_default();
-            yield Ok(Event::default().data(data));
+            yield Ok::<Event, Infallible>(Event::default().data(data));
         }
     };
 
-    Sse::new(Box::pin(stream)).keep_alive(KeepAlive::default())
+    Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(KeepAlive::default())
 }
 
 pub async fn create_session(
@@ -467,16 +439,15 @@ pub async fn create_session(
     match status {
         ConnectionStatus::Connected => {
             // Create session through ACP
-            let session_id = Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
 
             // Send request to agent task
-            if let Err(e) = connection.agent_tx.send(AgentRequest::NewSession {
-                session_id: session_id.clone(),
-                response: tx,
-            }) {
+            if let Err(e) = connection
+                .agent_tx
+                .send(AgentRequest::NewSession { response: tx })
+            {
                 return Ok(Json(CreateSessionResponse {
-                    session_id: String::new(),
+                    session_id: None,
                     status: "error".to_string(),
                     error: Some(format!("Failed to send request: {}", e)),
                 }));
@@ -487,18 +458,17 @@ pub async fn create_session(
                 Ok(Ok(Ok(acp_session_id))) => {
                     // Create our session tracking
                     let session = Arc::new(AcpSession {
-                        id: session_id.clone(),
+                        id: acp_session_id.clone(),
                         acp_id: req.acp_id.clone(),
-                        acp_session_id,
                         pending_requests: Arc::new(DashMap::new()),
                         message_buffer: Arc::new(RwLock::new(Vec::new())),
-                        sse_id_counter: Arc::new(AtomicU64::new(1)),
+                        ws_id_counter: Arc::new(AtomicU64::new(1)),
                     });
 
-                    state.sessions.insert(session_id.clone(), session);
+                    state.sessions.insert(acp_session_id.clone(), session);
 
                     Ok(Json(CreateSessionResponse {
-                        session_id,
+                        session_id: Some(acp_session_id),
                         status: "created".to_string(),
                         error: None,
                     }))
@@ -507,32 +477,32 @@ pub async fn create_session(
                     // Check if it's an auth error
                     if e.contains("auth_required") {
                         Ok(Json(CreateSessionResponse {
-                            session_id: String::new(),
+                            session_id: None,
                             status: "auth_required".to_string(),
                             error: Some(e),
                         }))
                     } else {
                         Ok(Json(CreateSessionResponse {
-                            session_id: String::new(),
+                            session_id: None,
                             status: "error".to_string(),
                             error: Some(e),
                         }))
                     }
                 }
                 _ => Ok(Json(CreateSessionResponse {
-                    session_id: String::new(),
+                    session_id: None,
                     status: "error".to_string(),
                     error: Some("Request timed out".to_string()),
                 })),
             }
         }
         ConnectionStatus::Error { message } => Ok(Json(CreateSessionResponse {
-            session_id: String::new(),
+            session_id: None,
             status: "error".to_string(),
             error: Some(message),
         })),
         _ => Ok(Json(CreateSessionResponse {
-            session_id: String::new(),
+            session_id: None,
             status: "loading".to_string(),
             error: Some("Connection not ready".to_string()),
         })),
@@ -555,44 +525,31 @@ pub async fn list_sessions(
     Ok(Json(sessions))
 }
 
-pub async fn session_update(
-    State(state): State<AcpServerState>,
-    Path(session_id): Path<String>,
-    Json(req): Json<SessionUpdateRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let session = state
-        .sessions
-        .get(&session_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Route response to waiting handler
-    if let Some((_, tx)) = session.pending_requests.remove(&req.id) {
-        let response = if let Some(result) = req.result {
-            json!({ "result": result })
-        } else if let Some(error) = req.error {
-            json!({ "error": error })
-        } else {
-            json!({})
-        };
-
-        let _ = tx.send(response);
-    }
-
-    Ok(StatusCode::OK)
-}
-
-pub async fn session_sse(
+pub async fn session_ws(
+    ws: WebSocketUpgrade,
     State(state): State<AcpServerState>,
     Path(session_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     let session = state
         .sessions
-        .get(&session_id)
+        .get(&acp::SessionId(std::sync::Arc::from(session_id)))
         .ok_or(StatusCode::NOT_FOUND)?
         .clone();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<SseMessage>();
+    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, session, params)))
+}
+
+async fn handle_websocket(
+    socket: WebSocket,
+    state: AcpServerState,
+    session: Arc<AcpSession>,
+    params: HashMap<String, String>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Create channel for sending messages to WebSocket
+    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Check if client wants messages from a specific ID
     let from_id = params
@@ -604,25 +561,184 @@ pub async fn session_sse(
     let buffered = session.message_buffer.read().await.clone();
     for msg in buffered {
         let msg_id = match &msg {
-            SseMessage::AcpJsonRpc { id, .. } => *id,
-            SseMessage::Exit { id } => *id,
+            ServerMessage::SessionNotification { id, .. } => *id,
+            ServerMessage::PermissionRequest { id, .. } => *id,
+            ServerMessage::PromptResponse { id, .. } => *id,
+            ServerMessage::Exit { id } => *id,
         };
         if msg_id > from_id {
             let _ = tx.send(msg);
         }
     }
 
-    // Register SSE connection
-    state.sse_connections.insert(session_id.clone(), tx);
+    // Register WebSocket connection
+    state.ws_connections.insert(session.id.clone(), tx.clone());
 
-    let stream = async_stream::stream! {
+    // Handle outgoing messages (server to client)
+    let session_id_out = session.id.clone();
+    let state_out = state.clone();
+    let tx_task = tokio::spawn(async move {
+        use futures::SinkExt;
         while let Some(msg) = rx.recv().await {
-            let data = serde_json::to_string(&msg).unwrap_or_default();
-            yield Ok(Event::default().data(data));
-        }
-    };
+            let json_str = match serde_json::to_string(&msg) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Failed to serialize message: {}", e);
+                    continue;
+                }
+            };
 
-    Sse::new(Box::pin(stream)).keep_alive(KeepAlive::default())
+            if sender.send(Message::Text(json_str.into())).await.is_err() {
+                debug!("WebSocket send failed for session: {}", session_id_out);
+                break;
+            }
+        }
+        // Clean up when sending task ends
+        state_out.ws_connections.remove(&session_id_out);
+    });
+
+    // Handle incoming messages (client to server)
+    let session_rx = session.clone();
+    let state_rx = state.clone();
+    let rx_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Err(e) = handle_client_message(&state_rx, &session_rx, &text).await {
+                        debug!("Error handling client message: {}", e);
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    debug!("WebSocket closed for session: {}", session_rx.id);
+                    break;
+                }
+                Err(e) => {
+                    debug!("WebSocket error for session {}: {}", session_rx.id, e);
+                    break;
+                }
+                _ => {} // Ignore other message types
+            }
+        }
+    });
+
+    // Wait for either task to complete
+    tokio::select! {
+        _ = tx_task => {},
+        _ = rx_task => {},
+    }
+
+    // Clean up WebSocket connection
+    state.ws_connections.remove(&session.id);
+}
+
+async fn handle_client_message(
+    state: &AcpServerState,
+    session: &AcpSession,
+    text: &str,
+) -> Result<()> {
+    let client_msg: ClientMessage =
+        serde_json::from_str(text).map_err(|e| anyhow!("Failed to parse client message: {}", e))?;
+
+    match client_msg {
+        ClientMessage::Prompt { id, messages } => {
+            // Get the connection for this session
+            let connection = state
+                .connections
+                .get(&session.acp_id)
+                .ok_or_else(|| anyhow!("Connection not found"))?;
+
+            // Check connection status
+            let status = connection.status.read().await.clone();
+            if !matches!(status, ConnectionStatus::Connected) {
+                // Send error response
+                let response = ServerMessage::PromptResponse {
+                    id,
+                    response_type: "error".to_string(),
+                    response: None,
+                    error: Some("Connection not ready".to_string()),
+                };
+                if let Some(tx) = state.ws_connections.get(&session.id) {
+                    let _ = tx.send(response);
+                }
+                return Ok(());
+            }
+
+            // Send prompt request to agent task
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = connection.agent_tx.send(AgentRequest::Prompt {
+                session_id: session.id.clone(),
+                messages,
+                response: tx,
+            }) {
+                let response = ServerMessage::PromptResponse {
+                    id,
+                    response_type: "error".to_string(),
+                    response: None,
+                    error: Some(format!("Failed to send request: {}", e)),
+                };
+                if let Some(ws_tx) = state.ws_connections.get(&session.id) {
+                    let _ = ws_tx.send(response);
+                }
+                return Ok(());
+            }
+
+            // Wait for response and send back via WebSocket
+            let ws_tx = state.ws_connections.get(&session.id).map(|tx| tx.clone());
+            tokio::spawn(async move {
+                let response = match timeout(Duration::from_secs(30), rx).await {
+                    Ok(Ok(Ok(prompt_response))) => ServerMessage::PromptResponse {
+                        id,
+                        response_type: "success".to_string(),
+                        response: Some(prompt_response),
+                        error: None,
+                    },
+                    Ok(Ok(Err(e))) => ServerMessage::PromptResponse {
+                        id,
+                        response_type: "error".to_string(),
+                        response: None,
+                        error: Some(e),
+                    },
+                    Ok(Err(_)) => ServerMessage::PromptResponse {
+                        id,
+                        response_type: "error".to_string(),
+                        response: None,
+                        error: Some("Response channel closed".to_string()),
+                    },
+                    Err(_) => ServerMessage::PromptResponse {
+                        id,
+                        response_type: "error".to_string(),
+                        response: None,
+                        error: Some("Request timed out".to_string()),
+                    },
+                };
+
+                if let Some(tx) = ws_tx {
+                    let _ = tx.send(response);
+                }
+            });
+        }
+        ClientMessage::PermissionResponse { id, response } => {
+            // Find the pending request and respond
+            if let Some((_, tx)) = session.pending_requests.remove(&id) {
+                let _ = tx.send(acp::ClientResponse::RequestPermissionResponse(response));
+            }
+        }
+        ClientMessage::Ack { latest_id } => {
+            // Remove acknowledged messages from buffer
+            let mut buffer = session.message_buffer.write().await;
+            buffer.retain(|msg| {
+                let msg_id = match msg {
+                    ServerMessage::SessionNotification { id, .. } => *id,
+                    ServerMessage::PermissionRequest { id, .. } => *id,
+                    ServerMessage::PromptResponse { id, .. } => *id,
+                    ServerMessage::Exit { id } => *id,
+                };
+                msg_id > latest_id
+            });
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -633,10 +749,18 @@ async fn spawn_acp_process(
     state: &AcpServerState,
     req: CreateConnectionRequest,
 ) -> Result<ConnectionInfo> {
+    debug!("spawn_acp_process called for connection: {}", req.id);
+
     let parts: Vec<&str> = req.command.split_whitespace().collect();
     if parts.is_empty() {
         return Err(anyhow!("Empty command"));
     }
+
+    debug!(
+        "Spawning process: {} with args: {:?}",
+        parts[0],
+        &parts[1..]
+    );
 
     let mut child = Command::new(parts[0])
         .args(&parts[1..])
@@ -645,6 +769,8 @@ async fn spawn_acp_process(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
+
+    debug!("Process spawned successfully for connection: {}", req.id);
 
     let stdin = child
         .stdin
@@ -674,11 +800,11 @@ async fn spawn_acp_process(
         status: Arc::new(RwLock::new(ConnectionStatus::Loading)),
         capabilities: Arc::new(RwLock::new(None)),
         agent_tx: agent_tx.clone(),
-        process_handle: Arc::new(Mutex::new(Some(child))),
         local_set_handle: Arc::new(Mutex::new(None)),
     });
 
     state.connections.insert(req.id.clone(), connection.clone());
+    debug!("Connection stored in state for: {}", req.id);
 
     // Spawn stderr reader
     let acp_id = req.id.clone();
@@ -697,126 +823,146 @@ async fn spawn_acp_process(
 
     // Create client implementation
     let client_impl = ClientImpl::new(state.clone());
+    debug!("Client implementation created for: {}", req.id);
 
     // Set up ACP connection in a LocalSet
     let connection_clone = connection.clone();
     let state_clone = state.clone();
     let acp_id = req.id.clone();
+    let acp_id_for_log = acp_id.clone();
 
-    let local_set_handle = tokio::spawn(async move {
+    debug!("Starting blocking thread for ACP connection: {}", acp_id);
+    let local_set_handle = tokio::task::spawn_blocking(move || {
+        debug!(
+            "Inside blocking thread for ACP connection: {}",
+            acp_id_for_log
+        );
+
+        // Create a new runtime for this blocking thread
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
         let local_set = LocalSet::new();
 
-        local_set
-            .run_until(async move {
-                // Create ACP connection
-                let (conn, io_task) = acp::ClientSideConnection::new(
-                    client_impl,
-                    stdin,
-                    stdout,
-                    |fut| {
-                        tokio::task::spawn_local(fut);
-                    },
-                );
+        debug!("Created runtime and LocalSet for: {}", acp_id_for_log);
 
-                // Initialize the agent
-                match conn
-                    .initialize(acp::InitializeRequest {
-                        protocol_version: acp::PROTOCOL_VERSION.to_string(),
-                        client_capabilities: acp::ClientCapabilities {
-                            fs: Some(acp::FileSystemCapabilities {
-                                read_text_file: Some(false),
-                                write_text_file: Some(false),
-                            }),
-                            terminal: Some(false),
-                            _meta: None,
-                        },
-                        _meta: None,
-                    })
-                    .await
-                {
-                    Ok(response) => {
-                        info!("ACP[{}] initialized successfully", acp_id);
-                        *connection_clone.status.write().await = ConnectionStatus::Connected;
-                        *connection_clone.capabilities.write().await = response.agent_capabilities;
+        rt.block_on(local_set.run_until(async move {
+            debug!("Inside LocalSet run_until for: {}", acp_id);
 
-                        // Notify listeners
-                        let update = ConnectionUpdate {
-                            id: acp_id.clone(),
-                            status: ConnectionStatus::Connected,
-                            capabilities: response.agent_capabilities.clone(),
-                        };
-                        for tx in state_clone.connection_updates.read().await.iter() {
-                            let _ = tx.send(update.clone());
-                        }
-                    }
-                    Err(e) => {
-                        error!("ACP[{}] initialization failed: {}", acp_id, e);
-                        *connection_clone.status.write().await = ConnectionStatus::Error {
-                            message: format!("Initialization failed: {}", e),
-                        };
-
-                        // Notify listeners
-                        let update = ConnectionUpdate {
-                            id: acp_id.clone(),
-                            status: ConnectionStatus::Error {
-                                message: format!("Initialization failed: {}", e),
-                            },
-                            capabilities: None,
-                        };
-                        for tx in state_clone.connection_updates.read().await.iter() {
-                            let _ = tx.send(update.clone());
-                        }
-                        return;
-                    }
-                }
-
-                // Handle agent requests
-                tokio::task::spawn_local(async move {
-                    while let Some(request) = agent_rx.recv().await {
-                        match request {
-                            AgentRequest::NewSession {
-                                session_id,
-                                response,
-                            } => {
-                                let result = conn
-                                    .new_session(acp::NewSessionRequest {
-                                        _meta: None,
-                                    })
-                                    .await;
-
-                                let _ = response.send(match result {
-                                    Ok(resp) => Ok(resp.session_id),
-                                    Err(e) => Err(e.to_string()),
-                                });
-                            }
-                            AgentRequest::Prompt {
-                                session_id,
-                                messages,
-                                response,
-                            } => {
-                                let result = conn
-                                    .prompt(acp::PromptRequest {
-                                        session_id,
-                                        messages,
-                                        _meta: None,
-                                    })
-                                    .await;
-
-                                let _ = response.send(match result {
-                                    Ok(_) => Ok(()),
-                                    Err(e) => Err(e.to_string()),
-                                });
-                            }
-                        }
-                    }
+            // Create ACP connection
+            let (conn, io_task) =
+                acp::ClientSideConnection::new(client_impl, stdin, stdout, |fut| {
+                    tokio::task::spawn_local(fut);
                 });
 
-                // Run IO task
-                io_task.await
-            })
-            .await;
+            debug!("ACP ClientSideConnection created for: {}", acp_id);
 
-        info!("ACP[{}] LocalSet finished", acp_id);
+            // Spawn the I/O task first - it needs to run concurrently with initialization
+            let acp_id_io = acp_id.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(e) = io_task.await {
+                    debug!("IO task error for {}: {}", acp_id_io, e);
+                }
+            });
+
+            // Initialize the agent
+            debug!("Starting ACP initialization for: {}", acp_id);
+            match conn
+                .initialize(acp::InitializeRequest {
+                    protocol_version: acp::V1,
+                    client_capabilities: acp::ClientCapabilities {
+                        fs: acp::FileSystemCapability {
+                            read_text_file: false,
+                            write_text_file: false,
+                            meta: None,
+                        },
+                        terminal: false,
+                        meta: None,
+                    },
+                    meta: None,
+                })
+                .await
+            {
+                Ok(response) => {
+                    info!("ACP[{}] initialized successfully", acp_id);
+                    *connection_clone.status.write().await = ConnectionStatus::Connected;
+                    let capabilities = response.agent_capabilities.clone();
+                    *connection_clone.capabilities.write().await = Some(capabilities.clone());
+
+                    // Notify listeners
+                    let update = ConnectionUpdate {
+                        id: acp_id.clone(),
+                        status: ConnectionStatus::Connected,
+                        capabilities: Some(capabilities),
+                    };
+                    for tx in state_clone.connection_updates.read().await.iter() {
+                        let _ = tx.send(update.clone());
+                    }
+                }
+                Err(e) => {
+                    error!("ACP[{}] initialization failed: {}", acp_id, e);
+                    *connection_clone.status.write().await = ConnectionStatus::Error {
+                        message: format!("Initialization failed: {}", e),
+                    };
+
+                    // Notify listeners
+                    let update = ConnectionUpdate {
+                        id: acp_id.clone(),
+                        status: ConnectionStatus::Error {
+                            message: format!("Initialization failed: {}", e),
+                        },
+                        capabilities: None,
+                    };
+                    for tx in state_clone.connection_updates.read().await.iter() {
+                        let _ = tx.send(update.clone());
+                    }
+                    return;
+                }
+            }
+
+            // Handle agent requests
+            let request_handler = tokio::task::spawn_local(async move {
+                while let Some(request) = agent_rx.recv().await {
+                    match request {
+                        AgentRequest::NewSession { response } => {
+                            let result = conn
+                                .new_session(acp::NewSessionRequest {
+                                    cwd: std::env::current_dir().unwrap_or_else(|_| "/tmp".into()),
+                                    mcp_servers: Vec::new(),
+                                    meta: None,
+                                })
+                                .await;
+
+                            let _ = response.send(match result {
+                                Ok(resp) => Ok(resp.session_id),
+                                Err(e) => Err(e.to_string()),
+                            });
+                        }
+                        AgentRequest::Prompt {
+                            session_id,
+                            messages,
+                            response,
+                        } => {
+                            let result = conn
+                                .prompt(acp::PromptRequest {
+                                    session_id,
+                                    prompt: messages,
+                                    meta: None,
+                                })
+                                .await;
+
+                            let _ = response.send(match result {
+                                Ok(prompt_response) => Ok(prompt_response),
+                                Err(e) => Err(e.to_string()),
+                            });
+                        }
+                    }
+                }
+            });
+
+            // Wait for the agent request handler to complete (keeps LocalSet alive)
+            let _ = request_handler.await;
+        }));
+
+        info!("ACP[{}] LocalSet finished", acp_id_for_log);
     });
 
     // Store handle
@@ -862,22 +1008,22 @@ async fn handle_process_exit(state: &AcpServerState, acp_id: &str) {
 
     // Send exit events and remove sessions
     for session_id in sessions_to_remove {
-        // Send exit event to SSE
+        // Send exit event to WebSocket
         if let Some(session) = state.sessions.get(&session_id) {
-            let sse_id = session.sse_id_counter.fetch_add(1, Ordering::Relaxed);
-            if let Some(tx) = state.sse_connections.get(&session_id) {
-                let msg = SseMessage::Exit { id: sse_id };
+            let ws_id = session.ws_id_counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(tx) = state.ws_connections.get(&session_id) {
+                let msg = ServerMessage::Exit { id: ws_id };
                 let _ = tx.send(msg);
             }
         }
 
         // Remove session
         state.sessions.remove(&session_id);
-        state.sse_connections.remove(&session_id);
+        state.ws_connections.remove(&session_id);
     }
 
     // Update connection status
-    if let Some(mut conn) = state.connections.get_mut(&acp_id.to_string()) {
+    if let Some(conn) = state.connections.get_mut(&acp_id.to_string()) {
         *conn.status.write().await = ConnectionStatus::Error {
             message: "Process exited".to_string(),
         };
@@ -894,5 +1040,129 @@ async fn handle_process_exit(state: &AcpServerState, acp_id: &str) {
         for tx in state.connection_updates.read().await.iter() {
             let _ = tx.send(update.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acp_server_state_creation() {
+        let state = AcpServerState::new();
+
+        assert_eq!(state.connections.len(), 0);
+        assert_eq!(state.sessions.len(), 0);
+        assert_eq!(state.ws_connections.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_connection_status_updates() {
+        let state = AcpServerState::new();
+        let (agent_tx, _agent_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(AcpConnection {
+            id: "test-conn".to_string(),
+            name: "Test Connection".to_string(),
+            command: "test-command".to_string(),
+            status: Arc::new(RwLock::new(ConnectionStatus::Loading)),
+            capabilities: Arc::new(RwLock::new(None)),
+            agent_tx,
+            local_set_handle: Arc::new(Mutex::new(None)),
+        });
+
+        state
+            .connections
+            .insert("test-conn".to_string(), connection.clone());
+
+        // Test initial status
+        assert!(matches!(
+            *connection.status.read().await,
+            ConnectionStatus::Loading
+        ));
+
+        // Test status change
+        *connection.status.write().await = ConnectionStatus::Connected;
+        assert!(matches!(
+            *connection.status.read().await,
+            ConnectionStatus::Connected
+        ));
+
+        // Test error status
+        *connection.status.write().await = ConnectionStatus::Error {
+            message: "Test error".to_string(),
+        };
+        let status = connection.status.read().await;
+        if let ConnectionStatus::Error { message } = &*status {
+            assert_eq!(message, "Test error");
+        } else {
+            panic!("Expected error status");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_websocket_message_serialization() {
+        // Test ServerMessage serialization
+        let session_notification = ServerMessage::SessionNotification {
+            id: 42,
+            params: acp::SessionNotification {
+                session_id: acp::SessionId(std::sync::Arc::from("test-session")),
+                update: acp::SessionUpdate::UserMessageChunk {
+                    content: acp::ContentBlock::Text(acp::TextContent {
+                        text: "Hello world".to_string(),
+                        annotations: None,
+                        meta: None,
+                    }),
+                },
+                meta: None,
+            },
+        };
+
+        let serialized = serde_json::to_string(&session_notification).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["type"], "session-notification");
+        assert_eq!(parsed["id"], 42);
+        assert!(parsed["params"].is_object());
+
+        // Test ClientMessage deserialization
+        let client_ack = r#"{"type": "ack", "latestId": 123}"#;
+        let parsed: ClientMessage = serde_json::from_str(client_ack).unwrap();
+
+        match parsed {
+            ClientMessage::Ack { latest_id } => assert_eq!(latest_id, 123),
+            _ => panic!("Expected Ack message"),
+        }
+
+        let exit_message = ServerMessage::Exit { id: 99 };
+        let serialized = serde_json::to_string(&exit_message).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["type"], "exit");
+        assert_eq!(parsed["id"], 99);
+    }
+
+    #[tokio::test]
+    async fn test_session_management() {
+        let id = acp::SessionId(Arc::from("test-acp-session"));
+        let state = AcpServerState::new();
+        let session = Arc::new(AcpSession {
+            id: id.clone(),
+            acp_id: "test-conn".to_string(),
+            pending_requests: Arc::new(DashMap::new()),
+            message_buffer: Arc::new(RwLock::new(Vec::new())),
+            ws_id_counter: Arc::new(AtomicU64::new(1)),
+        });
+
+        state.sessions.insert(id.clone(), session.clone());
+
+        // Verify session was added
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.sessions.contains_key(&id));
+
+        // Verify session properties
+        assert_eq!(session.id, id);
+        assert_eq!(session.acp_id, "test-conn");
+        assert_eq!(session.pending_requests.len(), 0);
+        assert_eq!(session.message_buffer.read().await.len(), 0);
     }
 }

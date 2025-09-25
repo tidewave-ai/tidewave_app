@@ -19,3 +19,12 @@ async-stream = "0.3"
 anyhow = "1.0"
 agent-client-protocol = "0.4.2"
 tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tower = { version = "0.5", features = ["util"] }
+hyper = { version = "1.0", features = ["full"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.23"

@@ -1,3 +1,4 @@
+mod acp_legacy;
 mod acp_server;
 mod mcp_remote;
 pub mod server;

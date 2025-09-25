@@ -74,13 +74,19 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
 
     // Create ACP routes
     let acp_routes = Router::new()
-        .route("/acp/connections", post(crate::acp_server::create_connections))
+        .route("/acp", get(crate::acp_legacy::acp_handler))
+        .route(
+            "/acp/connections",
+            post(crate::acp_server::create_connections),
+        )
         .route("/acp/connections", get(crate::acp_server::list_connections))
-        .route("/acp/connections/sse", get(crate::acp_server::connection_updates_sse))
+        .route(
+            "/acp/connections/sse",
+            get(crate::acp_server::connection_updates_sse),
+        )
         .route("/acp/sessions", post(crate::acp_server::create_session))
         .route("/acp/sessions", get(crate::acp_server::list_sessions))
-        .route("/acp/:sessionId/update", post(crate::acp_server::session_update))
-        .route("/acp/:sessionId/sse", get(crate::acp_server::session_sse))
+        .route("/acp/{sessionId}/ws", get(crate::acp_server::session_ws))
         .with_state(acp_state);
 
     // Create the main app without state
