@@ -17,9 +17,6 @@ dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 async-stream = "0.3"
 anyhow = "1.0"
-agent-client-protocol = "0.4.2"
-tokio-util = { version = "0.7", features = ["compat"] }
-async-trait = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -28,3 +25,6 @@ hyper = { version = "1.0", features = ["full"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = "0.23"
+agent-client-protocol = "0.4.2"
+async-trait = "0.1"
+urlencoding = "2.1"

@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Read(//oss/agent-client-protocol/rust/**)",
-      "Read(//oss/rust-sdk/**)"
+      "Read(//oss/rust-sdk/**)",
+      "Bash(cargo check:*)",
+      "Read(//oss/agent-client-protocol/**)",
+      "Read(//Users/steffen/oss/agent-client-protocol/**)"
     ],
     "deny": [],
     "ask": []

@@ -51,7 +51,7 @@ async fn verify_origin(
 pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
-    let acp_state = crate::acp_server::AcpServerState::new();
+    let acp_state = crate::acp_proxy::AcpProxyState::new();
 
     let config = ServerConfig {
         allowed_origins: vec![
@@ -75,18 +75,7 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
     // Create ACP routes
     let acp_routes = Router::new()
         .route("/acp", get(crate::acp_legacy::acp_handler))
-        .route(
-            "/acp/connections",
-            post(crate::acp_server::create_connections),
-        )
-        .route("/acp/connections", get(crate::acp_server::list_connections))
-        .route(
-            "/acp/connections/sse",
-            get(crate::acp_server::connection_updates_sse),
-        )
-        .route("/acp/sessions", post(crate::acp_server::create_session))
-        .route("/acp/sessions", get(crate::acp_server::list_sessions))
-        .route("/acp/{sessionId}/ws", get(crate::acp_server::session_ws))
+        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state);
 
     // Create the main app without state
