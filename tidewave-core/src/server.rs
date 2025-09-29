@@ -74,7 +74,6 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
 
     // Create ACP routes
     let acp_routes = Router::new()
-        .route("/acp", get(crate::acp_legacy::acp_handler))
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state);
 
