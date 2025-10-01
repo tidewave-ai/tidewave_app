@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::env;
 use tokio::net::TcpListener;
 use tracing::{debug, info, error};
+use crate::config::Config;
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -23,10 +24,11 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
+    let port = config.port;
 
-    let config = ServerConfig {
+    let server_config = ServerConfig {
         allowed_origins: vec![
             format!("http://localhost:{}", port),
             format!("http://127.0.0.1:{}", port),
@@ -42,7 +44,7 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
             })
         )
         .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(config.clone());
+            req.extensions_mut().insert(server_config.clone());
             verify_origin(req, next)
         }));
 
