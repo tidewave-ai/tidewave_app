@@ -214,7 +214,19 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     }
 
     debug!("Opening config file: {:?}", config_path);
-    app.opener().open_path(config_path.to_str().unwrap(), None::<&str>)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        Command::new("notepad.exe")
+            .arg(&config_path)
+            .spawn()?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        app.opener().open_path(config_path.to_str().unwrap(), None::<&str>)?;
+    }
 
     Ok(())
 }
