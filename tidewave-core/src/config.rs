@@ -39,9 +39,11 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     }
 
     debug!("Loading config from: {:?}", config_path);
-    let content = fs::read_to_string(&config_path)?;
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config file {}: {}", config_path.display(), e))?;
+
     let config: Config = toml::from_str(&content)
-        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+        .map_err(|e| format!("Failed to parse config file {}: {}", config_path.display(), e))?;
 
     debug!("Loaded config: {:?}", config);
     Ok(config)

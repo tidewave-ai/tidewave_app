@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = match tidewave_core::load_config() {
         Ok(config) => config,
         Err(e) => {
-            error!("Failed to load config: {}", e);
+            eprintln!("error: {}", e);
             std::process::exit(1);
         }
     };
