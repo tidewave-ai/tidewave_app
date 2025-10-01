@@ -23,31 +23,6 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
-    let headers = req.headers();
-
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-        let config = req
-            .extensions()
-            .get::<ServerConfig>()
-            .ok_or_else(|| {
-                error!("ServerConfig not found in request extensions");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        if !config.allowed_origins.contains(&origin_str.to_string()) {
-            debug!("Rejected request with origin: {}", origin_str);
-            return Err(StatusCode::FORBIDDEN);
-        }
-
-        return Ok(next.run(req).await);
-    }
-
-    Ok(next.run(req).await)
-}
-
 pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
 
@@ -75,6 +50,31 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
     info!("HTTP server running on port {}", port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
+    let headers = req.headers();
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        let config = req
+            .extensions()
+            .get::<ServerConfig>()
+            .ok_or_else(|| {
+                error!("ServerConfig not found in request extensions");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if !config.allowed_origins.contains(&origin_str.to_string()) {
+            debug!("Rejected request with origin: {}", origin_str);
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        return Ok(next.run(req).await);
+    }
+
+    Ok(next.run(req).await)
 }
 
 async fn proxy_handler(
