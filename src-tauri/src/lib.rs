@@ -153,7 +153,7 @@ pub fn run() {
                 }
             });
 
-            let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open Tidewave", true, None::<&str>)?;
+            let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, None::<&str>)?;
             let open_config_i = MenuItem::with_id(app, "open_config", "Settings...", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
