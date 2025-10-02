@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config = tidewave_core::Config {
-        port: cli_port.unwrap_or(9999),
+        port: cli_port.unwrap_or(9832),
         debug: cli_debug,
     };
 

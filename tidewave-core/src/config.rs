@@ -14,7 +14,7 @@ pub struct Config {
 }
 
 fn default_port() -> u16 {
-    9999
+    9832
 }
 
 pub fn get_config_path() -> PathBuf {

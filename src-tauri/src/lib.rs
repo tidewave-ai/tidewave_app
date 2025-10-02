@@ -12,7 +12,7 @@ use std::fs;
 const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
 # If you change this file, you must restart Tidewave.
 
-# port = 9999
+# port = 9832
 "#;
 
 pub fn run() {
