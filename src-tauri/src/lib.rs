@@ -149,10 +149,10 @@ pub fn run() {
             });
 
             let open_config_i = MenuItem::with_id(app, "open_config", "Open Configuration", true, None::<&str>)?;
-            let reload_config_i = MenuItem::with_id(app, "reload_config", "Reload Configuration", true, None::<&str>)?;
+            let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_config_i, &reload_config_i, &separator, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_config_i, &restart_i, &separator, &quit_i])?;
 
             TrayIconBuilder::new()
             .menu(&menu)
@@ -173,8 +173,8 @@ pub fn run() {
                             .blocking_show();
                     }
                 }
-                "reload_config" => {
-                    debug!("Reload Configuration menu item clicked");
+                "restart" => {
+                    debug!("Restart menu item clicked");
                     match tidewave_core::load_config() {
                         Ok(config) => {
                             info!("Reloaded config: {:?}", config);
