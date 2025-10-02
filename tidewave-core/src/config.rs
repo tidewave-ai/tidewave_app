@@ -24,7 +24,7 @@ pub fn get_config_path() -> PathBuf {
         std::env::var("HOME").expect("HOME environment variable not set")
     };
 
-    PathBuf::from(home).join(".config").join("tidewave").join("config.toml")
+    PathBuf::from(home).join(".config").join("tidewave").join("app.toml")
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
