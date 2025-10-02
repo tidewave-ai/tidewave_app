@@ -24,7 +24,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(|app| tauri::async_runtime::block_on(async move {
             let mut config = match tidewave_core::load_config() {
                 Ok(config) => config,
                 Err(e) => {
@@ -106,17 +106,34 @@ pub fn run() {
 
             let port = config.port;
 
+            let listener = match tidewave_core::bind_http_server(config.clone()).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    app.dialog()
+                        .message(format!("Failed to bind HTTP server: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Error")
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+            };
+
+            let app_handle_for_server = app.handle().clone();
+            let server_config = config.clone();
+            let _server_handle = tauri::async_runtime::spawn(async move {
+                if let Err(e) = tidewave_core::serve_http_server(server_config, listener).await {
+                    app_handle_for_server.dialog()
+                        .message(format!("HTTP server error: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Error")
+                        .blocking_show();
+                    app_handle_for_server.exit(1);
+                }
+            });
+
             // If serve subcommand, run only the HTTP server
             if serve_only {
-                info!("Starting in server-only mode on port {}", port);
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-                let server_config = config.clone();
-                rt.block_on(async move {
-                    if let Err(e) = tidewave_core::start_http_server(server_config, Box::new(|| {})).await {
-                        error!("HTTP server error: {}", e);
-                        std::process::exit(1);
-                    }
-                });
+                info!("Running in server-only mode on port {}", port);
                 return Ok(());
             }
 
@@ -135,30 +152,13 @@ pub fn run() {
                 handle_urls(&app_handle_for_open, port, &event.urls());
             });
 
-            let app_handle_for_server = app.handle().clone();
-            let app_handle_for_open = app.handle().clone();
-            let server_config = config.clone();
-            let _server_handle = tauri::async_runtime::spawn(async move {
-                let ready_callback = Box::new(move || {
-                    open_tidewave(&app_handle_for_open, port);
-                });
-
-                if let Err(e) = tidewave_core::start_http_server(server_config, ready_callback).await {
-                    app_handle_for_server.dialog()
-                        .message(format!("HTTP server error: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Error")
-                        .blocking_show();
-                    app_handle_for_server.exit(1);
-                }
-            });
+            open_tidewave(&app.handle(), port);
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, None::<&str>)?;
             let open_config_i = MenuItem::with_id(app, "open_config", "Settings...", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, None::<&str>)?;
-
             let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
@@ -205,7 +205,7 @@ pub fn run() {
             })
             .build(app)?;
             Ok(())
-        })
+        }))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
