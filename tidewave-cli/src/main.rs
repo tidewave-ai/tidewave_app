@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -7,8 +7,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long, default_value = "9999")]
-    port: u16,
+    #[arg(short, long)]
+    port: Option<u16>,
 
     #[arg(short, long)]
     debug: bool,
@@ -17,8 +17,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Serve {
-        #[arg(short, long, default_value = "9999")]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         #[arg(short, long)]
         debug: bool,
@@ -29,24 +29,27 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let (debug, port) = match &cli.command {
+    let (cli_debug, cli_port) = match &cli.command {
         Some(Commands::Serve { debug, port }) => (*debug, *port),
         None => (cli.debug, cli.port),
     };
 
-    let filter = if debug { "debug" } else { "info" };
+    let config = tidewave_core::Config {
+        port: cli_port.unwrap_or(9832),
+        debug: cli_debug,
+    };
+
+    let filter = if config.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .init();
 
-    if debug {
+    if config.debug {
         debug!("Debug logging enabled");
-        debug!("Port: {}", port);
+        debug!("Config: {:?}", config);
     }
 
-    info!("Starting server on port {}", port);
-
-    if let Err(e) = tidewave_core::start_http_server(port).await {
+    if let Err(e) = tidewave_core::start_http_server(config).await {
         error!("Server error: {}", e);
         std::process::exit(1);
     }

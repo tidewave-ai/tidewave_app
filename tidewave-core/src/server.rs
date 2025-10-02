@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::env;
 use tokio::net::TcpListener;
 use tracing::{debug, info, error};
+use crate::config::Config;
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -21,6 +22,36 @@ struct ProxyParams {
 #[derive(Clone)]
 struct ServerConfig {
     allowed_origins: Vec<String>,
+}
+
+pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = Client::new();
+    let port = config.port;
+
+    let server_config = ServerConfig {
+        allowed_origins: vec![
+            format!("http://localhost:{}", port),
+            format!("http://127.0.0.1:{}", port),
+        ],
+    };
+
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/proxy",
+            axum::routing::any(move |params, req| {
+                let client = client.clone();
+                proxy_handler(params, req, client)
+            })
+        )
+        .layer(middleware::from_fn(move |mut req: Request, next| {
+            req.extensions_mut().insert(server_config.clone());
+            verify_origin(req, next)
+        }));
+
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
+    info!("HTTP server running on port {}", port);
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
@@ -46,35 +77,6 @@ async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Res
     }
 
     Ok(next.run(req).await)
-}
-
-pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::new();
-
-    let config = ServerConfig {
-        allowed_origins: vec![
-            format!("http://localhost:{}", port),
-            format!("http://127.0.0.1:{}", port),
-        ],
-    };
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/proxy",
-            axum::routing::any(move |params, req| {
-                let client = client.clone();
-                proxy_handler(params, req, client)
-            })
-        )
-        .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(config.clone());
-            verify_origin(req, next)
-        }));
-
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
-    info!("HTTP server running on port {}", port);
-    axum::serve(listener, app).await?;
-    Ok(())
 }
 
 async fn proxy_handler(
