@@ -163,7 +163,6 @@ pub fn run() {
                     app.exit(0);
                 }
                 "open_config" => {
-                    debug!("Open Configuration menu item clicked");
                     if let Err(e) = open_config_file(app) {
                         error!("Failed to open config file: {}", e);
                         app.dialog()
@@ -174,7 +173,6 @@ pub fn run() {
                     }
                 }
                 "restart" => {
-                    debug!("Restart menu item clicked");
                     match tidewave_core::load_config() {
                         Ok(config) => {
                             info!("Reloaded config: {:?}", config);
