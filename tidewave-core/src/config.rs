@@ -39,11 +39,33 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     }
 
     debug!("Loading config from: {:?}", config_path);
-    let content = fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read config file {}: {}", config_path.display(), e))?;
 
-    let config: Config = toml::from_str(&content)
-        .map_err(|e| format!("Failed to parse config file {}: {}", config_path.display(), e))?;
+    let content = fs::read_to_string(&config_path)?;
+
+    let error_message = r#"Expected configuration to be:
+
+    port = 0..65535"#;
+
+    let table = content.parse::<toml::Table>()
+        .map_err(|_| error_message)?;
+
+    let config = match (table.len(), table.get("port")) {
+        (0, None) => Config {
+            port: default_port(),
+            debug: false,
+        },
+        (1, Some(toml::Value::Integer(port))) => {
+            let port = u16::try_from(*port)
+                .map_err(|_| error_message)?;
+            Config {
+                port,
+                debug: false,
+            }
+        }
+        _ => {
+            return Err(error_message.into());
+        }
+    };
 
     debug!("Loaded config: {:?}", config);
     Ok(config)
