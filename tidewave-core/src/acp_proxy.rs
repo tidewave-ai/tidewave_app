@@ -230,13 +230,19 @@ impl ProcessState {
     }
 
     pub async fn cleanup_id_mappings(&self, proxy_id: &Value) {
-        let mut proxy_to_client = self.proxy_to_client_ids.write().await;
-        if let Some((websocket_id, client_id)) = proxy_to_client.remove(proxy_id) {
+        // Get the websocket_id and client_id first, then release the lock
+        let mapping = {
+            let mut proxy_to_client = self.proxy_to_client_ids.write().await;
+            proxy_to_client.remove(proxy_id)
+        }; // Write lock is dropped here
+
+        // Now acquire the second lock without holding the first
+        if let Some((websocket_id, client_id)) = mapping {
             let mut client_to_proxy = self.client_to_proxy_ids.write().await;
             client_to_proxy.remove(&(websocket_id, client_id));
         }
 
-        // Also clean up session mapping if it exists
+        // Clean up session mapping - acquire lock independently
         let mut proxy_to_session = self.proxy_to_session_ids.write().await;
         proxy_to_session.remove(proxy_id);
     }
@@ -1001,12 +1007,12 @@ async fn handle_process_message(
                 } else {
                     debug!("Missing original websocket for request {}", response.id);
                     // Fallback: Client disconnected, try to find session and forward to new websocket
-                    let proxy_to_session = process_state.proxy_to_session_ids.read().await;
-                    if let Some((session_id, client_id)) =
+                    let session_info = {
+                        let proxy_to_session = process_state.proxy_to_session_ids.read().await;
                         proxy_to_session.get(&response.id).cloned()
-                    {
-                        drop(proxy_to_session); // Release read lock before potential writes
+                    }; // Read lock is dropped here
 
+                    if let Some((session_id, client_id)) = session_info {
                         // Find the current websocket for this session
                         if let Some(current_websocket_id) =
                             state.session_to_websocket.get(&session_id)
