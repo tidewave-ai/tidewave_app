@@ -149,9 +149,11 @@ pub struct ProcessState {
     // ID mapping for multiplexed connections
     pub client_to_proxy_ids: Arc<RwLock<HashMap<(WebSocketId, Value), Value>>>,
     pub proxy_to_client_ids: Arc<RwLock<HashMap<Value, (WebSocketId, Value)>>>,
+    pub proxy_to_session_ids: Arc<RwLock<HashMap<Value, (SessionId, Value)>>>,
 
     // Cached init response
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
+    pub init_request_id: Arc<RwLock<Option<Value>>>,
 }
 
 pub struct SessionState {
@@ -175,7 +177,9 @@ impl ProcessState {
             next_proxy_id: Arc::new(AtomicU64::new(1)),
             client_to_proxy_ids: Arc::new(RwLock::new(HashMap::new())),
             proxy_to_client_ids: Arc::new(RwLock::new(HashMap::new())),
+            proxy_to_session_ids: Arc::new(RwLock::new(HashMap::new())),
             cached_init_response: Arc::new(RwLock::new(None)),
+            init_request_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -198,6 +202,7 @@ impl ProcessState {
         &self,
         websocket_id: WebSocketId,
         client_id: Value,
+        session_id: Option<SessionId>,
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
 
@@ -205,7 +210,13 @@ impl ProcessState {
         let mut proxy_to_client = self.proxy_to_client_ids.write().await;
 
         client_to_proxy.insert((websocket_id, client_id.clone()), proxy_id.clone());
-        proxy_to_client.insert(proxy_id.clone(), (websocket_id, client_id));
+        proxy_to_client.insert(proxy_id.clone(), (websocket_id, client_id.clone()));
+
+        // If this request has a session_id, also store the session mapping
+        if let Some(session_id) = session_id {
+            let mut proxy_to_session = self.proxy_to_session_ids.write().await;
+            proxy_to_session.insert(proxy_id.clone(), (session_id, client_id));
+        }
 
         proxy_id
     }
@@ -224,6 +235,10 @@ impl ProcessState {
             let mut client_to_proxy = self.client_to_proxy_ids.write().await;
             client_to_proxy.remove(&(websocket_id, client_id));
         }
+
+        // Also clean up session mapping if it exists
+        let mut proxy_to_session = self.proxy_to_session_ids.write().await;
+        proxy_to_session.remove(proxy_id);
     }
 }
 
@@ -241,7 +256,11 @@ impl SessionState {
         format!("notif_{}", id)
     }
 
-    pub async fn add_to_buffer(&self, message: JsonRpcMessage, id: NotificationId) -> NotificationId {
+    pub async fn add_to_buffer(
+        &self,
+        message: JsonRpcMessage,
+        id: NotificationId,
+    ) -> NotificationId {
         let buffered = BufferedMessage {
             id: id.clone(),
             message,
@@ -315,12 +334,10 @@ async fn handle_websocket(
     let tx_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             let ws_message = match message {
-                WebSocketMessage::JsonRpc(json_msg) => {
-                    match serde_json::to_string(&json_msg) {
-                        Ok(json_str) => Message::Text(format!("{}\n", json_str).into()),
-                        Err(_) => continue,
-                    }
-                }
+                WebSocketMessage::JsonRpc(json_msg) => match serde_json::to_string(&json_msg) {
+                    Ok(json_str) => Message::Text(format!("{}\n", json_str).into()),
+                    Err(_) => continue,
+                },
                 WebSocketMessage::Pong => Message::Text("pong".into()),
             };
 
@@ -395,7 +412,7 @@ async fn handle_websocket(
     for session_id in sessions_to_remove {
         state.session_to_websocket.remove(&session_id);
     }
-    
+
     debug!("WebSocket connection closed: {}", websocket_id);
 }
 
@@ -478,12 +495,11 @@ async fn handle_initialize_request(
             let mut response = cached_response.clone();
             response.id = request.id.clone();
 
-            // Inject our custom capabilities
-            inject_tidewave_capabilities(&mut response);
-
             // Send cached response
             if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(response)));
+                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                    response,
+                )));
             }
 
             // Store WebSocket -> Process mapping for future requests
@@ -531,11 +547,15 @@ async fn handle_initialize_request(
         .insert(websocket_id, process_key.clone());
 
     // Forward initialize request with mapped ID
+    let session_id = extract_session_id_from_request(request);
     let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone())
+        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id)
         .await;
     let mut proxy_request = request.clone();
-    proxy_request.id = proxy_id;
+    proxy_request.id = proxy_id.clone();
+
+    // Store the init request ID so we can identify the init response
+    *process_state.init_request_id.write().await = Some(proxy_id);
 
     // Send to process
     if let Err(e) = process_state
@@ -581,7 +601,9 @@ async fn handle_session_load_request(
             };
 
             if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(error_response)));
+                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                    error_response,
+                )));
             }
             return Ok(());
         }
@@ -602,7 +624,9 @@ async fn handle_session_load_request(
         };
 
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-            let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(error_response)));
+            let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                error_response,
+            )));
         }
         return Ok(());
     }
@@ -636,7 +660,9 @@ async fn handle_session_load_request(
             error: None,
         };
 
-        let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(success_response)));
+        let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+            success_response,
+        )));
     }
 
     Ok(())
@@ -666,8 +692,9 @@ async fn handle_regular_request(
     };
 
     // Map client ID to proxy ID
+    let session_id = extract_session_id_from_request(request);
     let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone())
+        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id)
         .await;
     let mut proxy_request = request.clone();
     proxy_request.id = proxy_id;
@@ -854,6 +881,72 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
         debug!("Process stderr handler ended");
     });
 
+    // Start process exit monitor
+    let process_state_exit = process_state.clone();
+    let state_exit = state.clone();
+    tokio::spawn(async move {
+        // Wait for the process to exit
+        let exit_status = {
+            let mut child_guard = process_state_exit.child.write().await;
+            if let Some(child) = child_guard.as_mut() {
+                child.wait().await
+            } else {
+                return;
+            }
+        };
+
+        match exit_status {
+            Ok(status) => {
+                if status.success() {
+                    info!("Process exited successfully");
+                } else {
+                    error!("Process exited with status: {}", status);
+                }
+            }
+            Err(e) => {
+                error!("Failed to wait for process: {}", e);
+            }
+        }
+
+        // Send exit notification to all connected websockets
+        // We need to find all websockets connected to this process
+        let mut websockets_to_notify = Vec::new();
+
+        // Find the process key for this process state
+        let mut process_key_opt = None;
+        for entry in state_exit.processes.iter() {
+            if Arc::ptr_eq(entry.value(), &process_state_exit) {
+                process_key_opt = Some(entry.key().clone());
+                break;
+            }
+        }
+
+        if let Some(process_key) = process_key_opt {
+            // Find all websockets mapped to this process
+            for entry in state_exit.websocket_to_process.iter() {
+                if entry.value() == &process_key {
+                    websockets_to_notify.push(*entry.key());
+                }
+            }
+
+            // Send exit notification to all connected websockets
+            for websocket_id in websockets_to_notify {
+                send_exit_notification(
+                    &state_exit,
+                    websocket_id,
+                    "process_exited",
+                    "The ACP process has exited",
+                )
+                .await;
+            }
+
+            // Clean up the process from the state
+            state_exit.processes.remove(&process_key);
+        }
+
+        debug!("Process exit handler ended");
+    });
+
     Ok(())
 }
 
@@ -862,6 +955,7 @@ async fn handle_process_message(
     state: &AcpProxyState,
     message: JsonRpcMessage,
 ) -> Result<()> {
+    debug!("Got process message {:?}", message);
     match &message {
         JsonRpcMessage::Response(response) => {
             // Handle responses - map proxy ID back to client ID
@@ -872,11 +966,13 @@ async fn handle_process_message(
                 let mut client_response = response.clone();
                 client_response.id = client_id;
 
-                // Check if this is an initialize response that we should cache
-                if is_initialize_response(&client_response) {
-                    let mut cached_response = client_response.clone();
-                    inject_tidewave_capabilities(&mut cached_response);
-                    *process_state.cached_init_response.write().await = Some(cached_response);
+                // Check if this is an initialize response that we should cache and inject capabilities
+                let init_request_id = process_state.init_request_id.read().await;
+                if init_request_id.as_ref() == Some(&response.id) {
+                    drop(init_request_id); // Release read lock
+                    inject_tidewave_capabilities(&mut client_response);
+                    *process_state.cached_init_response.write().await =
+                        Some(client_response.clone());
                 }
 
                 // Check if this response contains a new sessionId
@@ -899,7 +995,40 @@ async fn handle_process_message(
 
                 // Send to the correct WebSocket
                 if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-                    let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(client_response)));
+                    let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                        client_response,
+                    )));
+                } else {
+                    debug!("Missing original websocket for request {}", response.id);
+                    // Fallback: Client disconnected, try to find session and forward to new websocket
+                    let proxy_to_session = process_state.proxy_to_session_ids.read().await;
+                    if let Some((session_id, client_id)) =
+                        proxy_to_session.get(&response.id).cloned()
+                    {
+                        drop(proxy_to_session); // Release read lock before potential writes
+
+                        // Find the current websocket for this session
+                        if let Some(current_websocket_id) =
+                            state.session_to_websocket.get(&session_id)
+                        {
+                            let current_websocket_id = *current_websocket_id;
+
+                            // Create response with original client ID
+                            let mut client_response = response.clone();
+                            client_response.id = client_id;
+
+                            // Send to the current websocket for this session
+                            if let Some(tx) = state.websocket_senders.get(&current_websocket_id) {
+                                let _ = tx.send(WebSocketMessage::JsonRpc(
+                                    JsonRpcMessage::Response(client_response),
+                                ));
+                            }
+                        }
+
+                        // Clean up the session mapping
+                        let mut proxy_to_session = process_state.proxy_to_session_ids.write().await;
+                        proxy_to_session.remove(&response.id);
+                    }
                 }
 
                 // Clean up ID mappings
@@ -917,7 +1046,8 @@ async fn handle_process_message(
 
                     // Add notification ID if this is a notification
                     let mut routed_message = message.clone();
-                    let buffer_id = if let JsonRpcMessage::Notification(ref mut n) = routed_message {
+                    let buffer_id = if let JsonRpcMessage::Notification(ref mut n) = routed_message
+                    {
                         let notif_id = session_state.generate_notification_id();
 
                         // Add _meta.tidewave.ai/notificationId to params
@@ -957,7 +1087,9 @@ async fn handle_process_message(
                     };
 
                     // Buffer the message in the session
-                    let _buffer_id = session_state.add_to_buffer(routed_message.clone(), buffer_id).await;
+                    let _buffer_id = session_state
+                        .add_to_buffer(routed_message.clone(), buffer_id)
+                        .await;
 
                     // Route to appropriate WebSocket based on session_id
                     if let Some(websocket_id) = state.session_to_websocket.get(&session_id) {
@@ -1016,16 +1148,6 @@ fn inject_tidewave_capabilities(response: &mut JsonRpcResponse) {
     }
 }
 
-fn is_initialize_response(response: &JsonRpcResponse) -> bool {
-    // Check if this looks like an initialize response
-    if let Some(result) = &response.result {
-        if let Some(obj) = result.as_object() {
-            return obj.contains_key("protocolVersion") && obj.contains_key("agentCapabilities");
-        }
-    }
-    false
-}
-
 fn extract_session_id_from_message(message: &JsonRpcMessage) -> Option<String> {
     let params = match message {
         JsonRpcMessage::Request(req) => req.params.as_ref(),
@@ -1035,6 +1157,17 @@ fn extract_session_id_from_message(message: &JsonRpcMessage) -> Option<String> {
 
     if let Some(p) = params {
         if let Some(obj) = p.as_object() {
+            if let Some(session_id) = obj.get("sessionId") {
+                return session_id.as_str().map(|s| s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_session_id_from_request(request: &JsonRpcRequest) -> Option<String> {
+    if let Some(params) = &request.params {
+        if let Some(obj) = params.as_object() {
             if let Some(session_id) = obj.get("sessionId") {
                 return session_id.as_str().map(|s| s.to_string());
             }
@@ -1083,6 +1216,8 @@ async fn send_exit_notification(
     };
 
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Notification(exit_notification)));
+        let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Notification(
+            exit_notification,
+        )));
     }
 }

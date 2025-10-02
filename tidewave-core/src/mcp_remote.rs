@@ -316,10 +316,21 @@ pub async fn mcp_remote_client_handler(
     }
 
     // Look up the session in the registry
-    let session = state.registry.get(&session_id).ok_or_else(|| {
-        error!("Session not found: {}", session_id);
-        StatusCode::NOT_FOUND
-    })?;
+    let session = match state.registry.get(&session_id) {
+        Some(session) => session,
+        None => {
+            error!("Session not found: {}", session_id);
+            let error_response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_rpc_message.get("id"),
+                "error": {
+                    "code": -32000,
+                    "message": "Browser is not connected. Abort any generation until a manual user retry."
+                }
+            });
+            return Ok(Json(error_response).into_response());
+        }
+    };
 
     // Create response channel if this is a request (has "id")
     let (response_tx, response_rx) = if json_rpc_message.get("id").is_some() {
@@ -360,7 +371,7 @@ pub async fn mcp_remote_client_handler(
                     "id": json_rpc_message.get("id"),
                     "error": {
                         "code": -32000,
-                        "message": "timed out waiting for answer"
+                        "message": "Timed out waiting for response."
                     }
                 });
                 Ok(Json(timeout_error).into_response())
