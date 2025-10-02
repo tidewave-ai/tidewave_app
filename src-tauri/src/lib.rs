@@ -112,7 +112,7 @@ pub fn run() {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
                 let server_config = config.clone();
                 rt.block_on(async move {
-                    if let Err(e) = tidewave_core::start_http_server(server_config).await {
+                    if let Err(e) = tidewave_core::start_http_server(server_config, Box::new(|| {})).await {
                         error!("HTTP server error: {}", e);
                         std::process::exit(1);
                     }
@@ -136,9 +136,14 @@ pub fn run() {
             });
 
             let app_handle_for_server = app.handle().clone();
+            let app_handle_for_open = app.handle().clone();
             let server_config = config.clone();
             let _server_handle = tauri::async_runtime::spawn(async move {
-                if let Err(e) = tidewave_core::start_http_server(server_config).await {
+                let ready_callback = Box::new(move || {
+                    open_tidewave(&app_handle_for_open, port);
+                });
+
+                if let Err(e) = tidewave_core::start_http_server(server_config, ready_callback).await {
                     app_handle_for_server.dialog()
                         .message(format!("HTTP server error: {}", e))
                         .kind(MessageDialogKind::Error)
@@ -146,13 +151,6 @@ pub fn run() {
                         .blocking_show();
                     app_handle_for_server.exit(1);
                 }
-            });
-
-            // Open Tidewave in browser after a short delay to let server boot
-            let app_handle_for_open = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                open_tidewave(&app_handle_for_open, port);
             });
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open Tidewave", true, None::<&str>)?;

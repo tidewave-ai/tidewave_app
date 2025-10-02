@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug!("Config: {:?}", config);
     }
 
-    if let Err(e) = tidewave_core::start_http_server(config).await {
+    if let Err(e) = tidewave_core::start_http_server(config, Box::new(|| {})).await {
         error!("Server error: {}", e);
         std::process::exit(1);
     }

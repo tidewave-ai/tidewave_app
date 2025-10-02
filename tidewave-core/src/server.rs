@@ -24,7 +24,10 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_http_server(
+    config: Config,
+    ready_callback: Box<dyn FnOnce() + Send>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
 
@@ -50,6 +53,9 @@ pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error:
 
     let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
     info!("HTTP server running on port {}", port);
+
+    ready_callback();
+
     axum::serve(listener, app).await?;
     Ok(())
 }
