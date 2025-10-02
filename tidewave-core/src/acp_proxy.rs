@@ -12,7 +12,6 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::HashMap,
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -147,9 +146,9 @@ pub struct ProcessState {
     pub next_proxy_id: Arc<AtomicU64>,
 
     // ID mapping for multiplexed connections
-    pub client_to_proxy_ids: Arc<RwLock<HashMap<(WebSocketId, Value), Value>>>,
-    pub proxy_to_client_ids: Arc<RwLock<HashMap<Value, (WebSocketId, Value)>>>,
-    pub proxy_to_session_ids: Arc<RwLock<HashMap<Value, (SessionId, Value)>>>,
+    pub client_to_proxy_ids: Arc<DashMap<(WebSocketId, Value), Value>>,
+    pub proxy_to_client_ids: Arc<DashMap<Value, (WebSocketId, Value)>>,
+    pub proxy_to_session_ids: Arc<DashMap<Value, (SessionId, Value)>>,
 
     // Cached init response
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
@@ -175,9 +174,9 @@ impl ProcessState {
             child: Arc::new(RwLock::new(None)),
             stdin_tx: Arc::new(RwLock::new(None)),
             next_proxy_id: Arc::new(AtomicU64::new(1)),
-            client_to_proxy_ids: Arc::new(RwLock::new(HashMap::new())),
-            proxy_to_client_ids: Arc::new(RwLock::new(HashMap::new())),
-            proxy_to_session_ids: Arc::new(RwLock::new(HashMap::new())),
+            client_to_proxy_ids: Arc::new(DashMap::new()),
+            proxy_to_client_ids: Arc::new(DashMap::new()),
+            proxy_to_session_ids: Arc::new(DashMap::new()),
             cached_init_response: Arc::new(RwLock::new(None)),
             init_request_id: Arc::new(RwLock::new(None)),
         }
@@ -198,7 +197,7 @@ impl ProcessState {
         Value::Number(serde_json::Number::from(id))
     }
 
-    pub async fn map_client_id_to_proxy(
+    pub fn map_client_id_to_proxy(
         &self,
         websocket_id: WebSocketId,
         client_id: Value,
@@ -206,45 +205,29 @@ impl ProcessState {
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
 
-        let mut client_to_proxy = self.client_to_proxy_ids.write().await;
-        let mut proxy_to_client = self.proxy_to_client_ids.write().await;
-
-        client_to_proxy.insert((websocket_id, client_id.clone()), proxy_id.clone());
-        proxy_to_client.insert(proxy_id.clone(), (websocket_id, client_id.clone()));
+        self.client_to_proxy_ids.insert((websocket_id, client_id.clone()), proxy_id.clone());
+        self.proxy_to_client_ids.insert(proxy_id.clone(), (websocket_id, client_id.clone()));
 
         // If this request has a session_id, also store the session mapping
         if let Some(session_id) = session_id {
-            let mut proxy_to_session = self.proxy_to_session_ids.write().await;
-            proxy_to_session.insert(proxy_id.clone(), (session_id, client_id));
+            self.proxy_to_session_ids.insert(proxy_id.clone(), (session_id, client_id));
         }
 
         proxy_id
     }
 
-    pub async fn resolve_proxy_id_to_client(
+    pub fn resolve_proxy_id_to_client(
         &self,
         proxy_id: &Value,
     ) -> Option<(WebSocketId, Value)> {
-        let proxy_to_client = self.proxy_to_client_ids.read().await;
-        proxy_to_client.get(proxy_id).cloned()
+        self.proxy_to_client_ids.get(proxy_id).map(|entry| entry.value().clone())
     }
 
-    pub async fn cleanup_id_mappings(&self, proxy_id: &Value) {
-        // Get the websocket_id and client_id first, then release the lock
-        let mapping = {
-            let mut proxy_to_client = self.proxy_to_client_ids.write().await;
-            proxy_to_client.remove(proxy_id)
-        }; // Write lock is dropped here
-
-        // Now acquire the second lock without holding the first
-        if let Some((websocket_id, client_id)) = mapping {
-            let mut client_to_proxy = self.client_to_proxy_ids.write().await;
-            client_to_proxy.remove(&(websocket_id, client_id));
+    pub fn cleanup_id_mappings(&self, proxy_id: &Value) {
+        if let Some((_, (websocket_id, client_id))) = self.proxy_to_client_ids.remove(proxy_id) {
+            self.client_to_proxy_ids.remove(&(websocket_id, client_id));
         }
-
-        // Clean up session mapping - acquire lock independently
-        let mut proxy_to_session = self.proxy_to_session_ids.write().await;
-        proxy_to_session.remove(proxy_id);
+        self.proxy_to_session_ids.remove(proxy_id);
     }
 }
 
@@ -555,8 +538,7 @@ async fn handle_initialize_request(
     // Forward initialize request with mapped ID
     let session_id = extract_session_id_from_request(request);
     let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id)
-        .await;
+        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
     let mut proxy_request = request.clone();
     proxy_request.id = proxy_id.clone();
 
@@ -700,8 +682,7 @@ async fn handle_regular_request(
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
     let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id)
-        .await;
+        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
     let mut proxy_request = request.clone();
     proxy_request.id = proxy_id;
 
@@ -966,7 +947,7 @@ async fn handle_process_message(
         JsonRpcMessage::Response(response) => {
             // Handle responses - map proxy ID back to client ID
             if let Some((websocket_id, client_id)) =
-                process_state.resolve_proxy_id_to_client(&response.id).await
+                process_state.resolve_proxy_id_to_client(&response.id)
             {
                 // Create response with original client ID
                 let mut client_response = response.clone();
@@ -1007,10 +988,9 @@ async fn handle_process_message(
                 } else {
                     debug!("Missing original websocket for request {}", response.id);
                     // Fallback: Client disconnected, try to find session and forward to new websocket
-                    let session_info = {
-                        let proxy_to_session = process_state.proxy_to_session_ids.read().await;
-                        proxy_to_session.get(&response.id).cloned()
-                    }; // Read lock is dropped here
+                    let session_info = process_state.proxy_to_session_ids
+                        .get(&response.id)
+                        .map(|entry| entry.value().clone());
 
                     if let Some((session_id, client_id)) = session_info {
                         // Find the current websocket for this session
@@ -1032,13 +1012,12 @@ async fn handle_process_message(
                         }
 
                         // Clean up the session mapping
-                        let mut proxy_to_session = process_state.proxy_to_session_ids.write().await;
-                        proxy_to_session.remove(&response.id);
+                        process_state.proxy_to_session_ids.remove(&response.id);
                     }
                 }
 
                 // Clean up ID mappings
-                process_state.cleanup_id_mappings(&response.id).await;
+                process_state.cleanup_id_mappings(&response.id);
             }
         }
         JsonRpcMessage::Request(_) | JsonRpcMessage::Notification(_) => {
