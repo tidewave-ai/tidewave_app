@@ -29,26 +29,15 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let mut config = match tidewave_core::load_config() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
     let (cli_debug, cli_port) = match &cli.command {
         Some(Commands::Serve { debug, port }) => (*debug, *port),
         None => (cli.debug, cli.port),
     };
 
-    // CLI args override config file
-    if cli_debug {
-        config.debug = true;
-    }
-    if let Some(port) = cli_port {
-        config.port = port;
-    }
+    let config = tidewave_core::Config {
+        port: cli_port.unwrap_or(9999),
+        debug: cli_debug,
+    };
 
     let filter = if config.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
