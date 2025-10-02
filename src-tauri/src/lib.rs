@@ -38,11 +38,8 @@ pub fn run() {
                 }
             };
 
-            let mut serve_only = false;
-
             match app.cli().matches() {
                 Ok(matches) => {
-                    // Check for debug flag at root level
                     if let Some(debug_arg) = matches.args.get("debug") {
                         if let Some(value) = debug_arg.value.as_bool() {
                             if value {
@@ -51,36 +48,10 @@ pub fn run() {
                         }
                     }
 
-                    // Check for port argument at root level
                     if let Some(port_arg) = matches.args.get("port") {
                         if let Some(port_str) = port_arg.value.as_str() {
                             if let Ok(p) = port_str.parse::<u16>() {
                                 config.port = p;
-                            }
-                        }
-                    }
-
-                    // Check if serve subcommand was used
-                    if let Some(subcommand) = matches.subcommand {
-                        if subcommand.name == "serve" {
-                            serve_only = true;
-
-                            // Check for debug flag in subcommand args
-                            if let Some(debug_arg) = subcommand.matches.args.get("debug") {
-                                if let Some(value) = debug_arg.value.as_bool() {
-                                    if value {
-                                        config.debug = true;
-                                    }
-                                }
-                            }
-
-                            // Check for port argument in subcommand args
-                            if let Some(port_arg) = subcommand.matches.args.get("port") {
-                                if let Some(port_str) = port_arg.value.as_str() {
-                                    if let Ok(p) = port_str.parse::<u16>() {
-                                        config.port = p;
-                                    }
-                                }
                             }
                         }
                     }
@@ -100,7 +71,6 @@ pub fn run() {
 
             if config.debug {
                 debug!("Debug logging enabled");
-                debug!("Serve only: {}", serve_only);
                 debug!("{:?}", config);
             }
 
@@ -131,13 +101,6 @@ pub fn run() {
                 }
             });
 
-            // If serve subcommand, run only the HTTP server
-            if serve_only {
-                info!("Running in server-only mode on port {}", port);
-                return Ok(());
-            }
-
-            // Normal GUI mode
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             app.deep_link()
                 .register("tidewave")

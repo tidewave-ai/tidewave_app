@@ -1,12 +1,9 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use tracing::{debug, error};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
     #[arg(short, long)]
     port: Option<u16>,
 
@@ -14,29 +11,13 @@ struct Cli {
     debug: bool,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    Serve {
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        #[arg(short, long)]
-        debug: bool,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let (cli_debug, cli_port) = match &cli.command {
-        Some(Commands::Serve { debug, port }) => (*debug, *port),
-        None => (cli.debug, cli.port),
-    };
-
     let config = tidewave_core::Config {
-        port: cli_port.unwrap_or(9832),
-        debug: cli_debug,
+        port: cli.port.unwrap_or(9832),
+        debug: cli.debug,
     };
 
     let filter = if config.debug { "debug" } else { "info" };
