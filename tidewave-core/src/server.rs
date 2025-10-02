@@ -24,7 +24,26 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_http_server(
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_http_server(config.clone()).await?;
+    serve_http_server(config, listener).await
+}
+
+pub async fn bind_http_server(
+    config: Config,
+) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+    let port = config.port;
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
+    info!("HTTP server bound to port {}", port);
+    Ok(listener)
+}
+
+pub async fn serve_http_server(
+    config: Config,
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
 
@@ -48,8 +67,6 @@ pub async fn start_http_server(config: Config) -> Result<(), Box<dyn std::error:
             verify_origin(req, next)
         }));
 
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
-    info!("HTTP server running on port {}", port);
     axum::serve(listener, app).await?;
     Ok(())
 }
