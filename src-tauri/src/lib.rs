@@ -9,8 +9,8 @@ use tauri_plugin_opener::OpenerExt;
 use tracing::{debug, info, error};
 use std::fs;
 
-const DEFAULT_CONFIG: &str = r#"# This file is used to configure Tidewave.
-# If you change this file, you must restart Tidewave for your changes to take place.
+const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
+# If you change this file, you must ask Tidewave to reload configuration.
 
 # port = 9999
 "#;
