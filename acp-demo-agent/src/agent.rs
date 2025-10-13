@@ -1,8 +1,8 @@
 use agent_client_protocol as acp;
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,17 +22,26 @@ pub struct PermissionRequest {
 }
 
 /// State for tracking error simulations per message
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ErrorCounter {
-    counters: Arc<Mutex<HashMap<String, u32>>>,
+    counters: Arc<DashMap<String, u32>>,
+}
+
+impl Default for ErrorCounter {
+    fn default() -> Self {
+        Self {
+            counters: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 impl ErrorCounter {
     fn increment(&self, key: &str) -> u32 {
-        let mut counters = self.counters.lock().unwrap();
-        let count = counters.entry(key.to_string()).or_insert(0);
-        *count += 1;
-        *count
+        self.counters
+            .entry(key.to_string())
+            .and_modify(|v| *v += 1)
+            .or_insert(1)
+            .clone()
     }
 }
 
@@ -54,6 +63,8 @@ pub struct DemoAgent {
     plan_entries: Arc<Mutex<Vec<acp::PlanEntry>>>,
     /// Next session ID counter
     next_session_id: Arc<Mutex<u64>>,
+    /// Current model per session (session_id -> model_id)
+    session_models: Arc<DashMap<String, String>>,
 }
 
 impl DemoAgent {
@@ -73,6 +84,7 @@ impl DemoAgent {
             error_counters: ErrorCounter::default(),
             plan_entries: Arc::new(Mutex::new(Vec::new())),
             next_session_id: Arc::new(Mutex::new(0)),
+            session_models: Arc::new(DashMap::new()),
         }
     }
 
@@ -112,6 +124,25 @@ impl DemoAgent {
     async fn stream_text_response(&self, text: &str, session_id: &acp::SessionId) -> Result<()> {
         debug!("Streaming text response: {}", text);
 
+        // Get the current model for this session
+        let model = self
+            .session_models
+            .get(session_id.0.as_ref())
+            .map(|v| v.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        // Determine delay based on model: slow=500ms, default=50ms, fast=0ms
+        let delay_ms = if self.rapid_mode {
+            0
+        } else {
+            match model.as_str() {
+                "slow" => 500,
+                "fast" => 0,
+                _ => 50, // default
+            }
+        };
+
+        // Stream word by word for all models
         let words: Vec<&str> = text.split_whitespace().collect();
 
         for (i, word) in words.iter().enumerate() {
@@ -142,9 +173,9 @@ impl DemoAgent {
             rx.await
                 .map_err(|_| anyhow!("Failed to wait for notification acknowledgment"))?;
 
-            // Add delay for realistic typing unless in rapid mode
-            if !self.rapid_mode {
-                sleep(Duration::from_millis(50)).await;
+            // Add delay between words based on model speed
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
             }
         }
 
@@ -735,10 +766,40 @@ impl acp::Agent for DemoAgent {
         *session_counter += 1;
         drop(session_counter);
 
+        let session_id_str = session_id.to_string();
+
+        // Initialize session with default model
+        self.session_models
+            .insert(session_id_str.clone(), "default".to_string());
+
         Ok(acp::NewSessionResponse {
-            session_id: acp::SessionId(session_id.to_string().into()),
+            session_id: acp::SessionId(session_id_str.into()),
             modes: None,
             meta: None,
+            models: Some(acp::SessionModelState {
+                current_model_id: acp::ModelId("default".into()),
+                available_models: Vec::from([
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("default".into()),
+                        name: "Auto".into(),
+                        description: None,
+                        meta: None,
+                    },
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("slow".into()),
+                        name: "Slow".into(),
+                        description: None,
+                        meta: None,
+                    },
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("fast".into()),
+                        name: "Fast".into(),
+                        description: None,
+                        meta: None,
+                    },
+                ]),
+                meta: None,
+            }),
         })
     }
 
@@ -750,6 +811,30 @@ impl acp::Agent for DemoAgent {
         Ok(acp::LoadSessionResponse {
             modes: None,
             meta: None,
+            models: Some(acp::SessionModelState {
+                current_model_id: acp::ModelId("default".into()),
+                available_models: Vec::from([
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("default".into()),
+                        name: "Auto".into(),
+                        description: None,
+                        meta: None,
+                    },
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("slow".into()),
+                        name: "Slow".into(),
+                        description: None,
+                        meta: None,
+                    },
+                    acp::ModelInfo {
+                        model_id: acp::ModelId("fast".into()),
+                        name: "Fast".into(),
+                        description: None,
+                        meta: None,
+                    },
+                ]),
+                meta: None,
+            }),
         })
     }
 
@@ -759,6 +844,39 @@ impl acp::Agent for DemoAgent {
     ) -> Result<acp::SetSessionModeResponse, acp::Error> {
         info!("Received set session mode request: {:?}", args);
         Ok(acp::SetSessionModeResponse::default())
+    }
+
+    async fn set_session_model(
+        &self,
+        args: acp::SetSessionModelRequest,
+    ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+        info!("Received set session model request: {:?}", args);
+
+        let available_models = vec!["default", "slow", "fast"];
+        let model_id_str = args.model_id.0.as_ref();
+
+        // Validate the model ID
+        if !available_models.contains(&model_id_str) {
+            error!(
+                "Invalid model ID: {}. Available models: {:?}",
+                model_id_str, available_models
+            );
+            return Err(acp::Error::invalid_params());
+        }
+
+        // Store the model selection for this session
+        self.session_models.insert(
+            args.session_id.0.as_ref().to_string(),
+            model_id_str.to_string(),
+        );
+
+        info!(
+            "Session {} model set to: {}",
+            args.session_id.0.as_ref(),
+            model_id_str
+        );
+
+        Ok(acp::SetSessionModelResponse::default())
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {

@@ -104,6 +104,26 @@ pub struct TidewaveExitParams {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetSessionModelParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "modelId")]
+    pub model_id: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewSessionResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _meta: Option<Value>,
+}
+
 // ============================================================================
 // Server State Types
 // ============================================================================
@@ -159,6 +179,7 @@ pub struct SessionState {
     pub process_key: ProcessKey,
     pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
     pub notification_id_counter: Arc<AtomicU64>,
+    pub models: Arc<RwLock<Option<Value>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +258,7 @@ impl SessionState {
             process_key,
             message_buffer: Arc::new(RwLock::new(Vec::new())),
             notification_id_counter: Arc::new(AtomicU64::new(1)),
+            models: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -640,11 +662,18 @@ async fn handle_session_load_request(
             let _ = tx.send(WebSocketMessage::JsonRpc(buffered.message));
         }
 
-        // Send success response
+        // Send success response with model state
+        let response_data = NewSessionResponse {
+            session_id: params.session_id.clone(),
+            models: session_state.models.read().await.clone(),
+            modes: None,
+            _meta: None,
+        };
+
         let success_response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id.clone(),
-            result: Some(Value::Object(Map::new())),
+            result: serde_json::to_value(response_data).ok(),
             error: None,
         };
 
@@ -678,6 +707,22 @@ async fn handle_regular_request(
             return Ok(());
         }
     };
+
+    // Intercept session/set_model to update stored model state
+    if request.method == "session/set_model" {
+        if let Ok(params) = serde_json::from_value::<SetSessionModelParams>(
+            request.params.clone().unwrap_or(Value::Null)
+        ) {
+            if let Some(session_state) = state.sessions.get(&params.session_id) {
+                let mut models_guard = session_state.models.write().await;
+                if let Some(models) = models_guard.as_mut() {
+                    if let Some(models_obj) = models.as_object_mut() {
+                        models_obj.insert("currentModelId".to_string(), params.model_id);
+                    }
+                }
+            }
+        }
+    }
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
@@ -962,20 +1007,23 @@ async fn handle_process_message(
                         Some(client_response.clone());
                 }
 
-                // Check if this response contains a new sessionId
-                if let Some(session_id) = extract_session_id_from_response(&client_response) {
-                    // Check if this sessionId is new (not already in our session mappings)
-                    if !state.session_to_websocket.contains_key(&session_id) {
-                        // This is a new session (likely from session/new response)
-                        let process_key = find_process_key_for_websocket(state, websocket_id).await;
+                // Check if this response contains a new session (likely from session/new)
+                if let Some(result) = &client_response.result {
+                    if let Ok(new_session) = serde_json::from_value::<NewSessionResponse>(result.clone()) {
+                        // Check if this sessionId is new (not already in our session mappings)
+                        if !state.session_to_websocket.contains_key(&new_session.session_id) {
+                            let process_key = find_process_key_for_websocket(state, websocket_id).await;
 
-                        if let Some(process_key) = process_key {
-                            // Create session state
-                            let session_state = Arc::new(SessionState::new(process_key));
-                            state.sessions.insert(session_id.clone(), session_state);
+                            if let Some(process_key) = process_key {
+                                // Create session state and store model state
+                                let session_state = Arc::new(SessionState::new(process_key));
+                                *session_state.models.write().await = new_session.models;
 
-                            // Map session to websocket
-                            state.session_to_websocket.insert(session_id, websocket_id);
+                                state.sessions.insert(new_session.session_id.clone(), session_state);
+
+                                // Map session to websocket
+                                state.session_to_websocket.insert(new_session.session_id, websocket_id);
+                            }
                         }
                     }
                 }
@@ -1153,17 +1201,6 @@ fn extract_session_id_from_message(message: &JsonRpcMessage) -> Option<String> {
 fn extract_session_id_from_request(request: &JsonRpcRequest) -> Option<String> {
     if let Some(params) = &request.params {
         if let Some(obj) = params.as_object() {
-            if let Some(session_id) = obj.get("sessionId") {
-                return session_id.as_str().map(|s| s.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn extract_session_id_from_response(response: &JsonRpcResponse) -> Option<String> {
-    if let Some(result) = &response.result {
-        if let Some(obj) = result.as_object() {
             if let Some(session_id) = obj.get("sessionId") {
                 return session_id.as_str().map(|s| s.to_string());
             }
