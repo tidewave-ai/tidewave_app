@@ -1,3 +1,121 @@
+/**
+The idea behind the ACP Proxy is similar to our MCP Proxy 
+(https://github.com/tidewave-ai/mcp_proxy_rust):
+We keep the ACP session alive for the agent side, and allow the
+client (the browser) to reconnect when necessary.
+
+We do this by handling the minimal subset of ACP messages we need to
+handle (init, new sessions) to keep track of active sessions and
+add our own custom messages using the protocol extensibility features
+(https://agentclientprotocol.com/protocol/extensibility)
+to support a "_tidewave.ai/session/load" request for loading chats that
+are still active on the agent side.
+
+An overview of our extensions:
+
+1. Custom load session request
+
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "_tidewave.ai/session/load",
+      "params": {
+        "sessionId": "sess_123456",
+        "latestId": "foo",
+      }
+    }
+    
+    The client needs to pass the sessionId, as well as the "latestId", which
+    is the most recent ID it successfully processed.
+    
+    We respond with the same format as the ACP `session/new` response, including
+    supported session modes and models.
+    
+    In case the session cannot be loaded, we respond with a JSON-RPC error, reason
+    "Session not found".
+
+2. Custom agentCapabilities
+
+    We inject a `tidewave.ai` meta key into the agent capabilities:
+
+    {
+      "jsonrpc": "2.0",
+      "id": 0,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "_meta": {
+            "tidewave.ai": {
+              "session/load": true
+            }
+          } 
+        }
+      }
+    }
+
+3. tidewave.ai/notificationId injection
+
+    We inject a custom `tidewave.ai/notificationId` meta property into notifications:
+
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "sess_abc123def456",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "I'll analyze your code for potential issues. Let me examine it..."
+          }
+        },
+        "_meta": {
+          "tidewave.ai/notificationId": "notif_12"
+        }
+      }
+    }
+
+4. Client acknowledgements
+
+    A client can acknowledge messages (so we can prune the buffer):
+
+    {
+      "jsonrpc": "2.0",
+      "method": "_tidewave.ai/ack",
+      "params": {
+        "latestId": "notif_12"
+      }
+    }
+
+5. Exit notifications
+
+    To tell a client when an ACP process dies, we send a custom `_tidewave.ai/exit` notification:
+
+    {
+      "jsonrpc": "2.0",
+      "method": "_tidewave.ai/exit",
+      "params": {
+        "error": "process_exit",
+        "message": "ACP process exited with code 137"
+      }
+    }
+
+The proxy keeps a mapping of sessionId to the active socket connection.
+There is a bit of nuance to how to do this. Imagine the following situation:
+
+1. A client connects to the socket and starts an ACP session.
+2. The client starts a prompt (JSON-RPC request with - let's assume - ID 1)
+3. The client reconnects (browser reload).
+4. The client load the session and receives buffered notifications.
+5. The agent finishes and sends the response to the initial request.
+
+Now, we have an issue, because the browser did not send that original request.
+Because of this, we don't use the ACP SDK in the browser, but instead handle raw
+JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
+any requests to the new connection.
+*/
+
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{
@@ -39,6 +157,8 @@ pub enum JsonRpcMessage {
 }
 
 // Internal message type for WebSocket communication
+// Usually, we pass raw JSON-RPC messages back and forth,
+// but we also handle custom "ping" / "pong" plaintext messages.
 #[derive(Debug, Clone)]
 pub enum WebSocketMessage {
     JsonRpc(JsonRpcMessage),
@@ -91,7 +211,7 @@ pub struct SessionLoadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TidewaveAckRequest {
+pub struct TidewaveAckNotification {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     #[serde(rename = "latestId")]
@@ -104,6 +224,8 @@ pub struct TidewaveExitParams {
     pub message: String,
 }
 
+// to keep the current model update for our custom session load,
+// we intercept session/set_model and store the updated modelId
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetSessionModelParams {
     #[serde(rename = "sessionId")]
@@ -112,6 +234,8 @@ pub struct SetSessionModelParams {
     pub model_id: Value,
 }
 
+// we also have a type for the session response, which we try to parse
+// to see if we need to track a new session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSessionResponse {
     #[serde(rename = "sessionId")]
@@ -129,7 +253,7 @@ pub struct NewSessionResponse {
 // ============================================================================
 
 pub type WebSocketId = Uuid;
-pub type ProcessKey = String; // Hash of command + init params
+pub type ProcessKey = String; // command + init params
 pub type SessionId = String;
 pub type NotificationId = String;
 
@@ -141,9 +265,9 @@ pub struct AcpProxyState {
     pub websocket_senders: Arc<DashMap<WebSocketId, mpsc::UnboundedSender<WebSocketMessage>>>,
     /// Sessions (session_id -> session_state)
     pub sessions: Arc<DashMap<SessionId, Arc<SessionState>>>,
-    /// Session to WebSocket mapping (session_id -> websocket_id) - only for active connections
+    /// Session to WebSocket mapping (session_id -> websocket_id)
     pub session_to_websocket: Arc<DashMap<SessionId, WebSocketId>>,
-    /// WebSocket to Process mapping (websocket_id -> process_key) - for routing regular requests
+    /// WebSocket to Process mapping (websocket_id -> process_key)
     pub websocket_to_process: Arc<DashMap<WebSocketId, ProcessKey>>,
 }
 
@@ -813,13 +937,13 @@ async fn handle_ack_notification(
     websocket_id: WebSocketId,
     notification: &JsonRpcNotification,
 ) -> Result<()> {
-    let params: TidewaveAckRequest =
+    let params: TidewaveAckNotification =
         serde_json::from_value(notification.params.clone().unwrap_or(Value::Null))
             .map_err(|e| anyhow!("Invalid ack params: {}", e))?;
 
     // Find the specific session to prune
     if let Some(session_state) = state.sessions.get(&params.session_id) {
-        // Verify this websocket is actually connected to this session (security check)
+        // Verify this websocket is actually connected to this session
         if let Some(mapped_websocket_id) = state.session_to_websocket.get(&params.session_id) {
             if *mapped_websocket_id == websocket_id {
                 session_state.prune_buffer(&params.latest_id).await;
@@ -993,18 +1117,21 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
             }
         };
 
-        match exit_status {
+        let exit_message = match exit_status {
             Ok(status) => {
                 if status.success() {
                     info!("Process exited successfully");
+                    format!("ACP process exited with code {}", status.code().unwrap_or(0))
                 } else {
                     error!("Process exited with status: {}", status);
+                    format!("ACP process exited with code {}", status.code().unwrap_or(-1))
                 }
             }
             Err(e) => {
                 error!("Failed to wait for process: {}", e);
+                format!("ACP process failed: {}", e)
             }
-        }
+        };
 
         // Send exit notification to all connected websockets
         // We need to find all websockets connected to this process
@@ -1032,8 +1159,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                 send_exit_notification(
                     &state_exit,
                     websocket_id,
-                    "process_exited",
-                    "The ACP process has exited",
+                    "process_exit",
+                    &exit_message,
                 )
                 .await;
             }
