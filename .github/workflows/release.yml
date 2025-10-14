@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ensure-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_name: ${{ steps.determine-release.outputs.release_name }}
+    steps:
+      - name: Create or update release
+        id: determine-release
+        shell: bash
+        run: |
+          repo="${GITHUB_REPOSITORY}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            ref_name="${GITHUB_REF_NAME}"
+            title="${ref_name}"
+            flags=""
+            update_existing=false
+          else
+            ref_name="nightly"
+            title="Nightly"
+            notes="Automated nightly build for ${GITHUB_SHA}."
+            flags="--notes \"${notes}\" --prerelease"
+            update_existing=true
+          fi
+
+          if ! gh release view -R "${repo}" "${ref_name}" 2>/dev/null; then
+            eval gh release create -R \"${repo}\" \"${ref_name}\" \
+              --title \"${title}\" \
+              ${flags}
+          elif [ "${update_existing}" = true ]; then
+            gh release edit -R "${repo}" "${ref_name}" \
+              --notes "${notes}"
+          fi
+
+          echo "release_name=${ref_name}" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: ensure-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            os: macos
+            cli_targets: "x86_64-apple-darwin aarch64-apple-darwin"
+            gui_targets: "x86_64-apple-darwin aarch64-apple-darwin"
+          - platform: windows-latest
+            os: windows
+            cli_targets: "x86_64-pc-windows-msvc"
+            gui_targets: "x86_64-pc-windows-msvc"
+          - platform: ubuntu-latest
+            os: linux
+            cli_targets: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+            gui_targets: "x86_64-unknown-linux-gnu"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cargo/bin
+
+      - name: Install targets
+        shell: bash
+        run: |
+          for target in ${{ matrix.cli_targets }}; do
+            rustup target add $target
+          done
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            musl-tools \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Tauri CLI
+        if: matrix.gui_targets
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Build Tauri app
+        if: matrix.gui_targets
+        shell: bash
+        run: |
+          for target in ${{ matrix.gui_targets }}; do
+            echo "Building GUI for $target"
+            cargo tauri build --target $target
+          done
+
+      - name: Build CLI binaries
+        shell: bash
+        run: |
+          for target in ${{ matrix.cli_targets }}; do
+            echo "Building CLI for $target"
+
+            # Set linker for aarch64 cross-compilation
+            if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            elif [[ "$target" == "aarch64-unknown-linux-musl" ]]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+            fi
+
+            cargo build -p tidewave-cli --release --target $target
+          done
+
+      - name: Upload artifacts
+        shell: bash
+        run: |
+          release_name="${{ needs.ensure-release.outputs.release_name }}"
+
+          product_name=$(jq -r '.productName' src-tauri/tauri.conf.json)
+          app_version=$(jq -r '.version' src-tauri/tauri.conf.json)
+
+          # Upload GUI artifacts
+          if [ -n "${{ matrix.gui_targets }}" ]; then
+            if [ "${{ matrix.os }}" = "macos" ]; then
+              for target in ${{ matrix.gui_targets }}; do
+                if [[ "$target" == *"x86_64"* ]]; then
+                  arch="x64"
+                  bundle_arch="x64"
+                else
+                  arch="arm64"
+                  bundle_arch="aarch64"
+                fi
+
+                dmg_path="target/$target/release/bundle/dmg/${product_name}_${app_version}_${bundle_arch}.dmg"
+                if [ ! -f "$dmg_path" ]; then
+                  echo "Expected DMG not found at ${dmg_path}" >&2
+                  exit 1
+                fi
+
+                cp "$dmg_path" tidewave-app-macos-$arch.dmg
+                gh release upload --clobber "${release_name}" tidewave-app-macos-$arch.dmg
+              done
+            elif [ "${{ matrix.os }}" = "windows" ]; then
+              for target in ${{ matrix.gui_targets }}; do
+                msi_path="target/$target/release/bundle/msi/${product_name}_${app_version}_x64_en-US.msi"
+                if [ ! -f "$msi_path" ]; then
+                  echo "Expected MSI not found at ${msi_path}" >&2
+                  exit 1
+                fi
+
+                cp "$msi_path" tidewave-app-windows-x64.msi
+                gh release upload --clobber "${release_name}" tidewave-app-windows-x64.msi
+
+                # Upload NSIS .exe (disabled for now)
+                # nsis_path="target/$target/release/bundle/nsis/${product_name}_${app_version}_x64.exe"
+                # cp "$nsis_path" tidewave-app-windows-x64.exe
+                # gh release upload --clobber "${release_name}" tidewave-app-windows-x64.exe
+              done
+            elif [ "${{ matrix.os }}" = "linux" ]; then
+              for target in ${{ matrix.gui_targets }}; do
+                # Upload .deb (disabled for now)
+                # deb_path="target/$target/release/bundle/deb/${product_name}_${app_version}_amd64.deb"
+                # cp "$deb_path" tidewave-app-linux-x64.deb
+                # gh release upload --clobber "${release_name}" tidewave-app-linux-x64.deb
+
+                # Upload .AppImage (Tauri emits AppImages with `amd64` suffix even for x86_64 targets)
+                appimage_path="target/$target/release/bundle/appimage/${product_name}_${app_version}_amd64.AppImage"
+                if [ ! -f "$appimage_path" ]; then
+                  echo "Expected AppImage not found at ${appimage_path}" >&2
+                  exit 1
+                fi
+
+                cp "$appimage_path" tidewave-app-linux-x64.AppImage
+                gh release upload --clobber "${release_name}" tidewave-app-linux-x64.AppImage
+              done
+            fi
+          fi
+
+          # Upload CLI binaries
+          for target in ${{ matrix.cli_targets }}; do
+            binary_name="tidewave"
+            if [ "${{ matrix.os }}" = "windows" ]; then
+              binary_name="tidewave.exe"
+            fi
+
+            src="target/$target/release/$binary_name"
+            dest="tidewave-cli-$target"
+            if [ "${{ matrix.os }}" = "windows" ]; then
+              dest="$dest.exe"
+            fi
+
+            cp "$src" "$dest"
+            gh release upload --clobber "${release_name}" "$dest"
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
