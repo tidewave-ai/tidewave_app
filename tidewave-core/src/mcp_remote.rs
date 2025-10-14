@@ -1,3 +1,14 @@
+/// The idea behind the MCP-Remote socket is to provide a kind of "reverse proxy"
+/// for ACP agents to connect to the Tidewave Web tools (browser_eval, restart_app_server).
+///
+/// To do this, the browser connects to the /acp/mcp-remote socket, providing an ID.
+/// Then, when the browser tells the ACP agent what MCP servers to connect to,
+/// it also provides the same ID as a query parameter. The agent will then send POST
+/// requests to the /acp/mcp-remote-client endpoint in streamable HTTP format.
+///
+/// When receiving such a POST request, we look up the registered browsers in memory
+/// and forward the raw MCP message to the browser. The response is routed back to the agent.
+///  
 use axum::{
     body::Bytes,
     extract::{
@@ -7,13 +18,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
-    sync::{mpsc, oneshot, RwLock},
+    sync::{mpsc, oneshot},
     time::timeout,
 };
 use tracing::{debug, error, info, warn};
@@ -28,9 +39,13 @@ pub struct McpSession {
 
 #[derive(Debug)]
 pub enum McpMessage {
-    System {
-        message: String,
-    },
+    /// The browser sends two kinds of "system" messages:
+    ///
+    ///     1. "register-sessionId" to register itself for a specific session ID.
+    ///     2. "ping", which we'll reply to with a "pong".
+    ///
+    /// Any other messages are wrapped JSON-RPC messages.
+    System { message: String },
     JsonRpc {
         session_id: String,
         json_rpc_message: Value,
@@ -41,14 +56,14 @@ pub enum McpMessage {
 #[derive(Clone)]
 pub struct McpRemoteState {
     pub registry: McpRegistry,
-    pub awaiting_answers: Arc<RwLock<HashMap<(String, Value), oneshot::Sender<Value>>>>,
+    pub awaiting_answers: Arc<DashMap<(String, Value), oneshot::Sender<Value>>>,
 }
 
 impl McpRemoteState {
     pub fn new() -> Self {
         Self {
             registry: Arc::new(DashMap::new()),
-            awaiting_answers: Arc::new(RwLock::new(HashMap::new())),
+            awaiting_answers: Arc::new(DashMap::new()),
         }
     }
 }
@@ -98,7 +113,7 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
     let (tx, mut rx) = mpsc::unbounded_channel::<McpMessage>();
 
     // Track registered session IDs for cleanup
-    let registered_sessions = Arc::new(RwLock::new(Vec::<String>::new()));
+    let registered_sessions = Arc::new(DashSet::<String>::new());
 
     // Task to send messages to WebSocket
     let sender_task = {
@@ -149,7 +164,7 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
                         if let Some(response_tx) = response_tx {
                             if let Some(id) = json_rpc_message.get("id") {
                                 let key = (session_id, id.clone());
-                                awaiting_answers.write().await.insert(key, response_tx);
+                                awaiting_answers.insert(key, response_tx);
                             }
                         }
 
@@ -194,10 +209,7 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
                             registry.insert(session_id.to_string(), session);
 
                             // Track this session for cleanup
-                            registered_sessions
-                                .write()
-                                .await
-                                .push(session_id.to_string());
+                            registered_sessions.insert(session_id.to_string());
 
                             // Send registration confirmation
                             if let Err(e) = tx.send(McpMessage::System {
@@ -221,7 +233,7 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
                         // Check if this is a reply to a pending request
                         if let Some(id) = message.json_rpc_message.get("id") {
                             let key = (message.session_id.clone(), id.clone());
-                            if let Some(response_tx) = awaiting_answers.write().await.remove(&key) {
+                            if let Some((_, response_tx)) = awaiting_answers.remove(&key) {
                                 // This is a reply to a pending request
                                 if let Err(_) = response_tx.send(message.json_rpc_message.clone()) {
                                     warn!("Failed to send response to waiting request");
@@ -262,23 +274,23 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
     let _ = tokio::join!(sender_task, receiver_task);
 
     // Cleanup: Remove all registered sessions from registry
-    let sessions_to_cleanup = registered_sessions.read().await.clone();
+    let sessions_to_cleanup: Vec<String> = registered_sessions.iter().map(|s| s.clone()).collect();
     for session_id in sessions_to_cleanup {
         debug!("Cleaning up session: {}", session_id);
         state.registry.remove(&session_id);
 
         // Clean up any pending responses for this session and notify waiters
-        let mut awaiting = state.awaiting_answers.write().await;
-        let mut to_remove = Vec::new();
+        // First, collect all keys for this session
+        let keys_to_remove: Vec<_> = state
+            .awaiting_answers
+            .iter()
+            .filter(|entry| entry.key().0 == session_id)
+            .map(|entry| entry.key().clone())
+            .collect();
 
-        for (key, _) in awaiting.iter() {
-            if key.0 == session_id {
-                to_remove.push(key.clone());
-            }
-        }
-
-        for key in to_remove {
-            if let Some(tx) = awaiting.remove(&key) {
+        // Remove each key and send error response
+        for key in keys_to_remove {
+            if let Some((_, tx)) = state.awaiting_answers.remove(&key) {
                 // Send an error response to any waiting requests
                 let _ = tx.send(serde_json::json!({
                     "error": {
