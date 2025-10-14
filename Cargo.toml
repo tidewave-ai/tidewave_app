@@ -4,7 +4,6 @@ members = [
     "tidewave-core",
     "tidewave-cli",
     "src-tauri",
-    "acp-demo-agent",
 ]
 
 [patch.crates-io]
