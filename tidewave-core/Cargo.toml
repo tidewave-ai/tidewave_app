@@ -7,12 +7,13 @@ edition = "2021"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+toml = "0.8
 dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 async-stream = "0.3"

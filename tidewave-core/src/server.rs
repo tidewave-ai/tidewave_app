@@ -1,3 +1,4 @@
+use crate::config::Config;
 use axum::{
     body::Body,
     extract::{Query, Request},
@@ -23,33 +24,36 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
 }
 
-async fn verify_origin(
-    req: Request,
-    next: axum::middleware::Next,
-) -> Result<Response<Body>, StatusCode> {
-    let headers = req.headers();
-
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
-            error!("ServerConfig not found in request extensions");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if !config.allowed_origins.contains(&origin_str.to_string()) {
-            debug!("Rejected request with origin: {}", origin_str);
-            return Err(StatusCode::FORBIDDEN);
-        }
-
-        return Ok(next.run(req).await);
-    }
-
-    Ok(next.run(req).await)
+pub async fn start_http_server(
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_http_server(config.clone()).await?;
+    serve_http_server(config, listener).await
 }
 
-pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn bind_http_server(
+    config: Config,
+) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+    let port = config.port;
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
+    info!("HTTP server bound to port {}", port);
+    Ok(listener)
+}
+
+pub async fn serve_http_server(
+    config: Config,
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_with_shutdown(config, listener, std::future::pending()).await
+}
+
+pub async fn serve_http_server_with_shutdown(
+    config: Config,
+    listener: TcpListener,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
+    let port = config.port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
     let acp_state = crate::acp_proxy::AcpProxyState::new();
 
@@ -94,10 +98,35 @@ pub async fn start_http_server(port: u16) -> Result<(), Box<dyn std::error::Erro
         .merge(mcp_routes)
         .merge(acp_routes);
 
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
-    info!("HTTP server running on port {}", port);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
+}
+
+async fn verify_origin(
+    req: Request,
+    next: axum::middleware::Next,
+) -> Result<Response<Body>, StatusCode> {
+    let headers = req.headers();
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+            error!("ServerConfig not found in request extensions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if !config.allowed_origins.contains(&origin_str.to_string()) {
+            debug!("Rejected request with origin: {}", origin_str);
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        return Ok(next.run(req).await);
+    }
+
+    Ok(next.run(req).await)
 }
 
 async fn proxy_handler(

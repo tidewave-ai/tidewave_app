@@ -1,12 +1,26 @@
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
+    Manager,
 };
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
-use tracing::{debug, error, info};
+use tracing::{debug, info, error};
+use std::fs;
+use std::sync::{Arc, Mutex};
+
+struct ServerState {
+    handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
+# If you change this file, you must restart Tidewave.
+
+# port = 9832
+"#;
 
 pub fn run() {
     tauri::Builder::default()
@@ -17,48 +31,34 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let mut port = 9999;
-            let mut serve_only = false;
-            let mut debug_mode = false;
+        .setup(|app| tauri::async_runtime::block_on(async move {
+            let mut config = match tidewave_core::load_config() {
+                Ok(config) => config,
+                Err(e) => {
+                    error!("Failed to load config: {}", e);
+                    app.dialog()
+                        .message(format!("Failed to load config file: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Config Error")
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+            };
 
             match app.cli().matches() {
                 Ok(matches) => {
-                    // Check for debug flag at root level
                     if let Some(debug_arg) = matches.args.get("debug") {
                         if let Some(value) = debug_arg.value.as_bool() {
-                            debug_mode = value;
+                            if value {
+                                config.debug = true;
+                            }
                         }
                     }
 
-                    // Check for port argument at root level
                     if let Some(port_arg) = matches.args.get("port") {
                         if let Some(port_str) = port_arg.value.as_str() {
                             if let Ok(p) = port_str.parse::<u16>() {
-                                port = p;
-                            }
-                        }
-                    }
-
-                    // Check if serve subcommand was used
-                    if let Some(subcommand) = matches.subcommand {
-                        if subcommand.name == "serve" {
-                            serve_only = true;
-
-                            // Check for debug flag in subcommand args
-                            if let Some(debug_arg) = subcommand.matches.args.get("debug") {
-                                if let Some(value) = debug_arg.value.as_bool() {
-                                    debug_mode = value;
-                                }
-                            }
-
-                            // Check for port argument in subcommand args
-                            if let Some(port_arg) = subcommand.matches.args.get("port") {
-                                if let Some(port_str) = port_arg.value.as_str() {
-                                    if let Ok(p) = port_str.parse::<u16>() {
-                                        port = p;
-                                    }
-                                }
+                                config.port = p;
                             }
                         }
                     }
@@ -67,7 +67,7 @@ pub fn run() {
             }
 
             // Initialize tracing
-            let filter = if debug_mode {
+            let filter = if config.debug {
                 "debug"
             } else {
                 "info"
@@ -76,26 +76,56 @@ pub fn run() {
                 .with_env_filter(filter)
                 .init();
 
-            if debug_mode {
+            if config.debug {
                 debug!("Debug logging enabled");
-                debug!("Port: {}", port);
-                debug!("Serve only: {}", serve_only);
+                debug!("{:?}", config);
             }
 
-            // If serve subcommand, run only the HTTP server
-            if serve_only {
-                info!("Starting in server-only mode on port {}", port);
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-                rt.block_on(async move {
-                    if let Err(e) = tidewave_core::start_http_server(port).await {
-                        error!("HTTP server error: {}", e);
-                        std::process::exit(1);
-                    }
-                });
-                return Ok(());
-            }
+            let port = config.port;
 
-            // Normal GUI mode
+            let listener = match tidewave_core::bind_http_server(config.clone()).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    app.dialog()
+                        .message(format!("Failed to bind HTTP server: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Error")
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+            };
+
+            // Create shutdown signal channel
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+            let handle_holder = Arc::new(Mutex::new(None));
+            let handle_holder_clone = handle_holder.clone();
+
+            let app_handle_for_server = app.handle().clone();
+            let server_config = config.clone();
+            let server_handle = tauri::async_runtime::spawn(async move {
+                let shutdown_signal = async move {
+                    let _ = shutdown_rx.changed().await;
+                };
+
+                if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, listener, shutdown_signal).await {
+                    app_handle_for_server.dialog()
+                        .message(format!("HTTP server error: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Error")
+                        .blocking_show();
+                    app_handle_for_server.exit(1);
+                }
+            });
+
+            *handle_holder.lock().unwrap() = Some(server_handle);
+
+            // Store server state for cleanup on restart
+            app.manage(ServerState {
+                handle: handle_holder_clone,
+                shutdown_tx,
+            });
+
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             app.deep_link()
                 .register("tidewave")
@@ -110,32 +140,66 @@ pub fn run() {
                 handle_urls(&app_handle_for_open, port, &event.urls());
             });
 
-            let app_handle_for_server = app.handle().clone();
-            let _server_handle = tauri::async_runtime::spawn(async move {
-                if let Err(e) = tidewave_core::start_http_server(port).await {
-                    app_handle_for_server.dialog()
-                        .message(format!("HTTP server error: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Error")
-                        .blocking_show();
-                    app_handle_for_server.exit(1);
-                }
-            });
+            open_tidewave(&app.handle(), port);
 
-            let test_i = MenuItem::with_id(app, "test", "test", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&test_i, &quit_i])?;
+            let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, None::<&str>)?;
+            let open_config_i = MenuItem::with_id(app, "open_config", "Settings...", true, None::<&str>)?;
+            let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
             .menu(&menu)
             .icon(app.default_window_icon().unwrap().clone())
-            .on_menu_event(|app, event| match event.id.as_ref() {
+            .on_menu_event(move |app, event| match event.id.as_ref() {
                 "quit" => {
                     debug!("quit menu item was clicked");
                     app.exit(0);
                 }
-                "test" => {
-                    debug!("test menu item clicked");
+                "open_tidewave" => {
+                    open_tidewave(app, port);
+                }
+                "open_config" => {
+                    if let Err(e) = open_config_file(app) {
+                        error!("Failed to open config file: {}", e);
+                        app.dialog()
+                            .message(format!("Failed to open config file: {}", e))
+                            .kind(MessageDialogKind::Error)
+                            .title("Error")
+                            .blocking_show();
+                    }
+                }
+                "restart" => {
+                    match tidewave_core::load_config() {
+                        Ok(config) => {
+                            info!("Reloaded config: {:?}", config);
+                            info!("Restarting application to apply new configuration...");
+
+                            // Trigger graceful shutdown and wait for server to stop
+                            if let Some(server_state) = app.try_state::<ServerState>() {
+                                let _ = server_state.shutdown_tx.send(true);
+
+                                // Wait for the server task to complete gracefully
+                                if let Some(handle) = server_state.handle.lock().unwrap().take() {
+                                    tauri::async_runtime::block_on(async {
+                                        let _ = handle.await;
+                                    });
+                                    info!("Server shut down gracefully");
+                                }
+                            }
+
+                            app.restart();
+                        }
+                        Err(e) => {
+                            error!("Failed to reload config: {}", e);
+                            app.dialog()
+                                .message(format!("Failed to reload config file: {}", e))
+                                .kind(MessageDialogKind::Error)
+                                .title("Config Error")
+                                .blocking_show();
+                        }
+                    }
                 }
                 _ => {
                     debug!("menu item {:?} not handled", event.id);
@@ -143,9 +207,46 @@ pub fn run() {
             })
             .build(app)?;
             Ok(())
-        })
+        }))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn open_tidewave(app: &tauri::AppHandle, port: u16) {
+    debug!("Opening Tidewave in browser");
+    let url = format!("http://localhost:{}", port);
+    if let Err(e) = app.opener().open_url(url, None::<&str>) {
+        error!("Failed to open Tidewave: {}", e);
+    }
+}
+
+fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = tidewave_core::get_config_path();
+
+    if !config_path.exists() {
+        debug!("Creating config file: {:?}", config_path);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&config_path, DEFAULT_CONFIG)?;
+    }
+
+    debug!("Opening config file: {:?}", config_path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        Command::new("notepad.exe")
+            .arg(&config_path)
+            .spawn()?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        app.opener().open_path(config_path.to_str().unwrap(), None::<&str>)?;
+    }
+
+    Ok(())
 }
 
 fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
