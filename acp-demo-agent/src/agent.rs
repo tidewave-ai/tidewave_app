@@ -3,14 +3,16 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::mcp_manager::McpManager;
@@ -45,6 +47,70 @@ impl ErrorCounter {
     }
 }
 
+/// Session storage for persisting session updates
+#[derive(Clone)]
+pub struct SessionStore {
+    base_dir: PathBuf,
+}
+
+impl SessionStore {
+    pub fn new() -> Result<Self> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| anyhow!("Cannot determine home directory"))?;
+
+        let base_dir = PathBuf::from(home).join(".acp-demo-agent").join("sessions");
+        fs::create_dir_all(&base_dir)?;
+
+        Ok(Self { base_dir })
+    }
+
+    fn session_file_path(&self, session_id: &str) -> PathBuf {
+        self.base_dir.join(format!("{}.jsonl", session_id))
+    }
+
+    pub fn store_update(&self, session_id: &str, update: &acp::SessionUpdate) -> Result<()> {
+        let file_path = self.session_file_path(session_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)?;
+
+        let json = serde_json::to_string(update)?;
+        writeln!(file, "{}", json)?;
+        file.flush()?;
+
+        Ok(())
+    }
+
+    pub fn load_updates(&self, session_id: &str) -> Result<Vec<acp::SessionUpdate>> {
+        let file_path = self.session_file_path(session_id);
+
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+        let mut updates = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<acp::SessionUpdate>(&line) {
+                Ok(update) => updates.push(update),
+                Err(e) => {
+                    warn!("Failed to parse session update line: {}", e);
+                }
+            }
+        }
+
+        Ok(updates)
+    }
+}
+
 /// Demo ACP Agent that mimics the Elixir stub behavior
 pub struct DemoAgent {
     /// MCP manager for delegating complex tools
@@ -53,6 +119,10 @@ pub struct DemoAgent {
     rapid_mode: bool,
     /// Whether authentication is required
     require_auth: bool,
+    /// Whether to enable session loading
+    enable_load_session: bool,
+    /// Session store for persisting session updates
+    session_store: Option<Arc<SessionStore>>,
     /// Channel for sending session notifications
     session_tx: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
     /// Channel for requesting permissions
@@ -61,10 +131,10 @@ pub struct DemoAgent {
     error_counters: ErrorCounter,
     /// Plan entries for plan functionality
     plan_entries: Arc<Mutex<Vec<acp::PlanEntry>>>,
-    /// Next session ID counter
-    next_session_id: Arc<Mutex<u64>>,
     /// Current model per session (session_id -> model_id)
     session_models: Arc<DashMap<String, String>>,
+    /// Cancellation flags per session (session_id -> cancelled)
+    cancellation_flags: Arc<DashMap<String, Arc<AtomicBool>>>,
 }
 
 impl DemoAgent {
@@ -72,19 +142,66 @@ impl DemoAgent {
         mcp_manager: Option<McpManager>,
         rapid_mode: bool,
         require_auth: bool,
+        enable_load_session: bool,
         session_tx: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
         permission_tx: mpsc::UnboundedSender<PermissionRequest>,
     ) -> Self {
+        let session_store = if enable_load_session {
+            match SessionStore::new() {
+                Ok(store) => {
+                    info!("Session store initialized");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    warn!("Failed to initialize session store: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             mcp_manager,
             rapid_mode,
             require_auth,
+            enable_load_session,
+            session_store,
             session_tx,
             permission_tx,
             error_counters: ErrorCounter::default(),
             plan_entries: Arc::new(Mutex::new(Vec::new())),
-            next_session_id: Arc::new(Mutex::new(0)),
             session_models: Arc::new(DashMap::new()),
+            cancellation_flags: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Get or create a cancellation flag for a session
+    fn get_cancellation_flag(&self, session_id: &acp::SessionId) -> Arc<AtomicBool> {
+        self.cancellation_flags
+            .entry(session_id.0.as_ref().to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// Check if the session has been cancelled
+    fn is_cancelled(&self, session_id: &acp::SessionId) -> bool {
+        self.cancellation_flags
+            .get(session_id.0.as_ref())
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Store a session update to disk if session store is enabled
+    fn store_session_update(&self, session_id: &acp::SessionId, update: &acp::SessionUpdate) {
+        if let Some(ref store) = self.session_store {
+            if let Err(e) = store.store_update(session_id.0.as_ref(), update) {
+                warn!(
+                    "Failed to store session update for session {}: {}",
+                    session_id.0.as_ref(),
+                    e
+                );
+            }
         }
     }
 
@@ -124,6 +241,16 @@ impl DemoAgent {
     async fn stream_text_response(&self, text: &str, session_id: &acp::SessionId) -> Result<()> {
         debug!("Streaming text response: {}", text);
 
+        // Store the full text as a single AgentMessageChunk for session persistence
+        let full_text_update = acp::SessionUpdate::AgentMessageChunk {
+            content: acp::ContentBlock::Text(acp::TextContent {
+                annotations: None,
+                text: text.to_string(),
+                meta: None,
+            }),
+        };
+        self.store_session_update(session_id, &full_text_update);
+
         // Get the current model for this session
         let model = self
             .session_models
@@ -146,6 +273,12 @@ impl DemoAgent {
         let words: Vec<&str> = text.split_whitespace().collect();
 
         for (i, word) in words.iter().enumerate() {
+            // Check for cancellation before each word
+            if self.is_cancelled(session_id) {
+                warn!("Streaming cancelled for session {}", session_id.0.as_ref());
+                return Err(anyhow!("Operation cancelled"));
+            }
+
             // Prepare the chunk text (add space before word if not first)
             let chunk_text = if i == 0 {
                 word.to_string()
@@ -153,7 +286,7 @@ impl DemoAgent {
                 format!(" {}", word)
             };
 
-            // Send session notification with just this chunk
+            // Send session notification with just this chunk (for streaming display)
             let notification = acp::SessionNotification {
                 session_id: session_id.clone(),
                 update: acp::SessionUpdate::AgentMessageChunk {
@@ -684,9 +817,14 @@ impl DemoAgent {
             meta: None,
         };
 
+        let update = acp::SessionUpdate::Plan(plan);
+
+        // Store the plan update
+        self.store_session_update(session_id, &update);
+
         let notification = acp::SessionNotification {
             session_id: session_id.clone(),
-            update: acp::SessionUpdate::Plan(plan),
+            update,
             meta: None,
         };
 
@@ -711,7 +849,21 @@ impl acp::Agent for DemoAgent {
 
         Ok(acp::InitializeResponse {
             protocol_version: acp::V1,
-            agent_capabilities: acp::AgentCapabilities::default(),
+            agent_capabilities: acp::AgentCapabilities {
+                load_session: self.enable_load_session,
+                prompt_capabilities: acp::PromptCapabilities {
+                    image: false,
+                    audio: false,
+                    embedded_context: false,
+                    meta: None,
+                },
+                mcp_capabilities: acp::McpCapabilities {
+                    http: true,
+                    sse: false,
+                    meta: None,
+                },
+                meta: None,
+            },
             auth_methods: if self.require_auth {
                 vec![acp::AuthMethod {
                     id: acp::AuthMethodId("demo_auth".to_string().into()),
@@ -761,12 +913,8 @@ impl acp::Agent for DemoAgent {
             }
         }
 
-        let mut session_counter = self.next_session_id.lock().unwrap();
-        let session_id = *session_counter;
-        *session_counter += 1;
-        drop(session_counter);
-
-        let session_id_str = session_id.to_string();
+        // Generate UUID for session ID
+        let session_id_str = Uuid::new_v4().to_string();
 
         // Initialize session with default model
         self.session_models
@@ -808,6 +956,49 @@ impl acp::Agent for DemoAgent {
         args: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
         info!("Received load session request: {:?}", args);
+
+        // Check if load session is enabled
+        if !self.enable_load_session {
+            error!("Load session is disabled");
+            return Err(acp::Error::method_not_found());
+        }
+
+        // Load stored session updates
+        if let Some(ref store) = self.session_store {
+            match store.load_updates(args.session_id.0.as_ref()) {
+                Ok(updates) => {
+                    info!(
+                        "Loaded {} updates for session {}",
+                        updates.len(),
+                        args.session_id.0.as_ref()
+                    );
+
+                    // Replay all stored updates as session notifications
+                    for update in updates {
+                        let notification = acp::SessionNotification {
+                            session_id: args.session_id.clone(),
+                            update,
+                            meta: None,
+                        };
+
+                        let (tx, rx) = oneshot::channel();
+                        if let Err(e) = self.session_tx.send((notification, tx)) {
+                            error!("Failed to send session notification during load: {}", e);
+                            break;
+                        }
+
+                        if let Err(e) = rx.await {
+                            error!("Failed to wait for notification acknowledgment: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load session updates: {}", e);
+                }
+            }
+        }
+
         Ok(acp::LoadSessionResponse {
             modes: None,
             meta: None,
@@ -885,6 +1076,18 @@ impl acp::Agent for DemoAgent {
             args.prompt.len()
         );
 
+        // Clear any previous cancellation flag for this session
+        let cancel_flag = self.get_cancellation_flag(&args.session_id);
+        cancel_flag.store(false, Ordering::Relaxed);
+
+        // Store user message chunks
+        for content_block in &args.prompt {
+            let update = acp::SessionUpdate::UserMessageChunk {
+                content: content_block.clone(),
+            };
+            self.store_session_update(&args.session_id, &update);
+        }
+
         let text_content = self.extract_text_content(&args.prompt);
         info!("Processing prompt: {}", text_content);
 
@@ -899,14 +1102,38 @@ impl acp::Agent for DemoAgent {
                 meta: None,
             }),
             Err(e) => {
-                error!("Error handling prompt: {}", e);
-                Err(acp::Error::internal_error())
+                // Check if the error is due to cancellation
+                if self.is_cancelled(&args.session_id) {
+                    info!(
+                        "Prompt cancelled for session {}",
+                        args.session_id.0.as_ref()
+                    );
+                    Ok(acp::PromptResponse {
+                        stop_reason: acp::StopReason::Cancelled,
+                        meta: None,
+                    })
+                } else {
+                    error!("Error handling prompt: {}", e);
+                    Err(acp::Error::internal_error())
+                }
             }
         }
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> Result<(), acp::Error> {
-        info!("Received cancel notification: {:?}", args);
+        info!(
+            "Received cancel notification for session: {}",
+            args.session_id.0.as_ref()
+        );
+
+        // Set the cancellation flag for this session
+        let cancel_flag = self.get_cancellation_flag(&args.session_id);
+        cancel_flag.store(true, Ordering::Relaxed);
+
+        info!(
+            "Cancellation flag set for session {}",
+            args.session_id.0.as_ref()
+        );
         Ok(())
     }
 
@@ -950,12 +1177,17 @@ impl DemoAgent {
             meta: None,
         };
 
+        let update = acp::SessionUpdate::ToolCall(tool_call);
+
+        // Store the tool call update
+        self.store_session_update(session_id, &update);
+
         let (tx, rx) = oneshot::channel();
         self.session_tx
             .send((
                 acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: acp::SessionUpdate::ToolCall(tool_call),
+                    update,
                     meta: None,
                 },
                 tx,
@@ -1037,7 +1269,7 @@ impl DemoAgent {
         diff: acp::Diff,
         session_id: &acp::SessionId,
     ) -> Result<()> {
-        let update = acp::ToolCallUpdate {
+        let tool_update = acp::ToolCallUpdate {
             id: tool_id.clone(),
             meta: None,
             fields: acp::ToolCallUpdateFields {
@@ -1047,12 +1279,17 @@ impl DemoAgent {
             },
         };
 
+        let update = acp::SessionUpdate::ToolCallUpdate(tool_update);
+
+        // Store the tool call update
+        self.store_session_update(session_id, &update);
+
         let (tx, rx) = oneshot::channel();
         self.session_tx
             .send((
                 acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: acp::SessionUpdate::ToolCallUpdate(update),
+                    update,
                     meta: None,
                 },
                 tx,
@@ -1071,7 +1308,7 @@ impl DemoAgent {
         error_msg: &str,
         session_id: &acp::SessionId,
     ) -> Result<()> {
-        let update = acp::ToolCallUpdate {
+        let tool_update = acp::ToolCallUpdate {
             id: tool_id.clone(),
             meta: None,
             fields: acp::ToolCallUpdateFields {
@@ -1081,12 +1318,17 @@ impl DemoAgent {
             },
         };
 
+        let update = acp::SessionUpdate::ToolCallUpdate(tool_update);
+
+        // Store the tool call update
+        self.store_session_update(session_id, &update);
+
         let (tx, rx) = oneshot::channel();
         self.session_tx
             .send((
                 acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: acp::SessionUpdate::ToolCallUpdate(update),
+                    update,
                     meta: None,
                 },
                 tx,
@@ -1105,7 +1347,7 @@ impl DemoAgent {
         text: &str,
         session_id: &acp::SessionId,
     ) -> Result<()> {
-        let update = acp::ToolCallUpdate {
+        let tool_update = acp::ToolCallUpdate {
             id: tool_id.clone(),
             meta: None,
             fields: acp::ToolCallUpdateFields {
@@ -1121,12 +1363,17 @@ impl DemoAgent {
             },
         };
 
+        let update = acp::SessionUpdate::ToolCallUpdate(tool_update);
+
+        // Store the tool call update
+        self.store_session_update(session_id, &update);
+
         let (tx, rx) = oneshot::channel();
         self.session_tx
             .send((
                 acp::SessionNotification {
                     session_id: session_id.clone(),
-                    update: acp::SessionUpdate::ToolCallUpdate(update),
+                    update,
                     meta: None,
                 },
                 tx,

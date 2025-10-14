@@ -24,6 +24,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_auth: bool,
 
+    /// Disable session loading capability (enabled by default)
+    #[arg(long, default_value_t = false)]
+    disable_load_session: bool,
+
     /// Enable debug logging
     #[arg(long, default_value_t = false)]
     debug: bool,
@@ -43,6 +47,7 @@ async fn main() -> Result<()> {
     info!("Starting ACP Demo Agent");
     info!("Mode: {}", args.mode);
     info!("Require Auth: {}", args.require_auth);
+    info!("Load Session Enabled: {}", !args.disable_load_session);
 
     // Initialize MCP manager (servers will be connected from session requests)
     let mcp_manager = Some(McpManager::new());
@@ -72,6 +77,7 @@ async fn main() -> Result<()> {
                 mcp_manager,
                 args.mode == "rapid",
                 args.require_auth,
+                !args.disable_load_session,
                 session_tx,
                 permission_tx,
             );

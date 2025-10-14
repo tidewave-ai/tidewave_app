@@ -462,8 +462,9 @@ async fn handle_client_request(
     match request.method.as_str() {
         "initialize" => handle_initialize_request(state, websocket_id, command, request).await,
         "_tidewave.ai/session/load" => {
-            handle_session_load_request(state, websocket_id, request).await
+            handle_tidewave_session_load(state, websocket_id, request).await
         }
+        "session/load" => handle_acp_session_load(state, websocket_id, command, request).await,
         _ => handle_regular_request(state, websocket_id, command, request).await,
     }
 }
@@ -585,7 +586,7 @@ async fn handle_initialize_request(
     Ok(())
 }
 
-async fn handle_session_load_request(
+async fn handle_tidewave_session_load(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
     request: &JsonRpcRequest,
@@ -683,6 +684,69 @@ async fn handle_session_load_request(
     }
 
     Ok(())
+}
+
+async fn handle_acp_session_load(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    command: &str,
+    request: &JsonRpcRequest,
+) -> Result<()> {
+    // Extract session_id from the request params
+    let session_id = extract_session_id_from_request(request);
+
+    if let Some(session_id) = session_id {
+        // Get or create the session state
+        let process_key = match state.sessions.get(&session_id) {
+            Some(session_state) => {
+                info!(
+                    "session/load for existing session {} on websocket {}",
+                    session_id, websocket_id
+                );
+                session_state.process_key.clone()
+            }
+            None => {
+                // Session doesn't exist yet - create it
+                let process_key = match find_process_key_for_websocket(state, websocket_id).await {
+                    Some(key) => key,
+                    None => {
+                        warn!(
+                            "session/load: no process mapping found for websocket {}",
+                            websocket_id
+                        );
+                        return handle_regular_request(state, websocket_id, command, request).await;
+                    }
+                };
+
+                let session_state = Arc::new(SessionState::new(process_key.clone()));
+                state.sessions.insert(session_id.clone(), session_state);
+
+                info!(
+                    "Created new session {} for session/load on websocket {}",
+                    session_id, websocket_id
+                );
+                process_key
+            }
+        };
+
+        // Map this websocket to the session BEFORE forwarding the request
+        // This ensures that when the agent sends notifications during session/load,
+        // we can route them to the correct websocket
+        state
+            .session_to_websocket
+            .insert(session_id.clone(), websocket_id);
+
+        // Also map websocket to process
+        state.websocket_to_process.insert(websocket_id, process_key);
+
+        info!(
+            "Mapped websocket {} to session {} for session/load",
+            websocket_id, session_id
+        );
+    }
+
+    // Forward the request to the agent as a regular request
+    handle_regular_request(state, websocket_id, command, request).await
 }
 
 async fn handle_regular_request(
@@ -1007,23 +1071,26 @@ async fn handle_process_message(
                         Some(client_response.clone());
                 }
 
-                // Check if this response contains a new session (likely from session/new)
+                // Check if this response contains a new session (likely from session/new or session/load)
                 if let Some(result) = &client_response.result {
-                    if let Ok(new_session) = serde_json::from_value::<NewSessionResponse>(result.clone()) {
+                    if let Ok(session_response) = serde_json::from_value::<NewSessionResponse>(result.clone()) {
                         // Check if this sessionId is new (not already in our session mappings)
-                        if !state.session_to_websocket.contains_key(&new_session.session_id) {
+                        if !state.sessions.contains_key(&session_response.session_id) {
                             let process_key = find_process_key_for_websocket(state, websocket_id).await;
 
                             if let Some(process_key) = process_key {
                                 // Create session state and store model state
                                 let session_state = Arc::new(SessionState::new(process_key));
-                                *session_state.models.write().await = new_session.models;
+                                *session_state.models.write().await = session_response.models;
 
-                                state.sessions.insert(new_session.session_id.clone(), session_state);
+                                state.sessions.insert(session_response.session_id.clone(), session_state);
 
                                 // Map session to websocket
-                                state.session_to_websocket.insert(new_session.session_id, websocket_id);
+                                state.session_to_websocket.insert(session_response.session_id, websocket_id);
                             }
+                        } else if let Some(session_state) = state.sessions.get(&session_response.session_id) {
+                            // Session already exists (e.g., from session/load), update model state
+                            *session_state.models.write().await = session_response.models;
                         }
                     }
                 }
