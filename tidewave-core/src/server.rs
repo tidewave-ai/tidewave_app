@@ -44,6 +44,14 @@ pub async fn serve_http_server(
     config: Config,
     listener: TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_with_shutdown(config, listener, std::future::pending()).await
+}
+
+pub async fn serve_http_server_with_shutdown(
+    config: Config,
+    listener: TcpListener,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
 
@@ -67,7 +75,9 @@ pub async fn serve_http_server(
             verify_origin(req, next)
         }));
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 

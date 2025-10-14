@@ -1,6 +1,7 @@
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
+    Manager,
 };
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -8,6 +9,12 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tracing::{debug, info, error};
 use std::fs;
+use std::sync::{Arc, Mutex};
+
+struct ServerState {
+    handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
 
 const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
 # If you change this file, you must restart Tidewave.
@@ -88,10 +95,20 @@ pub fn run() {
                 }
             };
 
+            // Create shutdown signal channel
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+            let handle_holder = Arc::new(Mutex::new(None));
+            let handle_holder_clone = handle_holder.clone();
+
             let app_handle_for_server = app.handle().clone();
             let server_config = config.clone();
-            let _server_handle = tauri::async_runtime::spawn(async move {
-                if let Err(e) = tidewave_core::serve_http_server(server_config, listener).await {
+            let server_handle = tauri::async_runtime::spawn(async move {
+                let shutdown_signal = async move {
+                    let _ = shutdown_rx.changed().await;
+                };
+
+                if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, listener, shutdown_signal).await {
                     app_handle_for_server.dialog()
                         .message(format!("HTTP server error: {}", e))
                         .kind(MessageDialogKind::Error)
@@ -99,6 +116,14 @@ pub fn run() {
                         .blocking_show();
                     app_handle_for_server.exit(1);
                 }
+            });
+
+            *handle_holder.lock().unwrap() = Some(server_handle);
+
+            // Store server state for cleanup on restart
+            app.manage(ServerState {
+                handle: handle_holder_clone,
+                shutdown_tx,
             });
 
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -150,6 +175,20 @@ pub fn run() {
                         Ok(config) => {
                             info!("Reloaded config: {:?}", config);
                             info!("Restarting application to apply new configuration...");
+
+                            // Trigger graceful shutdown and wait for server to stop
+                            if let Some(server_state) = app.try_state::<ServerState>() {
+                                let _ = server_state.shutdown_tx.send(true);
+
+                                // Wait for the server task to complete gracefully
+                                if let Some(handle) = server_state.handle.lock().unwrap().take() {
+                                    tauri::async_runtime::block_on(async {
+                                        let _ = handle.await;
+                                    });
+                                    info!("Server shut down gracefully");
+                                }
+                            }
+
                             app.restart();
                         }
                         Err(e) => {
