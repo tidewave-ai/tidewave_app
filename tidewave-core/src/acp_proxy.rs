@@ -226,22 +226,24 @@ impl ProcessState {
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
 
-        self.client_to_proxy_ids.insert((websocket_id, client_id.clone()), proxy_id.clone());
-        self.proxy_to_client_ids.insert(proxy_id.clone(), (websocket_id, client_id.clone()));
+        self.client_to_proxy_ids
+            .insert((websocket_id, client_id.clone()), proxy_id.clone());
+        self.proxy_to_client_ids
+            .insert(proxy_id.clone(), (websocket_id, client_id.clone()));
 
         // If this request has a session_id, also store the session mapping
         if let Some(session_id) = session_id {
-            self.proxy_to_session_ids.insert(proxy_id.clone(), (session_id, client_id));
+            self.proxy_to_session_ids
+                .insert(proxy_id.clone(), (session_id, client_id));
         }
 
         proxy_id
     }
 
-    pub fn resolve_proxy_id_to_client(
-        &self,
-        proxy_id: &Value,
-    ) -> Option<(WebSocketId, Value)> {
-        self.proxy_to_client_ids.get(proxy_id).map(|entry| entry.value().clone())
+    pub fn resolve_proxy_id_to_client(&self, proxy_id: &Value) -> Option<(WebSocketId, Value)> {
+        self.proxy_to_client_ids
+            .get(proxy_id)
+            .map(|entry| entry.value().clone())
     }
 
     pub fn cleanup_id_mappings(&self, proxy_id: &Value) {
@@ -560,8 +562,8 @@ async fn handle_initialize_request(
 
     // Forward initialize request with mapped ID
     let session_id = extract_session_id_from_request(request);
-    let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
+    let proxy_id =
+        process_state.map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
     let mut proxy_request = request.clone();
     proxy_request.id = proxy_id.clone();
 
@@ -775,7 +777,7 @@ async fn handle_regular_request(
     // Intercept session/set_model to update stored model state
     if request.method == "session/set_model" {
         if let Ok(params) = serde_json::from_value::<SetSessionModelParams>(
-            request.params.clone().unwrap_or(Value::Null)
+            request.params.clone().unwrap_or(Value::Null),
         ) {
             if let Some(session_state) = state.sessions.get(&params.session_id) {
                 let mut models_guard = session_state.models.write().await;
@@ -790,8 +792,8 @@ async fn handle_regular_request(
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
-    let proxy_id = process_state
-        .map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
+    let proxy_id =
+        process_state.map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
     let mut proxy_request = request.clone();
     proxy_request.id = proxy_id;
 
@@ -1073,22 +1075,31 @@ async fn handle_process_message(
 
                 // Check if this response contains a new session (likely from session/new or session/load)
                 if let Some(result) = &client_response.result {
-                    if let Ok(session_response) = serde_json::from_value::<NewSessionResponse>(result.clone()) {
+                    if let Ok(session_response) =
+                        serde_json::from_value::<NewSessionResponse>(result.clone())
+                    {
                         // Check if this sessionId is new (not already in our session mappings)
                         if !state.sessions.contains_key(&session_response.session_id) {
-                            let process_key = find_process_key_for_websocket(state, websocket_id).await;
+                            let process_key =
+                                find_process_key_for_websocket(state, websocket_id).await;
 
                             if let Some(process_key) = process_key {
                                 // Create session state and store model state
                                 let session_state = Arc::new(SessionState::new(process_key));
                                 *session_state.models.write().await = session_response.models;
 
-                                state.sessions.insert(session_response.session_id.clone(), session_state);
+                                state
+                                    .sessions
+                                    .insert(session_response.session_id.clone(), session_state);
 
                                 // Map session to websocket
-                                state.session_to_websocket.insert(session_response.session_id, websocket_id);
+                                state
+                                    .session_to_websocket
+                                    .insert(session_response.session_id, websocket_id);
                             }
-                        } else if let Some(session_state) = state.sessions.get(&session_response.session_id) {
+                        } else if let Some(session_state) =
+                            state.sessions.get(&session_response.session_id)
+                        {
                             // Session already exists (e.g., from session/load), update model state
                             *session_state.models.write().await = session_response.models;
                         }
@@ -1103,7 +1114,8 @@ async fn handle_process_message(
                 } else {
                     debug!("Missing original websocket for request {}", response.id);
                     // Fallback: Client disconnected, try to find session and forward to new websocket
-                    let session_info = process_state.proxy_to_session_ids
+                    let session_info = process_state
+                        .proxy_to_session_ids
                         .get(&response.id)
                         .map(|entry| entry.value().clone());
 

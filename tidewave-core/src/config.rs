@@ -24,7 +24,10 @@ pub fn get_config_path() -> PathBuf {
         std::env::var("HOME").expect("HOME environment variable not set")
     };
 
-    PathBuf::from(home).join(".config").join("tidewave").join("app.toml")
+    PathBuf::from(home)
+        .join(".config")
+        .join("tidewave")
+        .join("app.toml")
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -46,8 +49,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 
     port = 0..65535"#;
 
-    let table = content.parse::<toml::Table>()
-        .map_err(|_| error_message)?;
+    let table = content.parse::<toml::Table>().map_err(|_| error_message)?;
 
     let config = match (table.len(), table.get("port")) {
         (0, None) => Config {
@@ -55,12 +57,8 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
             debug: false,
         },
         (1, Some(toml::Value::Integer(port))) => {
-            let port = u16::try_from(*port)
-                .map_err(|_| error_message)?;
-            Config {
-                port,
-                debug: false,
-            }
+            let port = u16::try_from(*port).map_err(|_| error_message)?;
+            Config { port, debug: false }
         }
         _ => {
             return Err(error_message.into());

@@ -1,3 +1,5 @@
+use std::fs;
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -7,9 +9,7 @@ use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
-use tracing::{debug, info, error};
-use std::fs;
-use std::sync::{Arc, Mutex};
+use tracing::{debug, error, info};
 
 struct ServerState {
     handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
@@ -236,14 +236,13 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        Command::new("notepad.exe")
-            .arg(&config_path)
-            .spawn()?;
+        Command::new("notepad.exe").arg(&config_path).spawn()?;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        app.opener().open_path(config_path.to_str().unwrap(), None::<&str>)?;
+        app.opener()
+            .open_path(config_path.to_str().unwrap(), None::<&str>)?;
     }
 
     Ok(())
