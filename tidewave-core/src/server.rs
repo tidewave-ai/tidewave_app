@@ -165,7 +165,7 @@ async fn proxy_handler(
             "upgrade",
             "accept-encoding",
             "content-encoding",
-            "origin"
+            "origin",
         ]
         .contains(&key_str)
         {

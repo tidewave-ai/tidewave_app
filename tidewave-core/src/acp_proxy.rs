@@ -1,5 +1,5 @@
 /**
-The idea behind the ACP Proxy is similar to our MCP Proxy 
+The idea behind the ACP Proxy is similar to our MCP Proxy
 (https://github.com/tidewave-ai/mcp_proxy_rust):
 We keep the ACP session alive for the agent side, and allow the
 client (the browser) to reconnect when necessary.
@@ -24,13 +24,13 @@ An overview of our extensions:
         "latestId": "foo",
       }
     }
-    
+
     The client needs to pass the sessionId, as well as the "latestId", which
     is the most recent ID it successfully processed.
-    
+
     We respond with the same format as the ACP `session/new` response, including
     supported session modes and models.
-    
+
     In case the session cannot be loaded, we respond with a JSON-RPC error, reason
     "Session not found".
 
@@ -49,7 +49,7 @@ An overview of our extensions:
             "tidewave.ai": {
               "session/load": true
             }
-          } 
+          }
         }
       }
     }
@@ -115,7 +115,6 @@ Because of this, we don't use the ACP SDK in the browser, but instead handle raw
 JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
 any requests to the new connection.
 */
-
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{
@@ -125,7 +124,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -296,7 +295,12 @@ pub struct ProcessState {
 
     // Cached init response
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
+
+    // We store the request ID of init, session/new and session/load
+    // because we need to handle their responses.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
+    pub new_request_ids: Arc<DashSet<Value>>,
+    pub load_request_ids: Arc<DashMap<Value, SessionId>>,
 }
 
 pub struct SessionState {
@@ -324,6 +328,8 @@ impl ProcessState {
             proxy_to_session_ids: Arc::new(DashMap::new()),
             cached_init_response: Arc::new(RwLock::new(None)),
             init_request_id: Arc::new(RwLock::new(None)),
+            new_request_ids: Arc::new(DashSet::<Value>::new()),
+            load_request_ids: Arc::new(DashMap::new()),
         }
     }
 
@@ -898,28 +904,43 @@ async fn handle_regular_request(
         }
     };
 
-    // Intercept session/set_model to update stored model state
-    if request.method == "session/set_model" {
-        if let Ok(params) = serde_json::from_value::<SetSessionModelParams>(
-            request.params.clone().unwrap_or(Value::Null),
-        ) {
-            if let Some(session_state) = state.sessions.get(&params.session_id) {
-                let mut models_guard = session_state.models.write().await;
-                if let Some(models) = models_guard.as_mut() {
-                    if let Some(models_obj) = models.as_object_mut() {
-                        models_obj.insert("currentModelId".to_string(), params.model_id);
+    // Map client ID to proxy ID
+    let session_id = extract_session_id_from_request(request);
+    let proxy_id =
+        process_state.map_client_id_to_proxy(websocket_id, request.id.clone(), session_id.clone());
+    let mut proxy_request = request.clone();
+    proxy_request.id = proxy_id.clone();
+
+    match request.method.as_str() {
+        // Intercept session/set_model to update stored model state
+        "session/set_model" => {
+            if let Ok(params) = serde_json::from_value::<SetSessionModelParams>(
+                request.params.clone().unwrap_or(Value::Null),
+            ) {
+                if let Some(session_state) = state.sessions.get(&params.session_id) {
+                    let mut models_guard = session_state.models.write().await;
+                    if let Some(models) = models_guard.as_mut() {
+                        if let Some(models_obj) = models.as_object_mut() {
+                            models_obj.insert("currentModelId".to_string(), params.model_id);
+                        }
                     }
                 }
             }
         }
+        // we need to store the proxy_id to store the models from the response
+        // for a future tidewave.ai/session/load
+        "session/new" => {
+            process_state.new_request_ids.insert(proxy_id.clone());
+        }
+        "session/load" => {
+            if let Some(session_id) = session_id.clone() {
+                process_state
+                    .load_request_ids
+                    .insert(proxy_id.clone(), session_id);
+            }
+        }
+        _ => (),
     }
-
-    // Map client ID to proxy ID
-    let session_id = extract_session_id_from_request(request);
-    let proxy_id =
-        process_state.map_client_id_to_proxy(websocket_id, request.id.clone(), session_id);
-    let mut proxy_request = request.clone();
-    proxy_request.id = proxy_id;
 
     // Forward to process
     if let Err(e) = process_state
@@ -1121,10 +1142,16 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
             Ok(status) => {
                 if status.success() {
                     info!("Process exited successfully");
-                    format!("ACP process exited with code {}", status.code().unwrap_or(0))
+                    format!(
+                        "ACP process exited with code {}",
+                        status.code().unwrap_or(0)
+                    )
                 } else {
                     error!("Process exited with status: {}", status);
-                    format!("ACP process exited with code {}", status.code().unwrap_or(-1))
+                    format!(
+                        "ACP process exited with code {}",
+                        status.code().unwrap_or(-1)
+                    )
                 }
             }
             Err(e) => {
@@ -1156,13 +1183,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
 
             // Send exit notification to all connected websockets
             for websocket_id in websockets_to_notify {
-                send_exit_notification(
-                    &state_exit,
-                    websocket_id,
-                    "process_exit",
-                    &exit_message,
-                )
-                .await;
+                send_exit_notification(&state_exit, websocket_id, "process_exit", &exit_message)
+                    .await;
             }
 
             // Clean up the process from the state
@@ -1200,35 +1222,50 @@ async fn handle_process_message(
                         Some(client_response.clone());
                 }
 
-                // Check if this response contains a new session (likely from session/new or session/load)
-                if let Some(result) = &client_response.result {
-                    if let Ok(session_response) =
-                        serde_json::from_value::<NewSessionResponse>(result.clone())
-                    {
-                        // Check if this sessionId is new (not already in our session mappings)
-                        if !state.sessions.contains_key(&session_response.session_id) {
-                            let process_key =
-                                find_process_key_for_websocket(state, websocket_id).await;
-
-                            if let Some(process_key) = process_key {
-                                // Create session state and store model state
-                                let session_state = Arc::new(SessionState::new(process_key));
-                                *session_state.models.write().await = session_response.models;
-
-                                state
-                                    .sessions
-                                    .insert(session_response.session_id.clone(), session_state);
-
-                                // Map session to websocket
-                                state
-                                    .session_to_websocket
-                                    .insert(session_response.session_id, websocket_id);
-                            }
-                        } else if let Some(session_state) =
-                            state.sessions.get(&session_response.session_id)
+                // Check if this is a session/new response and create a new session
+                if let Some(_) = process_state.new_request_ids.remove(&response.id) {
+                    if let Some(result) = &client_response.result {
+                        if let Ok(session_response) =
+                            serde_json::from_value::<NewSessionResponse>(result.clone())
                         {
-                            // Session already exists (e.g., from session/load), update model state
-                            *session_state.models.write().await = session_response.models;
+                            // Check if this sessionId is new (not already in our session mappings)
+                            if !state.sessions.contains_key(&session_response.session_id) {
+                                let process_key =
+                                    find_process_key_for_websocket(state, websocket_id).await;
+
+                                if let Some(process_key) = process_key {
+                                    // Create session state and store model state
+                                    let session_state = Arc::new(SessionState::new(process_key));
+                                    *session_state.models.write().await = session_response.models;
+
+                                    state
+                                        .sessions
+                                        .insert(session_response.session_id.clone(), session_state);
+
+                                    // Map session to websocket
+                                    state
+                                        .session_to_websocket
+                                        .insert(session_response.session_id, websocket_id);
+                                }
+                            } else if let Some(session_state) =
+                                state.sessions.get(&session_response.session_id)
+                            {
+                                // Session already exists (e.g., from session/load), update model state
+                                *session_state.models.write().await = session_response.models;
+                            }
+                        }
+                    }
+                }
+
+                // Check if this is a session/load response, to update the stored models
+                if let Some((_proxy_id, session_id)) = process_state.load_request_ids.remove(&response.id) {
+                    if let Some(result) = &client_response.result {
+                        if let Some(obj) = result.as_object() {
+                            if let Some(models) = obj.get("models") {
+                                if let Some(session_state) = state.sessions.get(&session_id) {
+                                    *session_state.models.write().await = Some(models.clone());
+                                }
+                            }
                         }
                     }
                 }
