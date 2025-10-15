@@ -2,6 +2,9 @@ name: Release
 
 on:
   push:
+    branches:
+      # TODO:
+      - 'wm-release'
     tags:
       - 'v*.*.*'
   schedule:
@@ -107,14 +110,73 @@ jobs:
         if: matrix.gui_targets
         run: cargo install tauri-cli --version "^2.0.0" --locked
 
+      - name: Install Apple certificate
+        if: matrix.os == 'macos'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: secret
+        run: |
+          # Only run if certificate is provided
+          if [ -n "$P12_BASE64" ]; then
+            # Create variables
+            CERTIFICATE_PATH=$RUNNER_TEMP/apple_certificate.p12
+            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+            echo -n "$P12_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+
+            # Create temporary keychain
+            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+            # Import certificate to keychain
+            security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            security list-keychain -d user -s $KEYCHAIN_PATH
+          fi
+
       - name: Build Tauri app
         if: matrix.gui_targets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: |
           for target in ${{ matrix.gui_targets }}; do
             echo "Building GUI for $target"
             cargo tauri build --target $target
           done
+
+      - name: Verify macOS code signing and notarization
+        if: matrix.os == 'macos' && matrix.gui_targets
+        shell: bash
+        run: |
+          for target in ${{ matrix.gui_targets }}; do
+            app_path="target/$target/release/bundle/macos/tidewave.app"
+            echo "Verifying $app_path"
+            spctl -a -t exec -vvv "$app_path"
+          done
+
+      - name: Sign Windows files with Azure Trusted Signing
+        if: matrix.os == 'windows' && matrix.gui_targets
+        uses: azure/trusted-signing-action@v0.4.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\target
+          files-folder-filter: exe,msi,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Build CLI binaries
         shell: bash
