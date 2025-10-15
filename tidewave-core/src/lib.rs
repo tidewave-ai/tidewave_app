@@ -1,5 +1,7 @@
-pub mod server;
 pub mod config;
+pub mod server;
 
-pub use server::{start_http_server, bind_http_server, serve_http_server, serve_http_server_with_shutdown};
-pub use config::{Config, load_config, get_config_path};
+pub use config::{get_config_path, load_config, Config};
+pub use server::{
+    bind_http_server, serve_http_server, serve_http_server_with_shutdown, start_http_server,
+};

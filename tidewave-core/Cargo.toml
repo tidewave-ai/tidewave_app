@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 axum = "0.8"
+async-stream = "0.3.6"
+bytes = "1.10.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }

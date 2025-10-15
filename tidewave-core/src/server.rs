@@ -1,22 +1,29 @@
+use crate::config::Config;
 use axum::{
-    body::Body,
-    extract::{Query, Request},
+    body::{Body, Bytes},
+    extract::{Json, Query, Request},
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use bytes::BytesMut;
 use reqwest::Client;
 use serde::Deserialize;
 use std::env;
-use tokio::net::TcpListener;
-use tracing::{debug, info, error};
-use crate::config::Config;
+use std::process::Stdio;
+use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
+use tracing::{debug, error, info};
 
 #[derive(Deserialize)]
 struct ProxyParams {
     url: String,
+}
+
+#[derive(Deserialize)]
+struct ShellParams {
+    command: String,
 }
 
 #[derive(Clone)]
@@ -64,11 +71,13 @@ pub async fn serve_http_server_with_shutdown(
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/proxy",
+        .route("/shell", post(shell_handler))
+        .route(
+            "/proxy",
             axum::routing::any(move |params, req| {
                 let client = client.clone();
                 proxy_handler(params, req, client)
-            })
+            }),
         )
         .layer(middleware::from_fn(move |mut req: Request, next| {
             req.extensions_mut().insert(server_config.clone());
@@ -81,19 +90,19 @@ pub async fn serve_http_server_with_shutdown(
     Ok(())
 }
 
-async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
+async fn verify_origin(
+    req: Request,
+    next: axum::middleware::Next,
+) -> Result<Response<Body>, StatusCode> {
     let headers = req.headers();
 
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        let config = req
-            .extensions()
-            .get::<ServerConfig>()
-            .ok_or_else(|| {
-                error!("ServerConfig not found in request extensions");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+            error!("ServerConfig not found in request extensions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         if !config.allowed_origins.contains(&origin_str.to_string()) {
             debug!("Rejected request with origin: {}", origin_str);
@@ -104,6 +113,97 @@ async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Res
     }
 
     Ok(next.run(req).await)
+}
+
+async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
+    let (cmd, args) = get_shell_command(&payload.command);
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut stdout = Some(
+        child
+            .stdout
+            .take()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    let mut stderr = Some(
+        child
+            .stderr
+            .take()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+
+    let stream = async_stream::stream! {
+        let (mut stdout_buf, mut stderr_buf) = (vec![0u8; 4096], vec![0u8; 4096]);
+
+        loop {
+            tokio::select! {
+                result = async { stdout.as_mut().unwrap().read(&mut stdout_buf).await }, if stdout.is_some() => {
+                    match result {
+                        Ok(0) => stdout = None,
+                        Ok(n) => yield Ok(create_data_chunk(&stdout_buf[..n])),
+                        Err(e) => { yield Err(e); break; }
+                    }
+                }
+                result = async { stderr.as_mut().unwrap().read(&mut stderr_buf).await }, if stderr.is_some() => {
+                    match result {
+                        Ok(0) => stderr = None,
+                        Ok(n) => yield Ok(create_data_chunk(&stderr_buf[..n])),
+                        Err(e) => { yield Err(e); break; }
+                    }
+                }
+                else => break,
+            }
+        }
+
+        match child.wait().await {
+            Ok(status) => yield Ok(create_status_chunk(status.code().unwrap_or(-1))),
+            Err(e) => yield Err(e),
+        }
+    };
+
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+}
+
+fn create_data_chunk(data: &[u8]) -> Bytes {
+    let mut chunk = BytesMut::new();
+    chunk.extend_from_slice(&[0u8]); // type = 0 (data)
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes()); // length
+    chunk.extend_from_slice(data); // data
+    chunk.freeze()
+}
+
+fn create_status_chunk(status: i32) -> Bytes {
+    let json = format!(r#"{{"status":{}}}"#, status);
+    let mut chunk = BytesMut::new();
+    chunk.extend_from_slice(&[1u8]); // type = 1 (status)
+    chunk.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(json.as_bytes());
+    chunk.freeze()
+}
+
+fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        ("cmd.exe", vec!["/s", "/c", cmd])
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ("sh", vec!["-c", cmd])
+    }
 }
 
 async fn proxy_handler(
@@ -135,7 +235,16 @@ async fn proxy_handler(
     // Forward headers (excluding Host, connection-specific headers, and compression headers)
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
-        if !["host", "connection", "transfer-encoding", "upgrade", "accept-encoding", "content-encoding"].contains(&key_str) {
+        if ![
+            "host",
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "accept-encoding",
+            "content-encoding",
+        ]
+        .contains(&key_str)
+        {
             req_builder = req_builder.header(key.clone(), value.clone());
         }
     }
@@ -144,13 +253,10 @@ async fn proxy_handler(
     req_builder = req_builder.body(body_bytes);
 
     // Execute the request
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Proxy request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let response = req_builder.send().await.map_err(|e| {
+        error!("Proxy request failed: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
 
     // Get status and headers from the response
     let status = response.status();
@@ -166,7 +272,14 @@ async fn proxy_handler(
     // Forward response headers (excluding connection and encoding headers since we're not handling compression)
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
-        if !["connection", "transfer-encoding", "content-encoding", "content-length"].contains(&key_str) {
+        if ![
+            "connection",
+            "transfer-encoding",
+            "content-encoding",
+            "content-length",
+        ]
+        .contains(&key_str)
+        {
             resp_builder = resp_builder.header(key.clone(), value.clone());
         }
     }
@@ -177,8 +290,8 @@ async fn proxy_handler(
 }
 
 async fn root() -> Html<String> {
-    let client_url = env::var("TIDEWAVE_CLIENT_URL")
-        .unwrap_or_else(|_| "https://tidewave.ai".to_string());
+    let client_url =
+        env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
     let html = format!(
         r#"<html>
