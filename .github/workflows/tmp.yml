@@ -72,5 +72,5 @@ jobs:
         if: always()
         with:
           name: tidewave-cli
-          path: cover/default.coverdata
+          path: target/*/release/tidewave
           retention-days: 7
