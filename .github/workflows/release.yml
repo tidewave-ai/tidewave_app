@@ -2,9 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      # TODO:
-      - 'wm-release'
     tags:
       - 'v*.*.*'
   schedule:
