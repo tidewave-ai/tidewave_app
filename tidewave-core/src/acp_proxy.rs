@@ -127,6 +127,7 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::{Map, Value};
 use std::{
     process::Stdio,
@@ -301,6 +302,7 @@ pub struct ProcessState {
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
+    pub prompt_request_ids: Arc<DashMap<Value, SessionId>>,
 }
 
 pub struct SessionState {
@@ -308,6 +310,7 @@ pub struct SessionState {
     pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
     pub notification_id_counter: Arc<AtomicU64>,
     pub models: Arc<RwLock<Option<Value>>>,
+    pub prompt_running: Arc<RwLock<bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +333,7 @@ impl ProcessState {
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
             load_request_ids: Arc::new(DashMap::new()),
+            prompt_request_ids: Arc::new(DashMap::new()),
         }
     }
 
@@ -391,6 +395,7 @@ impl SessionState {
             message_buffer: Arc::new(RwLock::new(Vec::new())),
             notification_id_counter: Arc::new(AtomicU64::new(1)),
             models: Arc::new(RwLock::new(None)),
+            prompt_running: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -596,8 +601,9 @@ async fn handle_client_request(
         "_tidewave.ai/session/load" => {
             handle_tidewave_session_load(state, websocket_id, request).await
         }
-        "session/load" => handle_acp_session_load(state, websocket_id, command, request).await,
-        _ => handle_regular_request(state, websocket_id, command, request).await,
+        "session/load" => handle_acp_session_load(state, websocket_id, request).await,
+        "session/prompt" => handle_prompt(state, websocket_id, request).await,
+        _ => handle_regular_request(state, websocket_id, request).await,
     }
 }
 
@@ -800,7 +806,9 @@ async fn handle_tidewave_session_load(
             session_id: params.session_id.clone(),
             models: session_state.models.read().await.clone(),
             modes: None,
-            _meta: None,
+            _meta: Some(
+                json!({"tidewave.ai/promptRunning": *session_state.prompt_running.read().await}),
+            ),
         };
 
         let success_response = JsonRpcResponse {
@@ -821,7 +829,6 @@ async fn handle_tidewave_session_load(
 async fn handle_acp_session_load(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    command: &str,
     request: &JsonRpcRequest,
 ) -> Result<()> {
     // Extract session_id from the request params
@@ -846,7 +853,7 @@ async fn handle_acp_session_load(
                             "session/load: no process mapping found for websocket {}",
                             websocket_id
                         );
-                        return handle_regular_request(state, websocket_id, command, request).await;
+                        return handle_regular_request(state, websocket_id, request).await;
                     }
                 };
 
@@ -878,13 +885,32 @@ async fn handle_acp_session_load(
     }
 
     // Forward the request to the agent as a regular request
-    handle_regular_request(state, websocket_id, command, request).await
+    handle_regular_request(state, websocket_id, request).await
+}
+
+async fn handle_prompt(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    request: &JsonRpcRequest,
+) -> Result<()> {
+    // Extract session_id from the request params
+    let session_id = extract_session_id_from_request(request);
+
+    if let Some(session_id) = session_id {
+        if let Some(session_state) = state.sessions.get(&session_id) {
+            // we mark the session as generating to properly restore the
+            // chat status on load
+            *session_state.prompt_running.write().await = true;
+        }
+    }
+
+    // Forward the request to the agent as a regular request
+    handle_regular_request(state, websocket_id, request).await
 }
 
 async fn handle_regular_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    _command: &str,
     request: &JsonRpcRequest,
 ) -> Result<()> {
     // Look up the process for this WebSocket
@@ -936,6 +962,13 @@ async fn handle_regular_request(
             if let Some(session_id) = session_id.clone() {
                 process_state
                     .load_request_ids
+                    .insert(proxy_id.clone(), session_id);
+            }
+        }
+        "session/prompt" => {
+            if let Some(session_id) = session_id.clone() {
+                process_state
+                    .prompt_request_ids
                     .insert(proxy_id.clone(), session_id);
             }
         }
@@ -1258,7 +1291,9 @@ async fn handle_process_message(
                 }
 
                 // Check if this is a session/load response, to update the stored models
-                if let Some((_proxy_id, session_id)) = process_state.load_request_ids.remove(&response.id) {
+                if let Some((_proxy_id, session_id)) =
+                    process_state.load_request_ids.remove(&response.id)
+                {
                     if let Some(result) = &client_response.result {
                         if let Some(obj) = result.as_object() {
                             if let Some(models) = obj.get("models") {
@@ -1267,6 +1302,15 @@ async fn handle_process_message(
                                 }
                             }
                         }
+                    }
+                }
+
+                // Check if this is a session/prompt response to reset prompt_running
+                if let Some((_proxy_id, session_id)) =
+                    process_state.prompt_request_ids.remove(&response.id)
+                {
+                    if let Some(session_state) = state.sessions.get(&session_id) {
+                        *session_state.prompt_running.write().await = false;
                     }
                 }
 
