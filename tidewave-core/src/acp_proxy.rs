@@ -806,6 +806,12 @@ async fn handle_tidewave_session_load(
             session_id: params.session_id.clone(),
             models: session_state.models.read().await.clone(),
             modes: None,
+            // Because we need to know if the chat status should be set to generating
+            // after loading, we also keep track of running prompts.
+            //
+            // I'm not if concurrent prompt requests are a thing in practice, but
+            // we don't handle them here, since those should not happen with Tidewave Web as client
+            // (we disable the send button when a generation is in progress).
             _meta: Some(
                 json!({"tidewave.ai/promptRunning": *session_state.prompt_running.read().await}),
             ),
