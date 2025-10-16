@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*.*.*'
+    branches:
+      - 'wm-*'
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
   workflow_dispatch:
@@ -148,7 +150,7 @@ jobs:
             cargo tauri build --target $target
           done
 
-      - name: Verify macOS code signing and notarization
+      - name: Verify Tauri macOS app code signing and notarization
         if: matrix.os == 'macos' && matrix.gui_targets
         shell: bash
         run: |
@@ -157,23 +159,6 @@ jobs:
             echo "Verifying $app_path"
             spctl -a -t exec -vvv "$app_path"
           done
-
-      - name: Sign Windows files with Azure Trusted Signing
-        if: matrix.os == 'windows' && matrix.gui_targets
-        uses: azure/trusted-signing-action@v0.4.0
-        with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: https://eus.codesigning.azure.net/
-          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
-          files-folder: ${{ github.workspace }}\target
-          files-folder-filter: exe,msi,dll
-          files-folder-recurse: true
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
 
       - name: Build CLI binaries
         shell: bash
@@ -190,6 +175,54 @@ jobs:
 
             cargo build -p tidewave-cli --release --target $target
           done
+
+      - name: Sign and notarize macOS CLI binaries
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for target in ${{ matrix.cli_targets }}; do
+            binary_path="target/$target/release/tidewave"
+            zip_path="target/$target/release/tidewave.zip"
+
+            echo "Signing $binary_path"
+            codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+              --options runtime \
+              --timestamp \
+              "$binary_path"
+
+            codesign -vvv --deep --strict "$binary_path"
+
+            echo "Notarizing $binary_path"
+            ditto -c -k --keepParent "$binary_path" "$zip_path"
+
+            xcrun notarytool submit "$zip_path" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+          done
+
+      - name: Sign Windows files with Azure Trusted Signing
+        if: matrix.os == 'windows'
+        uses: azure/trusted-signing-action@v0.4.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\target
+          files-folder-filter: exe,msi,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Upload artifacts
         shell: bash
