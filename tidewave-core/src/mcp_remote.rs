@@ -28,12 +28,14 @@ use tokio::{
     time::timeout,
 };
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 // Global registry for MCP sessions
 pub type McpRegistry = Arc<DashMap<String, McpSession>>;
 
 #[derive(Clone, Debug)]
 pub struct McpSession {
+    pub websocket_id: Uuid,
     pub sender: mpsc::UnboundedSender<McpMessage>,
 }
 
@@ -108,6 +110,11 @@ pub async fn mcp_remote_ws_handler(
 
 async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
     debug!("MCP Remote WebSocket connection established");
+
+    // we use this to differentiate this connection from other ones,
+    // because it can happen that when reloading, the browser created and registers
+    // a new socket for a session while we did not yet clean up the old one
+    let id = Uuid::new_v4();
 
     let (ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<McpMessage>();
@@ -205,11 +212,16 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
 
                         // Handle registration
                         if let Some(session_id) = text.strip_prefix("register-") {
-                            let session = McpSession { sender: tx.clone() };
+                            let session = McpSession {
+                                sender: tx.clone(),
+                                websocket_id: id,
+                            };
                             registry.insert(session_id.to_string(), session);
 
                             // Track this session for cleanup
                             registered_sessions.insert(session_id.to_string());
+
+                            debug!("Registered MCP socket for id {}", session_id);
 
                             // Send registration confirmation
                             if let Err(e) = tx.send(McpMessage::System {
@@ -276,8 +288,16 @@ async fn handle_mcp_remote_socket(socket: WebSocket, state: McpRemoteState) {
     // Cleanup: Remove all registered sessions from registry
     let sessions_to_cleanup: Vec<String> = registered_sessions.iter().map(|s| s.clone()).collect();
     for session_id in sessions_to_cleanup {
-        debug!("Cleaning up session: {}", session_id);
-        state.registry.remove(&session_id);
+        match state
+            .registry
+            .remove_if(&session_id, |_, websocket| websocket.websocket_id == id)
+        {
+            Some(_) => debug!("Cleaned up session: {}", session_id),
+            None => debug!(
+                "Skipped cleanup of {}, because another socket is registered",
+                session_id
+            ),
+        }
 
         // Clean up any pending responses for this session and notify waiters
         // First, collect all keys for this session
