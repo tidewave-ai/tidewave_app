@@ -2003,7 +2003,8 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+        let proxy_id =
+            process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
 
         // Should have session mapping
         let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
@@ -2050,8 +2051,10 @@ mod tests {
         assert_ne!(proxy_id1, proxy_id2);
 
         // Both should resolve correctly
-        let (resolved_ws1, resolved_client1) = process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
-        let (resolved_ws2, resolved_client2) = process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+        let (resolved_ws1, resolved_client1) =
+            process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
+        let (resolved_ws2, resolved_client2) =
+            process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
 
         assert_eq!(resolved_ws1, ws_id1);
         assert_eq!(resolved_client1, client_id1);

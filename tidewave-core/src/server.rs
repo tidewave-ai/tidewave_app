@@ -11,7 +11,9 @@ use axum::{
 use bytes::BytesMut;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
+use std::path::Path;
 use std::process::Stdio;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
@@ -24,6 +26,8 @@ struct ProxyParams {
 #[derive(Deserialize)]
 struct ShellParams {
     command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -139,9 +143,13 @@ async fn verify_origin(
 
 async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
     let (cmd, args) = get_shell_command(&payload.command);
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
     let mut child = Command::new(cmd)
         .args(args)
+        .envs(env)
+        .current_dir(Path::new(&cwd))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
