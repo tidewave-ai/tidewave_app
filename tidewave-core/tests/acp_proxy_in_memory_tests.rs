@@ -87,6 +87,34 @@ fn create_fake_websocket() -> (
 }
 
 // ============================================================================
+// Test Helper Functions
+// ============================================================================
+
+/// Reads a JSON line from a stream (expects newline-terminated JSON)
+async fn read_json_line(stream: &mut DuplexStream) -> Value {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .expect("Failed to read line");
+    serde_json::from_str(&line).expect("Failed to parse JSON")
+}
+
+/// Writes a JSON value to a stream with a trailing newline and flushes
+async fn write_json_line(stream: &mut DuplexStream, value: &Value) {
+    stream
+        .write_all(value.to_string().as_bytes())
+        .await
+        .expect("Failed to write JSON");
+    stream
+        .write_all(b"\n")
+        .await
+        .expect("Failed to write newline");
+    stream.flush().await.expect("Failed to flush");
+}
+
+// ============================================================================
 // Integration Tests
 // ============================================================================
 
@@ -122,10 +150,7 @@ async fn test_websocket_init_request_flow() {
     process_started.await.expect("Process failed to start");
 
     // Read what the process received on stdin
-    let mut reader = BufReader::new(&mut test_stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
-    let received_request: Value = serde_json::from_str(&line).unwrap();
+    let received_request = read_json_line(&mut test_stdout).await;
     assert_eq!(received_request["method"], "initialize");
     let proxy_id = received_request["id"].clone();
 
@@ -138,13 +163,7 @@ async fn test_websocket_init_request_flow() {
             "agentCapabilities": {}
         }
     });
-
-    test_stdin
-        .write_all(init_response.to_string().as_bytes())
-        .await
-        .unwrap();
-    test_stdin.write_all(b"\n").await.unwrap();
-    test_stdin.flush().await.unwrap();
+    write_json_line(&mut test_stdin, &init_response).await;
 
     // Client should receive response with original ID
     let ws_msg = ws_out_rx.next().await.unwrap();
@@ -189,6 +208,9 @@ async fn test_websocket_session_new_flow() {
     // Wait for process to start
     process_started.await.expect("Process failed to start");
 
+    // Read and ignore init request from process
+    let _ = read_json_line(&mut test_stdout).await;
+
     // Send session/new request
     let session_new_request = json!({
         "jsonrpc": "2.0",
@@ -206,17 +228,8 @@ async fn test_websocket_session_new_flow() {
         )))
         .unwrap();
 
-    // Read init request from process stdin (ignore it)
-    let mut reader = BufReader::new(&mut test_stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
-    line.clear();
-
-    // Read session/new from process stdin
-    let mut reader = BufReader::new(&mut test_stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
-    let received_request: Value = serde_json::from_str(&line).unwrap();
+    // Read session/new from process
+    let received_request = read_json_line(&mut test_stdout).await;
     assert_eq!(received_request["method"], "session/new");
     assert_eq!(received_request["params"]["cwd"], "/tmp");
     let proxy_id = received_request["id"].clone();
@@ -229,13 +242,7 @@ async fn test_websocket_session_new_flow() {
             "sessionId": "sess_xyz_789"
         }
     });
-
-    test_stdin
-        .write_all(session_response.to_string().as_bytes())
-        .await
-        .unwrap();
-    test_stdin.write_all(b"\n").await.unwrap();
-    test_stdin.flush().await.unwrap();
+    write_json_line(&mut test_stdin, &session_response).await;
 
     // Client receives response
     let ws_msg = ws_out_rx.next().await.unwrap();
@@ -280,14 +287,9 @@ async fn test_websocket_notification_forwarding() {
     // Wait for process to start
     process_started.await.expect("Process failed to start");
 
-    // Read init request from stdout
-    let mut reader = BufReader::new(&mut test_stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
-    let init_req: Value = serde_json::from_str(&line).unwrap();
+    // Read init request and send response
+    let init_req = read_json_line(&mut test_stdout).await;
     let init_proxy_id = init_req["id"].clone();
-
-    // Send init response to register the connection
     let init_response = json!({
         "jsonrpc": "2.0",
         "id": init_proxy_id,
@@ -296,12 +298,7 @@ async fn test_websocket_notification_forwarding() {
             "agentCapabilities": {}
         }
     });
-    test_stdin
-        .write_all(init_response.to_string().as_bytes())
-        .await
-        .unwrap();
-    test_stdin.write_all(b"\n").await.unwrap();
-    test_stdin.flush().await.unwrap();
+    write_json_line(&mut test_stdin, &init_response).await;
 
     // Consume init response on websocket
     let _ = ws_out_rx.next().await.unwrap();
@@ -323,13 +320,9 @@ async fn test_websocket_notification_forwarding() {
         )))
         .unwrap();
 
-    // Read session/new from process
-    line.clear();
-    reader.read_line(&mut line).await.unwrap();
-    let new_req: Value = serde_json::from_str(&line).unwrap();
+    // Read session/new and respond
+    let new_req = read_json_line(&mut test_stdout).await;
     let new_proxy_id = new_req["id"].clone();
-
-    // Respond with session ID
     let new_response = json!({
         "jsonrpc": "2.0",
         "id": new_proxy_id,
@@ -337,17 +330,12 @@ async fn test_websocket_notification_forwarding() {
             "sessionId": "sess_123"
         }
     });
-    test_stdin
-        .write_all(new_response.to_string().as_bytes())
-        .await
-        .unwrap();
-    test_stdin.write_all(b"\n").await.unwrap();
-    test_stdin.flush().await.unwrap();
+    write_json_line(&mut test_stdin, &new_response).await;
 
     // Consume session/new response
     let _ = ws_out_rx.next().await.unwrap();
 
-    // Now write notification from process
+    // Write notification from process
     let notification = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -356,13 +344,7 @@ async fn test_websocket_notification_forwarding() {
             "update": "some data"
         }
     });
-
-    test_stdin
-        .write_all(notification.to_string().as_bytes())
-        .await
-        .unwrap();
-    test_stdin.write_all(b"\n").await.unwrap();
-    test_stdin.flush().await.unwrap();
+    write_json_line(&mut test_stdin, &notification).await;
 
     // Client receives notification
     let ws_msg = ws_out_rx.next().await.unwrap();
