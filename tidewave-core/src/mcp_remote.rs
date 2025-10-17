@@ -22,11 +22,8 @@ use dashmap::{DashMap, DashSet};
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::timeout,
-};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -386,27 +383,14 @@ pub async fn mcp_remote_client_handler(
 
     // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {
-        match timeout(Duration::from_secs(60), response_rx).await {
-            Ok(Ok(response)) => {
+        match response_rx.await {
+            Ok(response) => {
                 debug!("Got response: {:?}", response);
                 Ok(Json(response).into_response())
             }
-            Ok(Err(_)) => {
+            Err(_) => {
                 error!("Response channel closed unexpectedly");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
-            Err(_) => {
-                error!("Timeout waiting for response");
-                // Return proper JSON-RPC error format for timeout
-                let timeout_error = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": json_rpc_message.get("id"),
-                    "error": {
-                        "code": -32000,
-                        "message": "Timed out waiting for response."
-                    }
-                });
-                Ok(Json(timeout_error).into_response())
             }
         }
     } else {
