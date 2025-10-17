@@ -1264,11 +1264,17 @@ async fn handle_process_response(
         client_response.id = client_id;
 
         // Handle special response types
-        handle_init_response(process_state, response, &mut client_response).await;
-        handle_session_new_response(process_state, state, response, &client_response, websocket_id)
-            .await;
-        handle_session_load_response(process_state, state, response, &client_response).await;
-        handle_prompt_response(process_state, state, response).await;
+        maybe_handle_init_response(process_state, response, &mut client_response).await;
+        maybe_handle_session_new_response(
+            process_state,
+            state,
+            response,
+            &client_response,
+            websocket_id,
+        )
+        .await;
+        maybe_handle_session_load_response(process_state, state, response, &client_response).await;
+        maybe_handle_prompt_response(process_state, state, response).await;
 
         // Send to the correct WebSocket
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
@@ -1288,7 +1294,7 @@ async fn handle_process_response(
 }
 
 /// Handle initialize response - inject capabilities and cache
-async fn handle_init_response(
+async fn maybe_handle_init_response(
     process_state: &Arc<ProcessState>,
     response: &JsonRpcResponse,
     client_response: &mut JsonRpcResponse,
@@ -1297,12 +1303,13 @@ async fn handle_init_response(
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
         inject_tidewave_capabilities(client_response);
+        // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
     }
 }
 
 /// Handle session/new response - create new session and store model state
-async fn handle_session_new_response(
+async fn maybe_handle_session_new_response(
     process_state: &Arc<ProcessState>,
     state: &AcpProxyState,
     response: &JsonRpcResponse,
@@ -1343,7 +1350,7 @@ async fn handle_session_new_response(
 }
 
 /// Handle session/load response - update stored models
-async fn handle_session_load_response(
+async fn maybe_handle_session_load_response(
     process_state: &Arc<ProcessState>,
     state: &AcpProxyState,
     response: &JsonRpcResponse,
@@ -1363,7 +1370,7 @@ async fn handle_session_load_response(
 }
 
 /// Handle session/prompt response - reset prompt_running flag
-async fn handle_prompt_response(
+async fn maybe_handle_prompt_response(
     process_state: &Arc<ProcessState>,
     state: &AcpProxyState,
     response: &JsonRpcResponse,
