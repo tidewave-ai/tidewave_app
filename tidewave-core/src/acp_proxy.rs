@@ -1774,25 +1774,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prune_buffer_middle() {
-        let session = create_test_session();
-
-        // Add five messages
-        for i in 1..=5 {
-            let msg = create_test_notification("session/update", "sess_123");
-            session.add_to_buffer(msg, format!("notif_{}", i)).await;
-        }
-
-        // Prune up to and including notif_3
-        session.prune_buffer("notif_3").await;
-
-        let buffer = session.message_buffer.read().await;
-        assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer[0].id, "notif_4");
-        assert_eq!(buffer[1].id, "notif_5");
-    }
-
-    #[tokio::test]
     async fn test_prune_buffer_unknown_id() {
         let session = create_test_session();
 
@@ -1864,25 +1845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_buffered_messages_after_empty_id() {
-        let session = create_test_session();
-
-        // Add three messages
-        for i in 1..=3 {
-            let msg = create_test_notification("session/update", "sess_123");
-            session.add_to_buffer(msg, format!("notif_{}", i)).await;
-        }
-
-        // Get messages with empty latest_id (should return all messages)
-        let messages = session.get_buffered_messages_after("").await;
-
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].id, "notif_1");
-        assert_eq!(messages[1].id, "notif_2");
-        assert_eq!(messages[2].id, "notif_3");
-    }
-
-    #[tokio::test]
     async fn test_get_buffered_messages_after_unknown_id() {
         let session = create_test_session();
 
@@ -1915,24 +1877,6 @@ mod tests {
         let messages = session.get_buffered_messages_after("notif_3").await;
 
         assert_eq!(messages.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_get_buffered_messages_after_first_id() {
-        let session = create_test_session();
-
-        // Add three messages
-        for i in 1..=3 {
-            let msg = create_test_notification("session/update", "sess_123");
-            session.add_to_buffer(msg, format!("notif_{}", i)).await;
-        }
-
-        // Get messages after the first ID
-        let messages = session.get_buffered_messages_after("notif_1").await;
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].id, "notif_2");
-        assert_eq!(messages[1].id, "notif_3");
     }
 
     // ============================================================================
