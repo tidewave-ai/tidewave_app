@@ -1962,4 +1962,291 @@ mod tests {
             _ => panic!("Expected notification"),
         }
     }
+
+    // ============================================================================
+    // ProcessState ID Mapping Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_process_generate_proxy_id() {
+        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+
+        let id1 = process.generate_proxy_id();
+        let id2 = process.generate_proxy_id();
+        let id3 = process.generate_proxy_id();
+
+        assert_eq!(id1, Value::Number(serde_json::Number::from(1)));
+        assert_eq!(id2, Value::Number(serde_json::Number::from(2)));
+        assert_eq!(id3, Value::Number(serde_json::Number::from(3)));
+    }
+
+    #[tokio::test]
+    async fn test_process_id_mapping_basic() {
+        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None);
+
+        // Should be able to resolve back
+        let resolved = process.resolve_proxy_id_to_client(&proxy_id);
+        assert!(resolved.is_some());
+        let (resolved_ws, resolved_client) = resolved.unwrap();
+        assert_eq!(resolved_ws, ws_id);
+        assert_eq!(resolved_client, client_id);
+    }
+
+    #[tokio::test]
+    async fn test_process_id_mapping_with_session() {
+        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+        let session_id = "sess_123".to_string();
+
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+
+        // Should have session mapping
+        let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
+        assert!(session_mapping.is_some());
+        let (mapped_session, mapped_client) = session_mapping.unwrap().clone();
+        assert_eq!(mapped_session, session_id);
+        assert_eq!(mapped_client, client_id);
+    }
+
+    #[tokio::test]
+    async fn test_process_id_cleanup() {
+        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+        let session_id = "sess_123".to_string();
+
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id));
+
+        // Verify mappings exist
+        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_some());
+        assert!(process.proxy_to_session_ids.contains_key(&proxy_id));
+
+        // Cleanup
+        process.cleanup_id_mappings(&proxy_id);
+
+        // Verify mappings are removed
+        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
+        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+    }
+
+    #[tokio::test]
+    async fn test_process_multiple_clients_same_process() {
+        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+
+        let ws_id1 = Uuid::new_v4();
+        let ws_id2 = Uuid::new_v4();
+        let client_id1 = Value::String("1".to_string());
+        let client_id2 = Value::String("1".to_string());
+
+        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None);
+        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None);
+
+        // Should have different proxy IDs
+        assert_ne!(proxy_id1, proxy_id2);
+
+        // Both should resolve correctly
+        let (resolved_ws1, resolved_client1) = process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
+        let (resolved_ws2, resolved_client2) = process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+
+        assert_eq!(resolved_ws1, ws_id1);
+        assert_eq!(resolved_client1, client_id1);
+        assert_eq!(resolved_ws2, ws_id2);
+        assert_eq!(resolved_client2, client_id2);
+    }
+
+    // ============================================================================
+    // Message Extraction Tests
+    // ============================================================================
+
+    #[test]
+    fn test_extract_session_id_from_request() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            method: "session/prompt".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "prompt": "test"
+            })),
+        };
+
+        let session_id = extract_session_id_from_request(&request);
+        assert_eq!(session_id, Some("sess_123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_from_request_missing() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({
+                "protocolVersion": 1
+            })),
+        };
+
+        let session_id = extract_session_id_from_request(&request);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_from_notification() {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_456",
+                "update": "data"
+            })),
+        };
+
+        let message = JsonRpcMessage::Notification(notification);
+        let session_id = extract_session_id_from_message(&message);
+        assert_eq!(session_id, Some("sess_456".to_string()));
+    }
+
+    #[test]
+    fn test_inject_notification_id() {
+        let mut notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "update": "test"
+            })),
+        };
+
+        inject_notification_id(&mut notification, "notif_42".to_string());
+
+        let params = notification.params.unwrap();
+        let meta = params.get("_meta").unwrap();
+        let notif_id = meta.get("tidewave.ai/notificationId").unwrap();
+        assert_eq!(notif_id, "notif_42");
+    }
+
+    #[test]
+    fn test_inject_notification_id_with_existing_meta() {
+        let mut notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "_meta": {
+                    "existing": "value"
+                }
+            })),
+        };
+
+        inject_notification_id(&mut notification, "notif_99".to_string());
+
+        let params = notification.params.unwrap();
+        let meta = params.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "value");
+
+        // Should add notification ID
+        assert_eq!(meta.get("tidewave.ai/notificationId").unwrap(), "notif_99");
+    }
+
+    // ============================================================================
+    // Process Key Generation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_generate_process_key() {
+        let command = "test_agent";
+        let params = json!({"protocolVersion": 1, "clientCapabilities": {}});
+
+        let key = generate_process_key(command, &params);
+
+        assert!(key.contains("test_agent"));
+        assert!(key.contains("protocolVersion"));
+    }
+
+    #[test]
+    fn test_generate_process_key_same_params() {
+        let command = "test_agent";
+        let params = json!({"protocolVersion": 1});
+
+        let key1 = generate_process_key(command, &params);
+        let key2 = generate_process_key(command, &params);
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_generate_process_key_different_params() {
+        let command = "test_agent";
+        let params1 = json!({"protocolVersion": 1});
+        let params2 = json!({"protocolVersion": 2});
+
+        let key1 = generate_process_key(command, &params1);
+        let key2 = generate_process_key(command, &params2);
+
+        assert_ne!(key1, key2);
+    }
+
+    // ============================================================================
+    // Tidewave Capabilities Injection Tests
+    // ============================================================================
+
+    #[test]
+    fn test_inject_tidewave_capabilities() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_tidewave_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+        let tidewave = meta.get("tidewave.ai").unwrap();
+
+        assert_eq!(tidewave.get("session/load").unwrap(), true);
+    }
+
+    #[test]
+    fn test_inject_tidewave_capabilities_preserves_existing_meta() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "_meta": {
+                        "existing": "metadata"
+                    }
+                }
+            })),
+            error: None,
+        };
+
+        inject_tidewave_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "metadata");
+
+        // Should add tidewave meta
+        assert!(meta.get("tidewave.ai").is_some());
+    }
 }
