@@ -29,10 +29,30 @@ An overview of our extensions:
     is the most recent ID it successfully processed.
 
     We respond with the same format as the ACP `session/new` response, including
-    supported session modes and models.
+    supported models.
+
+    Note: we DO NOT handle session modes right now. Adding this would require similar
+    code to models.
+    TODO: add support for modes before release?
 
     In case the session cannot be loaded, we respond with a JSON-RPC error, reason
     "Session not found".
+
+    {
+      "jsonrpc": "2.0",
+      "id": "1",
+      "result": {
+        "_meta": {"tidewave.ai/promptRunning": false},
+        "models": {
+          "availableModels": [{"modelId":"default","name":"Auto"},{"modelId":"slow","name":"Slow"},{"modelId":"fast","name":"Fast"}],
+          "currentModelId": "default"
+        },
+        "sessionId": "sess_123456"
+      }
+    }
+
+    Note that we also have a custom "tidewave.ai/promptRunning" indicator in case the session
+    is loaded while there's still a prompt running.
 
 2. Custom agentCapabilities
 
@@ -102,13 +122,13 @@ An overview of our extensions:
     }
 
 The proxy keeps a mapping of sessionId to the active socket connection.
-There is a bit of nuance to how to do this. Imagine the following situation:
+There is a bit of nuance on how to do this. Imagine the following situation:
 
 1. A client connects to the socket and starts an ACP session.
 2. The client starts a prompt (JSON-RPC request with - let's assume - ID 1)
 3. The client reconnects (browser reload).
 4. The client load the session and receives buffered notifications.
-5. The agent finishes and sends the response to the initial request.
+5. The agent finishes and sends the response to the initial request with ID 1.
 
 Now, we have an issue, because the browser did not send that original request.
 Because of this, we don't use the ACP SDK in the browser, but instead handle raw
@@ -141,7 +161,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -203,7 +223,7 @@ pub struct JsonRpcError {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionLoadRequest {
+pub struct TidewaveSessionLoadRequest {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     #[serde(rename = "latestId")]
@@ -224,7 +244,11 @@ pub struct TidewaveExitParams {
     pub message: String,
 }
 
-// to keep the current model update for our custom session load,
+// ============================================================================
+// Regular ACP Message Types
+// ============================================================================
+
+// to keep the current model updated for our custom session load,
 // we intercept session/set_model and store the updated modelId
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetSessionModelParams {
@@ -266,8 +290,10 @@ pub struct AcpProxyState {
     /// Sessions (session_id -> session_state)
     pub sessions: Arc<DashMap<SessionId, Arc<SessionState>>>,
     /// Session to WebSocket mapping (session_id -> websocket_id)
+    /// used when we need to forward an ACP message to the correct websocket.
     pub session_to_websocket: Arc<DashMap<SessionId, WebSocketId>>,
     /// WebSocket to Process mapping (websocket_id -> process_key)
+    /// used when we need to forward a websocket message to the ACP process.
     pub websocket_to_process: Arc<DashMap<WebSocketId, ProcessKey>>,
 }
 
@@ -284,24 +310,30 @@ impl AcpProxyState {
 }
 
 pub struct ProcessState {
+    pub key: ProcessKey,
     pub command: String,
     pub child: Arc<RwLock<Option<Child>>>,
+    /// Channel used to forward a message to the ACP process.
     pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub next_proxy_id: Arc<AtomicU64>,
 
     // ID mapping for multiplexed connections
     pub client_to_proxy_ids: Arc<DashMap<(WebSocketId, Value), Value>>,
     pub proxy_to_client_ids: Arc<DashMap<Value, (WebSocketId, Value)>>,
+    /// In case the client disconnected, the original client for a request ID
+    /// does not exist any more, so we also store the a mapping to the session ID.
     pub proxy_to_session_ids: Arc<DashMap<Value, (SessionId, Value)>>,
 
-    // Cached init response
+    /// The cached init response we resend when a client reconnects.
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
 
     // We store the request ID of init, session/new and session/load
-    // because we need to handle their responses.
+    // because we need to handle their responses in a special way.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
+    /// A mapping of prompt request IDs to the session ID in order handle
+    /// the tidewave.ai/promptRunning status.
     pub prompt_request_ids: Arc<DashMap<Value, SessionId>>,
 }
 
@@ -320,8 +352,9 @@ pub struct BufferedMessage {
 }
 
 impl ProcessState {
-    pub fn new(command: String) -> Self {
+    pub fn new(key: ProcessKey, command: String) -> Self {
         Self {
+            key,
             command,
             child: Arc::new(RwLock::new(None)),
             stdin_tx: Arc::new(RwLock::new(None)),
@@ -348,6 +381,7 @@ impl ProcessState {
     }
 
     pub fn generate_proxy_id(&self) -> Value {
+        // Claude decided to use this ordering, we could also use UUIDs instead
         let id = self.next_proxy_id.fetch_add(1, Ordering::SeqCst);
         Value::Number(serde_json::Number::from(id))
     }
@@ -483,6 +517,8 @@ async fn handle_websocket(
         while let Some(message) = rx.recv().await {
             let ws_message = match message {
                 WebSocketMessage::JsonRpc(json_msg) => match serde_json::to_string(&json_msg) {
+                    // the ACP TypeScript SDK requires the trailing newline
+                    // we keep it although we don't use the SDK in the browser anymore at the moment
                     Ok(json_str) => Message::Text(format!("{}\n", json_str).into()),
                     Err(_) => continue,
                 },
@@ -498,45 +534,42 @@ async fn handle_websocket(
 
     // Task to handle incoming messages (client -> server)
     let state_rx = state.clone();
-    let websocket_id_rx = websocket_id;
     let rx_task = tokio::spawn(async move {
-        debug!("Starting WebSocket receive loop for: {}", websocket_id_rx);
+        trace!("Starting WebSocket receive loop for: {}", websocket_id);
         while let Some(msg) = ws_receiver.next().await {
-            debug!(
-                "Received WebSocket message for {}: {:?}",
-                websocket_id_rx, msg
-            );
+            trace!("Received WebSocket message for {}: {:?}", websocket_id, msg);
             match msg {
                 Ok(Message::Text(text)) => {
-                    debug!("Processing text message: {}", text);
                     if text.trim() == "ping" {
                         // Send pong response via channel
-                        if let Some(tx) = state_rx.websocket_senders.get(&websocket_id_rx) {
+                        // iirc we cannot use the ws_sender directly because it is moved into the
+                        // receiver task above and we cannot clone it
+                        if let Some(tx) = state_rx.websocket_senders.get(&websocket_id) {
                             let _ = tx.send(WebSocketMessage::Pong);
                         }
                     } else if let Err(e) =
-                        handle_client_message(&state_rx, websocket_id_rx, &command, &text).await
+                        handle_client_message(&state_rx, websocket_id, &command, &text).await
                     {
                         error!("Error handling client message: {}", e);
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    debug!("WebSocket closed for: {}", websocket_id_rx);
+                    debug!("WebSocket closed for: {}", websocket_id);
                     break;
                 }
                 Ok(msg_type) => {
                     debug!(
                         "Received non-text message for {}: {:?}",
-                        websocket_id_rx, msg_type
+                        websocket_id, msg_type
                     );
                 }
                 Err(e) => {
-                    debug!("WebSocket error for {}: {}", websocket_id_rx, e);
+                    debug!("WebSocket error for {}: {}", websocket_id, e);
                     break;
                 }
             }
         }
-        debug!("WebSocket receive loop ended for: {}", websocket_id_rx);
+        trace!("WebSocket receive loop ended for: {}", websocket_id);
     });
 
     // Wait for either task to complete
@@ -564,13 +597,14 @@ async fn handle_websocket(
     debug!("WebSocket connection closed: {}", websocket_id);
 }
 
+/// Called whenever we receive a message on the WebSocket (except ping).
 async fn handle_client_message(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
     command: &str,
     text: &str,
 ) -> Result<()> {
-    debug!("Received message from WebSocket {}: {}", websocket_id, text);
+    trace!("Received message from WebSocket {}: {}", websocket_id, text);
     let message: JsonRpcMessage = serde_json::from_str(text)
         .map_err(|e| anyhow!("Failed to parse JSON-RPC message: {}", e))?;
 
@@ -584,12 +618,15 @@ async fn handle_client_message(
             handle_client_notification(state, websocket_id, notif).await
         }
         JsonRpcMessage::Response(resp) => {
-            // Forward client responses (e.g., permission responses) back to the process
+            // Forward client responses (e.g., permission responses) back to the process.
+            // Note that we don't need
+            debug!("Forwarding response for ID {} to process", resp.id);
             forward_response_to_process(state, websocket_id, resp).await
         }
     }
 }
 
+/// Called whenever we receive a JSON-RPC request from the client.
 async fn handle_client_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
@@ -597,16 +634,24 @@ async fn handle_client_request(
     request: &JsonRpcRequest,
 ) -> Result<()> {
     match request.method.as_str() {
+        // We handle init because we need to
+        //   1. Start a new process in case there's no running one for the given parameters.
+        //   2. In case we start, store the request ID to store the response later on.
         "initialize" => handle_initialize_request(state, websocket_id, command, request).await,
+        // Our custom session load handler
         "_tidewave.ai/session/load" => {
             handle_tidewave_session_load(state, websocket_id, request).await
         }
+        // ACP session load. We need to intercept it because we need to update the session mapping.
         "session/load" => handle_acp_session_load(state, websocket_id, request).await,
+        // Prompt. We need to intercept it to keep the promptRunning status updated.
         "session/prompt" => handle_prompt(state, websocket_id, request).await,
+        // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, websocket_id, request).await,
     }
 }
 
+// Called whenever a client sends a notification.
 async fn handle_client_notification(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
@@ -635,7 +680,7 @@ async fn handle_initialize_request(
     debug!("Handling initialize request for command: {}", command);
     let init_params = request.params.as_ref().unwrap_or(&Value::Null);
     let process_key = generate_process_key(command, init_params);
-    debug!("Generated process key: {}", process_key);
+    trace!("Generated process key: {}", process_key);
 
     // Check if we already have a process for this command + params
     if let Some(process_state) = state.processes.get(&process_key) {
@@ -663,10 +708,30 @@ async fn handle_initialize_request(
 
     // Need to start a new process or get the init response
     let process_state = match state.processes.get(&process_key) {
-        Some(existing) => existing.clone(),
+        // This should be rare in practice and TC will try again for us.
+        Some(_existing) => {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id.clone(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32004,
+                    message: "Process alive, but no init response.".to_string(),
+                    data: None,
+                }),
+            };
+
+            if let Some(tx) = state.websocket_senders.get(&websocket_id) {
+                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                    response,
+                )));
+            }
+
+            return Ok(());
+        }
         None => {
             // Create new process
-            let new_process = Arc::new(ProcessState::new(command.to_string()));
+            let new_process = Arc::new(ProcessState::new(process_key.clone(), command.to_string()));
 
             // Start the ACP process
             match start_acp_process(new_process.clone(), state.clone()).await {
@@ -729,7 +794,7 @@ async fn handle_tidewave_session_load(
     websocket_id: WebSocketId,
     request: &JsonRpcRequest,
 ) -> Result<()> {
-    let params: SessionLoadRequest =
+    let params: TidewaveSessionLoadRequest =
         serde_json::from_value(request.params.clone().unwrap_or(Value::Null))
             .map_err(|e| anyhow!("Invalid session/load params: {}", e))?;
 
@@ -737,48 +802,22 @@ async fn handle_tidewave_session_load(
     let session_state = match state.sessions.get(&params.session_id) {
         Some(session) => session.clone(),
         None => {
-            // Session not found
-            let error_response = JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id.clone(),
-                result: None,
-                error: Some(JsonRpcError {
+            send_error_and_bail(
+                state,
+                websocket_id,
+                &request.id,
+                JsonRpcError {
                     code: -32002,
                     message: "Session not found".to_string(),
                     data: None,
-                }),
-            };
-
-            if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
-                    error_response,
-                )));
-            }
-            return Ok(());
+                },
+            )?;
+            unreachable!()
         }
     };
 
     // Check if there's already an active WebSocket for this session
-    if state.session_to_websocket.contains_key(&params.session_id) {
-        // Session already has an active connection
-        let error_response = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id.clone(),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32003, // Custom error code for "session already active"
-                message: "Session already has an active connection".to_string(),
-                data: None,
-            }),
-        };
-
-        if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-            let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
-                error_response,
-            )));
-        }
-        return Ok(());
-    }
+    ensure_session_not_active(state, websocket_id, request, &params.session_id)?;
 
     // Register this WebSocket for the session
     state
@@ -805,6 +844,7 @@ async fn handle_tidewave_session_load(
         let response_data = NewSessionResponse {
             session_id: params.session_id.clone(),
             models: session_state.models.read().await.clone(),
+            // TODO: handle modes
             modes: None,
             // Because we need to know if the chat status should be set to generating
             // after loading, we also keep track of running prompts.
@@ -841,6 +881,9 @@ async fn handle_acp_session_load(
     let session_id = extract_session_id_from_request(request);
 
     if let Some(session_id) = session_id {
+        // Check if there's already an active WebSocket for this session
+        ensure_session_not_active(state, websocket_id, request, &session_id)?;
+
         // Get or create the session state
         let process_key = match state.sessions.get(&session_id) {
             Some(session_state) => {
@@ -919,22 +962,7 @@ async fn handle_regular_request(
     websocket_id: WebSocketId,
     request: &JsonRpcRequest,
 ) -> Result<()> {
-    // Look up the process for this WebSocket
-    let process_key = match state.websocket_to_process.get(&websocket_id) {
-        Some(key) => key.clone(),
-        None => {
-            warn!("No process mapping found for WebSocket: {}", websocket_id);
-            return Ok(());
-        }
-    };
-
-    let process_state = match state.processes.get(&process_key) {
-        Some(process) => process.clone(),
-        None => {
-            warn!("Process not found for key: {}", process_key);
-            return Ok(());
-        }
-    };
+    let process_state = ensure_process_for_websocket(state, websocket_id)?;
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
@@ -1023,16 +1051,14 @@ async fn handle_ack_notification(
 
 async fn forward_notification_to_process(
     state: &AcpProxyState,
-    _websocket_id: WebSocketId,
+    websocket_id: WebSocketId,
     notification: &JsonRpcNotification,
 ) -> Result<()> {
-    // For now, forward to all processes - in the future we might route by session
-    for entry in state.processes.iter() {
-        let _ = entry
-            .value()
-            .send_to_process(JsonRpcMessage::Notification(notification.clone()))
-            .await;
-    }
+    let process_state = ensure_process_for_websocket(state, websocket_id)?;
+
+    process_state
+        .send_to_process(JsonRpcMessage::Notification(notification.clone()))
+        .await?;
 
     Ok(())
 }
@@ -1042,30 +1068,12 @@ async fn forward_response_to_process(
     websocket_id: WebSocketId,
     response: &JsonRpcResponse,
 ) -> Result<()> {
-    // Look up the process for this WebSocket
-    let process_key = match state.websocket_to_process.get(&websocket_id) {
-        Some(key) => key.clone(),
-        None => {
-            warn!("No process mapping found for WebSocket: {}", websocket_id);
-            return Ok(());
-        }
-    };
-
-    let process_state = match state.processes.get(&process_key) {
-        Some(process) => process.clone(),
-        None => {
-            warn!("Process not found for key: {}", process_key);
-            return Ok(());
-        }
-    };
+    let process_state = ensure_process_for_websocket(state, websocket_id)?;
 
     // Forward response directly (no ID mapping needed for process -> client -> process flow)
-    if let Err(e) = process_state
+    process_state
         .send_to_process(JsonRpcMessage::Response(response.clone()))
-        .await
-    {
-        error!("Failed to send response to process: {}", e);
-    }
+        .await?;
 
     Ok(())
 }
@@ -1199,36 +1207,22 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
             }
         };
 
-        // Send exit notification to all connected websockets
-        // We need to find all websockets connected to this process
-        let mut websockets_to_notify = Vec::new();
+        // Send exit notification to all connected websockets using this process
 
-        // Find the process key for this process state
-        let mut process_key_opt = None;
-        for entry in state_exit.processes.iter() {
-            if Arc::ptr_eq(entry.value(), &process_state_exit) {
-                process_key_opt = Some(entry.key().clone());
-                break;
+        for entry in state_exit.websocket_to_process.iter() {
+            if entry.value() == &process_state_exit.key {
+                send_exit_notification(
+                    &state_exit,
+                    entry.key().clone(),
+                    "process_exit",
+                    &exit_message,
+                )
+                .await;
             }
         }
 
-        if let Some(process_key) = process_key_opt {
-            // Find all websockets mapped to this process
-            for entry in state_exit.websocket_to_process.iter() {
-                if entry.value() == &process_key {
-                    websockets_to_notify.push(*entry.key());
-                }
-            }
-
-            // Send exit notification to all connected websockets
-            for websocket_id in websockets_to_notify {
-                send_exit_notification(&state_exit, websocket_id, "process_exit", &exit_message)
-                    .await;
-            }
-
-            // Clean up the process from the state
-            state_exit.processes.remove(&process_key);
-        }
+        // Clean up the process from the state
+        state_exit.processes.remove(&process_state_exit.key);
 
         debug!("Process exit handler ended");
     });
@@ -1442,6 +1436,78 @@ async fn handle_process_message(
 // Utility Functions
 // ============================================================================
 
+/// Helper function to send a JSON-RPC error response and return an error for early return.
+/// Use this with the `?` operator to short-circuit handler functions.
+fn send_error_and_bail(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    request_id: &Value,
+    error: JsonRpcError,
+) -> Result<()> {
+    let response = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: request_id.clone(),
+        result: None,
+        error: Some(error.clone()),
+    };
+
+    if let Some(tx) = state.websocket_senders.get(&websocket_id) {
+        let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+            response,
+        )));
+    }
+
+    Err(anyhow!("JSON-RPC error sent: {}", error.message))
+}
+
+/// Helper function to ensure a session is not already active on another websocket.
+/// Returns an error (with response already sent) if the session is active.
+fn ensure_session_not_active(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    request: &JsonRpcRequest,
+    session_id: &str,
+) -> Result<()> {
+    if state.session_to_websocket.contains_key(session_id) {
+        send_error_and_bail(
+            state,
+            websocket_id,
+            &request.id,
+            JsonRpcError {
+                code: -32003,
+                message: "Session already has an active connection".to_string(),
+                data: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Looks up the process for the given websocket ID.
+fn ensure_process_for_websocket(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+) -> Result<Arc<ProcessState>, anyhow::Error> {
+    let process_key = match state.websocket_to_process.get(&websocket_id) {
+        Some(key) => key.clone(),
+        None => {
+            return Err(anyhow!(
+                "No process mapping found for WebSocket: {}",
+                websocket_id
+            ))
+        }
+    };
+
+    let process_state = match state.processes.get(&process_key) {
+        Some(process) => process.clone(),
+        None => {
+            return Err(anyhow!("Process not found for key: {}", process_key));
+        }
+    };
+
+    return Ok(process_state);
+}
+
 fn generate_process_key(command: &str, init_params: &Value) -> ProcessKey {
     // String key of command + init params (from initialize request) for process deduplication
     format!(
@@ -1534,5 +1600,353 @@ async fn send_exit_notification(
         let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Notification(
             exit_notification,
         )));
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper function to create a test SessionState
+    fn create_test_session() -> SessionState {
+        SessionState::new("test_command:params".to_string())
+    }
+
+    // Helper function to create a test notification message
+    fn create_test_notification(method: &str, session_id: &str) -> JsonRpcMessage {
+        JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(json!({
+                "sessionId": session_id,
+                "update": "test_data"
+            })),
+        })
+    }
+
+    // Helper function to create a test response message
+    fn create_test_response(id: u64) -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(id)),
+            result: Some(json!({"status": "ok"})),
+            error: None,
+        })
+    }
+
+    // ============================================================================
+    // Basic Buffer Operations Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_generate_notification_id() {
+        let session = create_test_session();
+
+        let id1 = session.generate_notification_id();
+        let id2 = session.generate_notification_id();
+        let id3 = session.generate_notification_id();
+
+        assert_eq!(id1, "notif_1");
+        assert_eq!(id2, "notif_2");
+        assert_eq!(id3, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_add_to_buffer() {
+        let session = create_test_session();
+
+        let msg1 = create_test_notification("session/update", "sess_123");
+        let msg2 = create_test_notification("session/update", "sess_123");
+
+        let id1 = session
+            .add_to_buffer(msg1.clone(), "notif_1".to_string())
+            .await;
+        let id2 = session
+            .add_to_buffer(msg2.clone(), "notif_2".to_string())
+            .await;
+
+        assert_eq!(id1, "notif_1");
+        assert_eq!(id2, "notif_2");
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].id, "notif_1");
+        assert_eq!(buffer[1].id, "notif_2");
+    }
+
+    // ============================================================================
+    // Buffer Pruning Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_prune_buffer_basic() {
+        let session = create_test_session();
+
+        // Add three messages
+        let msg1 = create_test_notification("session/update", "sess_123");
+        let msg2 = create_test_notification("session/update", "sess_123");
+        let msg3 = create_test_notification("session/update", "sess_123");
+
+        session.add_to_buffer(msg1, "notif_1".to_string()).await;
+        session.add_to_buffer(msg2, "notif_2".to_string()).await;
+        session.add_to_buffer(msg3, "notif_3".to_string()).await;
+
+        // Prune up to and including notif_1
+        session.prune_buffer("notif_1").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].id, "notif_2");
+        assert_eq!(buffer[1].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_middle() {
+        let session = create_test_session();
+
+        // Add five messages
+        for i in 1..=5 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Prune up to and including notif_3
+        session.prune_buffer("notif_3").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].id, "notif_4");
+        assert_eq!(buffer[1].id, "notif_5");
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_unknown_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Try to prune with an unknown ID (should be a no-op)
+        session.prune_buffer("notif_unknown").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer[0].id, "notif_1");
+        assert_eq!(buffer[1].id, "notif_2");
+        assert_eq!(buffer[2].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_empty() {
+        let session = create_test_session();
+
+        // Pruning an empty buffer should not panic
+        session.prune_buffer("notif_1").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_all() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Prune all messages
+        session.prune_buffer("notif_3").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    // ============================================================================
+    // Buffer Retrieval Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_basic() {
+        let session = create_test_session();
+
+        // Add five messages
+        for i in 1..=5 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages after notif_2
+        let messages = session.get_buffered_messages_after("notif_2").await;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].id, "notif_3");
+        assert_eq!(messages[1].id, "notif_4");
+        assert_eq!(messages[2].id, "notif_5");
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_empty_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages with empty latest_id (should return all messages)
+        let messages = session.get_buffered_messages_after("").await;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].id, "notif_1");
+        assert_eq!(messages[1].id, "notif_2");
+        assert_eq!(messages[2].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_unknown_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages with unknown ID (should return all messages)
+        let messages = session.get_buffered_messages_after("notif_unknown").await;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].id, "notif_1");
+        assert_eq!(messages[1].id, "notif_2");
+        assert_eq!(messages[2].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_last_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages after the last ID (should return empty)
+        let messages = session.get_buffered_messages_after("notif_3").await;
+
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_first_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages after the first ID
+        let messages = session.get_buffered_messages_after("notif_1").await;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "notif_2");
+        assert_eq!(messages[1].id, "notif_3");
+    }
+
+    // ============================================================================
+    // Combined Operations Test
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_buffer_workflow() {
+        let session = create_test_session();
+
+        // Step 1: Add initial messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Step 2: Client connects and gets all messages (empty latest_id)
+        let messages = session.get_buffered_messages_after("").await;
+        assert_eq!(messages.len(), 3);
+
+        // Step 3: Client acknowledges up to notif_2
+        session.prune_buffer("notif_2").await;
+
+        // Step 4: Verify only notif_3 remains in buffer
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].id, "notif_3");
+        drop(buffer); // Release lock
+
+        // Step 5: Add more messages
+        for i in 4..=6 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Step 6: Client reconnects and gets messages after notif_2
+        let messages = session.get_buffered_messages_after("notif_2").await;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].id, "notif_3");
+        assert_eq!(messages[1].id, "notif_4");
+        assert_eq!(messages[2].id, "notif_5");
+        assert_eq!(messages[3].id, "notif_6");
+
+        // Step 7: Client acknowledges all messages
+        session.prune_buffer("notif_6").await;
+
+        // Step 8: Verify buffer is empty
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_with_different_message_types() {
+        let session = create_test_session();
+
+        // Add notification
+        let notif = create_test_notification("session/update", "sess_123");
+        session.add_to_buffer(notif, "notif_1".to_string()).await;
+
+        // Add response
+        let response = create_test_response(42);
+        session.add_to_buffer(response, "notif_2".to_string()).await;
+
+        // Add another notification
+        let notif2 = create_test_notification("session/complete", "sess_123");
+        session.add_to_buffer(notif2, "notif_3".to_string()).await;
+
+        // Verify all messages are in buffer
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 3);
+
+        // Verify message types are preserved
+        match &buffer[0].message {
+            JsonRpcMessage::Notification(_) => {}
+            _ => panic!("Expected notification"),
+        }
+        match &buffer[1].message {
+            JsonRpcMessage::Response(_) => {}
+            _ => panic!("Expected response"),
+        }
+        match &buffer[2].message {
+            JsonRpcMessage::Notification(_) => {}
+            _ => panic!("Expected notification"),
+        }
     }
 }
