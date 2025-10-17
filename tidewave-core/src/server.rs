@@ -1,18 +1,18 @@
+use crate::config::Config;
 use axum::{
     body::Body,
     extract::{Query, Request},
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::env;
 use tokio::net::TcpListener;
-use tracing::{debug, info, error};
-use crate::config::Config;
+use tracing::{debug, error, info};
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -54,26 +54,49 @@ pub async fn serve_http_server_with_shutdown(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
+    let mcp_state = crate::mcp_remote::McpRemoteState::new();
+    let acp_state = crate::acp_proxy::AcpProxyState::new();
 
-    let server_config = ServerConfig {
+    let config = ServerConfig {
         allowed_origins: vec![
             format!("http://localhost:{}", port),
             format!("http://127.0.0.1:{}", port),
         ],
     };
 
+    // Create the MCP routes that need state
+    let mcp_routes = Router::new()
+        .route(
+            "/acp/mcp-remote",
+            get(crate::mcp_remote::mcp_remote_ws_handler),
+        )
+        .route(
+            "/acp/mcp-remote-client",
+            post(crate::mcp_remote::mcp_remote_client_handler),
+        )
+        .with_state(mcp_state);
+
+    // Create ACP routes
+    let acp_routes = Router::new()
+        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
+        .with_state(acp_state);
+
+    // Create the main app without state
     let app = Router::new()
+        .layer(middleware::from_fn(move |mut req: Request, next| {
+            req.extensions_mut().insert(config.clone());
+            verify_origin(req, next)
+        }))
         .route("/", get(root))
-        .route("/proxy",
+        .route(
+            "/proxy",
             axum::routing::any(move |params, req| {
                 let client = client.clone();
                 proxy_handler(params, req, client)
-            })
+            }),
         )
-        .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(server_config.clone());
-            verify_origin(req, next)
-        }));
+        .merge(mcp_routes)
+        .merge(acp_routes);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
@@ -81,19 +104,19 @@ pub async fn serve_http_server_with_shutdown(
     Ok(())
 }
 
-async fn verify_origin(req: Request, next: axum::middleware::Next) -> Result<Response<Body>, StatusCode> {
+async fn verify_origin(
+    req: Request,
+    next: axum::middleware::Next,
+) -> Result<Response<Body>, StatusCode> {
     let headers = req.headers();
 
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        let config = req
-            .extensions()
-            .get::<ServerConfig>()
-            .ok_or_else(|| {
-                error!("ServerConfig not found in request extensions");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+            error!("ServerConfig not found in request extensions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         if !config.allowed_origins.contains(&origin_str.to_string()) {
             debug!("Rejected request with origin: {}", origin_str);
@@ -135,7 +158,17 @@ async fn proxy_handler(
     // Forward headers (excluding Host, connection-specific headers, and compression headers)
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
-        if !["host", "connection", "transfer-encoding", "upgrade", "accept-encoding", "content-encoding"].contains(&key_str) {
+        if ![
+            "host",
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "accept-encoding",
+            "content-encoding",
+            "origin",
+        ]
+        .contains(&key_str)
+        {
             req_builder = req_builder.header(key.clone(), value.clone());
         }
     }
@@ -144,13 +177,10 @@ async fn proxy_handler(
     req_builder = req_builder.body(body_bytes);
 
     // Execute the request
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Proxy request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let response = req_builder.send().await.map_err(|e| {
+        error!("Proxy request failed: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
 
     // Get status and headers from the response
     let status = response.status();
@@ -166,7 +196,14 @@ async fn proxy_handler(
     // Forward response headers (excluding connection and encoding headers since we're not handling compression)
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
-        if !["connection", "transfer-encoding", "content-encoding", "content-length"].contains(&key_str) {
+        if ![
+            "connection",
+            "transfer-encoding",
+            "content-encoding",
+            "content-length",
+        ]
+        .contains(&key_str)
+        {
             resp_builder = resp_builder.header(key.clone(), value.clone());
         }
     }
@@ -177,8 +214,8 @@ async fn proxy_handler(
 }
 
 async fn root() -> Html<String> {
-    let client_url = env::var("TIDEWAVE_CLIENT_URL")
-        .unwrap_or_else(|_| "https://tidewave.ai".to_string());
+    let client_url =
+        env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
     let html = format!(
         r#"<html>
