@@ -1276,7 +1276,7 @@ async fn handle_process_response(
         maybe_handle_session_load_response(process_state, state, response, &client_response).await;
         maybe_handle_prompt_response(process_state, state, response).await;
 
-        // Send to the correct WebSocket
+        // Finally: send to the WebSocket
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
             let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
                 client_response,
@@ -1339,10 +1339,12 @@ async fn maybe_handle_session_new_response(
                             .session_to_websocket
                             .insert(session_response.session_id, websocket_id);
                     }
-                } else if let Some(session_state) = state.sessions.get(&session_response.session_id)
-                {
+                } else {
                     // Session already exists (e.g., from session/load), update model state
-                    *session_state.models.write().await = session_response.models;
+                    warn!(
+                        "Unexpectedly got new session response for already known session! {}",
+                        session_response.session_id
+                    );
                 }
             }
         }
