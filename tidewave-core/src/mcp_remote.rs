@@ -38,13 +38,11 @@ pub struct McpSession {
 
 #[derive(Debug)]
 pub enum McpMessage {
-    /// The browser sends two kinds of "system" messages:
-    ///
-    ///     1. "register-sessionId" to register itself for a specific session ID.
-    ///     2. "ping", which we'll reply to with a "pong".
-    ///
-    /// Any other messages are wrapped JSON-RPC messages.
+    /// System messages from the browser:
+    /// - "register-sessionId" to register itself for a specific session ID
+    /// - "ping", which we'll reply to with a "pong"
     System { message: String },
+    /// JSON-RPC messages wrapped with session context and optional response channel
     JsonRpc {
         session_id: String,
         json_rpc_message: Value,
