@@ -145,7 +145,7 @@ use axum::{
     response::IntoResponse,
 };
 use dashmap::{DashMap, DashSet};
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::{Map, Value};
@@ -273,6 +273,26 @@ pub struct NewSessionResponse {
 }
 
 // ============================================================================
+// Process Starter Abstraction
+// ============================================================================
+
+/// Type alias for process I/O streams
+/// Returns (stdin_writer, stdout_reader, stderr_reader, optional_child_process)
+pub type ProcessIo = (
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
+    Option<Child>,
+);
+
+/// Function type for starting a process and returning its I/O streams
+pub type ProcessStarterFn = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessIo>> + Send>>
+        + Send
+        + Sync,
+>;
+
+// ============================================================================
 // Server State Types
 // ============================================================================
 
@@ -295,16 +315,23 @@ pub struct AcpProxyState {
     /// WebSocket to Process mapping (websocket_id -> process_key)
     /// used when we need to forward a websocket message to the ACP process.
     pub websocket_to_process: Arc<DashMap<WebSocketId, ProcessKey>>,
+    /// Process starter function for creating new ACP processes
+    pub process_starter: ProcessStarterFn,
 }
 
 impl AcpProxyState {
     pub fn new() -> Self {
+        Self::with_process_starter(real_process_starter())
+    }
+
+    pub fn with_process_starter(process_starter: ProcessStarterFn) -> Self {
         Self {
             processes: Arc::new(DashMap::new()),
             websocket_senders: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             session_to_websocket: Arc::new(DashMap::new()),
             websocket_to_process: Arc::new(DashMap::new()),
+            process_starter,
         }
     }
 }
@@ -503,8 +530,20 @@ async fn handle_websocket(
     websocket_id: WebSocketId,
     command: String,
 ) {
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (ws_sender, ws_receiver) = socket.split();
+    unit_testable_ws_handler(ws_sender, ws_receiver, state, websocket_id, command).await;
+}
 
+pub async fn unit_testable_ws_handler<W, R>(
+    mut ws_sender: W,
+    mut ws_receiver: R,
+    state: AcpProxyState,
+    websocket_id: WebSocketId,
+    command: String,
+) where
+    W: Sink<Message> + Unpin + Send + 'static,
+    R: Stream<Item = Result<Message, axum::Error>> + Unpin + Send + 'static,
+{
     // Create channel for sending messages to this WebSocket
     let (tx, mut rx) = mpsc::unbounded_channel::<WebSocketMessage>();
 
@@ -1082,41 +1121,59 @@ async fn forward_response_to_process(
 // Process Management
 // ============================================================================
 
+/// Real process starter that spawns actual OS processes
+pub fn real_process_starter() -> ProcessStarterFn {
+    Arc::new(|command: String| {
+        Box::pin(async move {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(anyhow!("Empty command"));
+            }
+
+            info!(
+                "Starting ACP process: {} with args: {:?}",
+                parts[0],
+                &parts[1..]
+            );
+
+            let mut child = Command::new(parts[0])
+                .args(&parts[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
+
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("Failed to get stdin"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("Failed to get stdout"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("Failed to get stderr"))?;
+
+            Ok::<ProcessIo, anyhow::Error>((
+                Box::new(stdin),
+                Box::new(BufReader::new(stdout)),
+                Box::new(BufReader::new(stderr)),
+                Some(child),
+            ))
+        })
+    })
+}
+
 async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyState) -> Result<()> {
-    let parts: Vec<&str> = process_state.command.split_whitespace().collect();
-    if parts.is_empty() {
-        return Err(anyhow!("Empty command"));
-    }
+    // Call the process starter function
+    let (stdin, stdout, stderr, child) =
+        (state.process_starter)(process_state.command.clone()).await?;
 
-    info!(
-        "Starting ACP process: {} with args: {:?}",
-        parts[0],
-        &parts[1..]
-    );
-
-    let mut child = Command::new(parts[0])
-        .args(&parts[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Failed to get stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to get stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to get stderr"))?;
-
-    // Store child process
-    *process_state.child.write().await = Some(child);
+    // Store child process (if it's a real process)
+    *process_state.child.write().await = child;
 
     // Create stdin channel and wire it up
     let (stdin_sender, mut stdin_receiver) = mpsc::unbounded_channel::<JsonRpcMessage>();
@@ -1144,9 +1201,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
     // Start stdout handler (Process -> WebSocket)
     let process_state_clone = process_state.clone();
     let state_clone = state.clone();
-    let stdout_reader = BufReader::new(stdout);
     tokio::spawn(async move {
-        let mut lines = stdout_reader.lines();
+        let mut lines = stdout.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if let Ok(message) = serde_json::from_str::<JsonRpcMessage>(&line) {
                 if let Err(e) =
@@ -1163,8 +1219,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
 
     // Start stderr handler (for debugging)
     tokio::spawn(async move {
-        let stderr_reader = BufReader::new(stderr);
-        let mut lines = stderr_reader.lines();
+        let mut lines = stderr.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             debug!("Process stderr: {}", line);
         }
@@ -2003,7 +2058,8 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+        let proxy_id =
+            process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
 
         // Should have session mapping
         let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
@@ -2050,8 +2106,10 @@ mod tests {
         assert_ne!(proxy_id1, proxy_id2);
 
         // Both should resolve correctly
-        let (resolved_ws1, resolved_client1) = process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
-        let (resolved_ws2, resolved_client2) = process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+        let (resolved_ws1, resolved_client1) =
+            process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
+        let (resolved_ws2, resolved_client2) =
+            process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
 
         assert_eq!(resolved_ws1, ws_id1);
         assert_eq!(resolved_client1, client_id1);
