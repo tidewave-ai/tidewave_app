@@ -61,15 +61,39 @@ pub async fn serve_http_server_with_shutdown(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
+    let mcp_state = crate::mcp_remote::McpRemoteState::new();
+    let acp_state = crate::acp_proxy::AcpProxyState::new();
 
-    let server_config = ServerConfig {
+    let config = ServerConfig {
         allowed_origins: vec![
             format!("http://localhost:{}", port),
             format!("http://127.0.0.1:{}", port),
         ],
     };
 
+    // Create the MCP routes that need state
+    let mcp_routes = Router::new()
+        .route(
+            "/acp/mcp-remote",
+            get(crate::mcp_remote::mcp_remote_ws_handler),
+        )
+        .route(
+            "/acp/mcp-remote-client",
+            post(crate::mcp_remote::mcp_remote_client_handler),
+        )
+        .with_state(mcp_state);
+
+    // Create ACP routes
+    let acp_routes = Router::new()
+        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
+        .with_state(acp_state);
+
+    // Create the main app without state
     let app = Router::new()
+        .layer(middleware::from_fn(move |mut req: Request, next| {
+            req.extensions_mut().insert(config.clone());
+            verify_origin(req, next)
+        }))
         .route("/", get(root))
         .route("/shell", post(shell_handler))
         .route(
@@ -79,10 +103,8 @@ pub async fn serve_http_server_with_shutdown(
                 proxy_handler(params, req, client)
             }),
         )
-        .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(server_config.clone());
-            verify_origin(req, next)
-        }));
+        .merge(mcp_routes)
+        .merge(acp_routes);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
@@ -242,6 +264,7 @@ async fn proxy_handler(
             "upgrade",
             "accept-encoding",
             "content-encoding",
+            "origin",
         ]
         .contains(&key_str)
         {
