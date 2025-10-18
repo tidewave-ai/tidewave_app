@@ -11,7 +11,10 @@ add our own custom messages using the protocol extensibility features
 to support a "_tidewave.ai/session/load" request for loading chats that
 are still active on the agent side.
 
-An overview of our extensions:
+To start an agent, we hijack init requests and dynamically start a new
+ACP process in case there's no existing one running.
+
+An overview of our protocol extensions:
 
 1. Custom load session request
 
@@ -59,7 +62,8 @@ An overview of our extensions:
 
 3. tidewave.ai/notificationId injection
 
-    We inject a custom `tidewave.ai/notificationId` meta property into notifications:
+    We inject a custom `tidewave.ai/notificationId` meta property into notifications.
+    This ID is used for acknowledgements/pruning below.
 
     {
       "jsonrpc": "2.0",
@@ -141,7 +145,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{mpsc, RwLock},
+    sync::{mpsc, Mutex, RwLock},
 };
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -292,6 +296,8 @@ pub struct AcpProxyState {
     pub websocket_to_process: Arc<DashMap<WebSocketId, ProcessKey>>,
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
+    /// Locks to prevent multiple concurrent process starts for the same process_key
+    pub process_start_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
 }
 
 impl AcpProxyState {
@@ -307,6 +313,7 @@ impl AcpProxyState {
             session_to_websocket: Arc::new(DashMap::new()),
             websocket_to_process: Arc::new(DashMap::new()),
             process_starter,
+            process_start_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -684,8 +691,34 @@ async fn handle_initialize_request(
     let process_key = generate_process_key(command, init_params);
     trace!("Generated process key: {}", process_key);
 
+    // Acquire or create a lock for this process_key to prevent concurrent starts
+    let lock = state
+        .process_start_locks
+        .entry(process_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let guard = lock.lock().await;
+
+    // Execute the initialization logic
+    let result =
+        handle_initialize_request_locked(state, websocket_id, command, request, &process_key).await;
+
+    // Clean up the lock after initialization attempt (success or failure)
+    drop(guard);
+    state.process_start_locks.remove(&process_key);
+
+    result
+}
+
+async fn handle_initialize_request_locked(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    command: &str,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+) -> Result<()> {
     // Check if we already have a process for this command + params
-    if let Some(process_state) = state.processes.get(&process_key) {
+    if let Some(process_state) = state.processes.get(process_key) {
         debug!("Found existing process for key: {}", process_key);
         // Check if we have a cached init response
         if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
@@ -709,7 +742,7 @@ async fn handle_initialize_request(
     }
 
     // Need to start a new process or get the init response
-    let process_state = match state.processes.get(&process_key) {
+    let process_state = match state.processes.get(process_key) {
         // This should be rare in practice and TC will try again for us.
         Some(_existing) => {
             let response = JsonRpcResponse {
