@@ -11,7 +11,10 @@ add our own custom messages using the protocol extensibility features
 to support a "_tidewave.ai/session/load" request for loading chats that
 are still active on the agent side.
 
-An overview of our extensions:
+To start an agent, we hijack init requests and dynamically start a new
+ACP process in case there's no existing one running.
+
+An overview of our protocol extensions:
 
 1. Custom load session request
 
@@ -28,31 +31,14 @@ An overview of our extensions:
     The client needs to pass the sessionId, as well as the "latestId", which
     is the most recent ID it successfully processed.
 
-    We respond with the same format as the ACP `session/new` response, including
-    supported models.
-
-    Note: we DO NOT handle session modes right now. Adding this would require similar
-    code to models.
-    TODO: add support for modes before release?
-
     In case the session cannot be loaded, we respond with a JSON-RPC error, reason
     "Session not found".
 
     {
       "jsonrpc": "2.0",
       "id": "1",
-      "result": {
-        "_meta": {"tidewave.ai/promptRunning": false},
-        "models": {
-          "availableModels": [{"modelId":"default","name":"Auto"},{"modelId":"slow","name":"Slow"},{"modelId":"fast","name":"Fast"}],
-          "currentModelId": "default"
-        },
-        "sessionId": "sess_123456"
-      }
+      "result": {}
     }
-
-    Note that we also have a custom "tidewave.ai/promptRunning" indicator in case the session
-    is loaded while there's still a prompt running.
 
 2. Custom agentCapabilities
 
@@ -76,7 +62,8 @@ An overview of our extensions:
 
 3. tidewave.ai/notificationId injection
 
-    We inject a custom `tidewave.ai/notificationId` meta property into notifications:
+    We inject a custom `tidewave.ai/notificationId` meta property into notifications.
+    This ID is used for acknowledgements/pruning below.
 
     {
       "jsonrpc": "2.0",
@@ -147,7 +134,6 @@ use axum::{
 use dashmap::{DashMap, DashSet};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::{Map, Value};
 use std::{
     process::Stdio,
@@ -159,10 +145,19 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{mpsc, RwLock},
+    sync::{mpsc, Mutex, RwLock},
 };
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+
+// ============================================================================
+// Version
+// ============================================================================
+
+/// Returns the Tidewave CLI version from Cargo.toml
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
 
 // ============================================================================
 // JSON-RPC Types
@@ -248,28 +243,12 @@ pub struct TidewaveExitParams {
 // Regular ACP Message Types
 // ============================================================================
 
-// to keep the current model updated for our custom session load,
-// we intercept session/set_model and store the updated modelId
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetSessionModelParams {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    #[serde(rename = "modelId")]
-    pub model_id: Value,
-}
-
 // we also have a type for the session response, which we try to parse
 // to see if we need to track a new session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSessionResponse {
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub models: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modes: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub _meta: Option<Value>,
 }
 
 // ============================================================================
@@ -317,6 +296,8 @@ pub struct AcpProxyState {
     pub websocket_to_process: Arc<DashMap<WebSocketId, ProcessKey>>,
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
+    /// Locks to prevent multiple concurrent process starts for the same process_key
+    pub process_start_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
 }
 
 impl AcpProxyState {
@@ -332,6 +313,7 @@ impl AcpProxyState {
             session_to_websocket: Arc::new(DashMap::new()),
             websocket_to_process: Arc::new(DashMap::new()),
             process_starter,
+            process_start_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -358,18 +340,12 @@ pub struct ProcessState {
     // because we need to handle their responses in a special way.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
-    pub load_request_ids: Arc<DashMap<Value, SessionId>>,
-    /// A mapping of prompt request IDs to the session ID in order handle
-    /// the tidewave.ai/promptRunning status.
-    pub prompt_request_ids: Arc<DashMap<Value, SessionId>>,
 }
 
 pub struct SessionState {
     pub process_key: ProcessKey,
     pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
     pub notification_id_counter: Arc<AtomicU64>,
-    pub models: Arc<RwLock<Option<Value>>>,
-    pub prompt_running: Arc<RwLock<bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,8 +368,6 @@ impl ProcessState {
             cached_init_response: Arc::new(RwLock::new(None)),
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
-            load_request_ids: Arc::new(DashMap::new()),
-            prompt_request_ids: Arc::new(DashMap::new()),
         }
     }
 
@@ -455,8 +429,6 @@ impl SessionState {
             process_key,
             message_buffer: Arc::new(RwLock::new(Vec::new())),
             notification_id_counter: Arc::new(AtomicU64::new(1)),
-            models: Arc::new(RwLock::new(None)),
-            prompt_running: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -683,8 +655,6 @@ async fn handle_client_request(
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
         "session/load" => handle_acp_session_load(state, websocket_id, request).await,
-        // Prompt. We need to intercept it to keep the promptRunning status updated.
-        "session/prompt" => handle_prompt(state, websocket_id, request).await,
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, websocket_id, request).await,
     }
@@ -721,8 +691,34 @@ async fn handle_initialize_request(
     let process_key = generate_process_key(command, init_params);
     trace!("Generated process key: {}", process_key);
 
+    // Acquire or create a lock for this process_key to prevent concurrent starts
+    let lock = state
+        .process_start_locks
+        .entry(process_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let guard = lock.lock().await;
+
+    // Execute the initialization logic
+    let result =
+        handle_initialize_request_locked(state, websocket_id, command, request, &process_key).await;
+
+    // Clean up the lock after initialization attempt (success or failure)
+    drop(guard);
+    state.process_start_locks.remove(&process_key);
+
+    result
+}
+
+async fn handle_initialize_request_locked(
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    command: &str,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+) -> Result<()> {
     // Check if we already have a process for this command + params
-    if let Some(process_state) = state.processes.get(&process_key) {
+    if let Some(process_state) = state.processes.get(process_key) {
         debug!("Found existing process for key: {}", process_key);
         // Check if we have a cached init response
         if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
@@ -746,7 +742,7 @@ async fn handle_initialize_request(
     }
 
     // Need to start a new process or get the init response
-    let process_state = match state.processes.get(&process_key) {
+    let process_state = match state.processes.get(process_key) {
         // This should be rare in practice and TC will try again for us.
         Some(_existing) => {
             let response = JsonRpcResponse {
@@ -879,27 +875,10 @@ async fn handle_tidewave_session_load(
             let _ = tx.send(WebSocketMessage::JsonRpc(buffered.message));
         }
 
-        // Send success response with model state
-        let response_data = NewSessionResponse {
-            session_id: params.session_id.clone(),
-            models: session_state.models.read().await.clone(),
-            // TODO: handle modes
-            modes: None,
-            // Because we need to know if the chat status should be set to generating
-            // after loading, we also keep track of running prompts.
-            //
-            // I'm not if concurrent prompt requests are a thing in practice, but
-            // we don't handle them here, since those should not happen with Tidewave Web as client
-            // (we disable the send button when a generation is in progress).
-            _meta: Some(
-                json!({"tidewave.ai/promptRunning": *session_state.prompt_running.read().await}),
-            ),
-        };
-
         let success_response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id.clone(),
-            result: serde_json::to_value(response_data).ok(),
+            result: serde_json::to_value(Map::new()).ok(),
             error: None,
         };
 
@@ -976,26 +955,6 @@ async fn handle_acp_session_load(
     handle_regular_request(state, websocket_id, request).await
 }
 
-async fn handle_prompt(
-    state: &AcpProxyState,
-    websocket_id: WebSocketId,
-    request: &JsonRpcRequest,
-) -> Result<()> {
-    // Extract session_id from the request params
-    let session_id = extract_session_id_from_request(request);
-
-    if let Some(session_id) = session_id {
-        if let Some(session_state) = state.sessions.get(&session_id) {
-            // we mark the session as generating to properly restore the
-            // chat status on load
-            *session_state.prompt_running.write().await = true;
-        }
-    }
-
-    // Forward the request to the agent as a regular request
-    handle_regular_request(state, websocket_id, request).await
-}
-
 async fn handle_regular_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
@@ -1011,39 +970,9 @@ async fn handle_regular_request(
     proxy_request.id = proxy_id.clone();
 
     match request.method.as_str() {
-        // Intercept session/set_model to update stored model state
-        "session/set_model" => {
-            if let Ok(params) = serde_json::from_value::<SetSessionModelParams>(
-                request.params.clone().unwrap_or(Value::Null),
-            ) {
-                if let Some(session_state) = state.sessions.get(&params.session_id) {
-                    let mut models_guard = session_state.models.write().await;
-                    if let Some(models) = models_guard.as_mut() {
-                        if let Some(models_obj) = models.as_object_mut() {
-                            models_obj.insert("currentModelId".to_string(), params.model_id);
-                        }
-                    }
-                }
-            }
-        }
-        // we need to store the proxy_id to store the models from the response
-        // for a future tidewave.ai/session/load
+        // We intercept new sessions to map the sessionId to the websocket
         "session/new" => {
             process_state.new_request_ids.insert(proxy_id.clone());
-        }
-        "session/load" => {
-            if let Some(session_id) = session_id.clone() {
-                process_state
-                    .load_request_ids
-                    .insert(proxy_id.clone(), session_id);
-            }
-        }
-        "session/prompt" => {
-            if let Some(session_id) = session_id.clone() {
-                process_state
-                    .prompt_request_ids
-                    .insert(proxy_id.clone(), session_id);
-            }
         }
         _ => (),
     }
@@ -1328,8 +1257,6 @@ async fn handle_process_response(
             websocket_id,
         )
         .await;
-        maybe_handle_session_load_response(process_state, state, response, &client_response).await;
-        maybe_handle_prompt_response(process_state, state, response).await;
 
         // Finally: send to the WebSocket
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
@@ -1348,7 +1275,7 @@ async fn handle_process_response(
     Ok(())
 }
 
-/// Handle initialize response - inject capabilities and cache
+/// Handle initialize response - inject version and cache
 async fn maybe_handle_init_response(
     process_state: &Arc<ProcessState>,
     response: &JsonRpcResponse,
@@ -1357,13 +1284,13 @@ async fn maybe_handle_init_response(
     let init_request_id = process_state.init_request_id.read().await;
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
-        inject_tidewave_capabilities(client_response);
+        inject_tidewave_version(client_response, version());
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
     }
 }
 
-/// Handle session/new response - create new session and store model state
+/// Handle session/new response - create new session
 async fn maybe_handle_session_new_response(
     process_state: &Arc<ProcessState>,
     state: &AcpProxyState,
@@ -1383,7 +1310,6 @@ async fn maybe_handle_session_new_response(
                     if let Some(process_key) = process_key {
                         // Create session state and store model state
                         let session_state = Arc::new(SessionState::new(process_key));
-                        *session_state.models.write().await = session_response.models;
 
                         state
                             .sessions
@@ -1402,39 +1328,6 @@ async fn maybe_handle_session_new_response(
                     );
                 }
             }
-        }
-    }
-}
-
-/// Handle session/load response - update stored models
-async fn maybe_handle_session_load_response(
-    process_state: &Arc<ProcessState>,
-    state: &AcpProxyState,
-    response: &JsonRpcResponse,
-    client_response: &JsonRpcResponse,
-) {
-    if let Some((_proxy_id, session_id)) = process_state.load_request_ids.remove(&response.id) {
-        if let Some(result) = &client_response.result {
-            if let Some(obj) = result.as_object() {
-                if let Some(models) = obj.get("models") {
-                    if let Some(session_state) = state.sessions.get(&session_id) {
-                        *session_state.models.write().await = Some(models.clone());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Handle session/prompt response - reset prompt_running flag
-async fn maybe_handle_prompt_response(
-    process_state: &Arc<ProcessState>,
-    state: &AcpProxyState,
-    response: &JsonRpcResponse,
-) {
-    if let Some((_proxy_id, session_id)) = process_state.prompt_request_ids.remove(&response.id) {
-        if let Some(session_state) = state.sessions.get(&session_id) {
-            *session_state.prompt_running.write().await = false;
         }
     }
 }
@@ -1641,25 +1534,21 @@ fn generate_process_key(command: &str, init_params: &Value) -> ProcessKey {
     )
 }
 
-fn inject_tidewave_capabilities(response: &mut JsonRpcResponse) {
+fn inject_tidewave_version(response: &mut JsonRpcResponse, version: &str) {
     if let Some(result) = &mut response.result {
         if let Some(result_obj) = result.as_object_mut() {
-            if let Some(agent_caps) = result_obj.get_mut("agentCapabilities") {
-                if let Some(caps_obj) = agent_caps.as_object_mut() {
-                    // Add our custom _meta capabilities within agentCapabilities
-                    let mut meta_obj = caps_obj
-                        .get("_meta")
-                        .and_then(|v| v.as_object())
-                        .cloned()
-                        .unwrap_or_default();
+            // Add top-level _meta with version
+            let mut meta_obj = result_obj
+                .get("_meta")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
 
-                    let mut tidewave_obj = Map::new();
-                    tidewave_obj.insert("session/load".to_string(), Value::Bool(true));
-                    meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
+            let mut tidewave_obj = Map::new();
+            tidewave_obj.insert("version".to_string(), Value::String(version.to_string()));
+            meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
 
-                    caps_obj.insert("_meta".to_string(), Value::Object(meta_obj));
-                }
-            }
+            result_obj.insert("_meta".to_string(), Value::Object(meta_obj));
         }
     }
 }
@@ -1734,6 +1623,7 @@ async fn send_exit_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // Helper function to create a test SessionState
     fn create_test_session() -> SessionState {
@@ -2251,11 +2141,11 @@ mod tests {
     }
 
     // ============================================================================
-    // Tidewave Capabilities Injection Tests
+    // Tidewave Version Injection Tests
     // ============================================================================
 
     #[test]
-    fn test_inject_tidewave_capabilities() {
+    fn test_inject_tidewave_version() {
         let mut response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: Value::Number(serde_json::Number::from(1)),
@@ -2268,43 +2158,42 @@ mod tests {
             error: None,
         };
 
-        inject_tidewave_capabilities(&mut response);
+        inject_tidewave_version(&mut response, "0.1.0");
 
         let result = response.result.unwrap();
-        let agent_caps = result.get("agentCapabilities").unwrap();
-        let meta = agent_caps.get("_meta").unwrap();
+        let meta = result.get("_meta").unwrap();
         let tidewave = meta.get("tidewave.ai").unwrap();
 
-        assert_eq!(tidewave.get("session/load").unwrap(), true);
+        assert_eq!(tidewave.get("version").unwrap(), "0.1.0");
     }
 
     #[test]
-    fn test_inject_tidewave_capabilities_preserves_existing_meta() {
+    fn test_inject_tidewave_version_preserves_existing_meta() {
         let mut response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: Value::Number(serde_json::Number::from(1)),
             result: Some(json!({
                 "protocolVersion": 1,
+                "_meta": {
+                    "existing": "metadata"
+                },
                 "agentCapabilities": {
-                    "loadSession": true,
-                    "_meta": {
-                        "existing": "metadata"
-                    }
+                    "loadSession": true
                 }
             })),
             error: None,
         };
 
-        inject_tidewave_capabilities(&mut response);
+        inject_tidewave_version(&mut response, "0.2.0");
 
         let result = response.result.unwrap();
-        let agent_caps = result.get("agentCapabilities").unwrap();
-        let meta = agent_caps.get("_meta").unwrap();
+        let meta = result.get("_meta").unwrap();
 
         // Should preserve existing meta
         assert_eq!(meta.get("existing").unwrap(), "metadata");
 
         // Should add tidewave meta
-        assert!(meta.get("tidewave.ai").is_some());
+        let tidewave = meta.get("tidewave.ai").unwrap();
+        assert_eq!(tidewave.get("version").unwrap(), "0.2.0");
     }
 }
