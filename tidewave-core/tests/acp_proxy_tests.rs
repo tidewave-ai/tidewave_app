@@ -1,6 +1,7 @@
 use futures::channel::mpsc as futures_mpsc;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tidewave_core::acp_proxy::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -243,6 +244,202 @@ async fn test_websocket_notification_forwarding() {
         }
         _ => panic!("Expected text message"),
     }
+}
+
+#[tokio::test]
+async fn test_concurrent_initialize_requests() {
+    // Create a barrier to control when the process start completes
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    let barrier = Arc::new(tokio::sync::Mutex::new(Some(barrier_rx)));
+
+    // Counter to track how many times the process starter is called
+    let start_count = Arc::new(AtomicUsize::new(0));
+    let start_count_clone = start_count.clone();
+
+    // Create a custom process starter that increments counter and waits on barrier
+    let (process_stdin, _test_stdin) = tokio::io::duplex(8192);
+    let process_stdin = Arc::new(tokio::sync::Mutex::new(Some(process_stdin)));
+    let (_test_stdout, process_stdout) = tokio::io::duplex(8192);
+    let process_stdout = Arc::new(tokio::sync::Mutex::new(Some(process_stdout)));
+    let (started_tx, _started_rx) = tokio::sync::oneshot::channel::<()>();
+    let started_tx = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
+
+    let starter: ProcessStarterFn = Arc::new(move |_command: String| {
+        let process_stdin = process_stdin.clone();
+        let process_stdout = process_stdout.clone();
+        let barrier = barrier.clone();
+        let start_count = start_count_clone.clone();
+        let started_tx = started_tx.clone();
+
+        Box::pin(async move {
+            // Increment start counter
+            start_count.fetch_add(1, Ordering::SeqCst);
+
+            let stdin = process_stdin
+                .lock()
+                .await
+                .take()
+                .expect("process already started");
+            let stdout = process_stdout
+                .lock()
+                .await
+                .take()
+                .expect("process already started");
+
+            // Wait for barrier
+            if let Some(rx) = barrier.lock().await.take() {
+                let _ = rx.await;
+            }
+
+            // Signal that process has started
+            if let Some(tx) = started_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+
+            // Create stderr (unused)
+            let (stderr_write, stderr_read) = tokio::io::duplex(1024);
+            drop(stderr_write);
+
+            Ok::<ProcessIo, anyhow::Error>((
+                Box::new(stdout),
+                Box::new(BufReader::new(stdin)),
+                Box::new(BufReader::new(stderr_read)),
+                None,
+            ))
+        })
+    });
+
+    let state = AcpProxyState::with_process_starter(starter);
+    let state_clone = state.clone();
+
+    // Create two websockets with the same command and params
+    let (ws1_out_tx, mut _ws1_out_rx, ws1_in_tx, ws1_in_rx) = create_fake_websocket();
+    let (ws2_out_tx, mut ws2_out_rx, ws2_in_tx, ws2_in_rx) = create_fake_websocket();
+
+    let websocket_id1 = uuid::Uuid::new_v4();
+    let websocket_id2 = uuid::Uuid::new_v4();
+    let command = "test_acp".to_string();
+    let command_clone = command.clone();
+
+    // Start both handlers
+    tokio::spawn(async move {
+        unit_testable_ws_handler(ws1_out_tx, ws1_in_rx, state, websocket_id1, command).await;
+    });
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(
+            ws2_out_tx,
+            ws2_in_rx,
+            state_clone,
+            websocket_id2,
+            command_clone,
+        )
+        .await;
+    });
+
+    // Send init requests from both clients with SAME params (same process_key)
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    });
+
+    // Send both requests at nearly the same time
+    ws1_in_tx
+        .unbounded_send(Ok(axum::extract::ws::Message::Text(
+            init_request.to_string().into(),
+        )))
+        .unwrap();
+
+    ws2_in_tx
+        .unbounded_send(Ok(axum::extract::ws::Message::Text(
+            init_request.to_string().into(),
+        )))
+        .unwrap();
+
+    // Wait for the process starter to be called exactly once
+    let start_time = tokio::time::Instant::now();
+    loop {
+        if start_count.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        if start_time.elapsed() > tokio::time::Duration::from_secs(1) {
+            panic!("Timeout waiting for process starter to be called");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    // At this point, first request should be blocked on barrier
+    // Second request should be waiting on the lock
+    // Process starter should have been called exactly once
+    assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+    // Release the barrier to complete the first process start
+    barrier_tx.send(()).unwrap();
+
+    // First client should receive response (but we need to handle the process side first)
+    // For this test, we'll just verify the second client gets the expected error
+
+    // Check second client's response - should be the "Process alive, but no init response" error
+    let ws2_msg = tokio::time::timeout(tokio::time::Duration::from_millis(500), ws2_out_rx.next())
+        .await
+        .expect("Timeout waiting for ws2 response")
+        .expect("ws2 channel closed");
+
+    match ws2_msg {
+        axum::extract::ws::Message::Text(text) => {
+            let response: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], 1);
+            // Should have an error, not a result
+            assert!(response.get("error").is_some());
+            let error = &response["error"];
+            assert_eq!(error["code"], -32004);
+            assert!(error["message"]
+                .as_str()
+                .unwrap()
+                .contains("no init response"));
+        }
+        _ => panic!("Expected text message"),
+    }
+
+    // Process starter should still have been called only once
+    assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+    // Now send a new init request with DIFFERENT params on ws2
+    // This should trigger a second process start since the process_key will be different
+    let init_request_different = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "initialize",
+        "params": {
+            "clientCapabilities": {
+                "experimental": true
+            }
+        }
+    });
+
+    ws2_in_tx
+        .unbounded_send(Ok(axum::extract::ws::Message::Text(
+            init_request_different.to_string().into(),
+        )))
+        .unwrap();
+
+    // Wait for the process starter to be called a second time
+    let start_time = tokio::time::Instant::now();
+    loop {
+        if start_count.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        if start_time.elapsed() > tokio::time::Duration::from_secs(1) {
+            panic!("Timeout waiting for second process starter call");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    // Process starter should now have been called twice (once for each unique process_key)
+    assert_eq!(start_count.load(Ordering::SeqCst), 2);
 }
 
 // ============================================================================
