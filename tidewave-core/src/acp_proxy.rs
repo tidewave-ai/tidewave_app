@@ -340,6 +340,7 @@ pub struct ProcessState {
     // because we need to handle their responses in a special way.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
+    pub load_request_ids: Arc<DashMap<Value, SessionId>>,
 }
 
 pub struct SessionState {
@@ -368,6 +369,7 @@ impl ProcessState {
             cached_init_response: Arc::new(RwLock::new(None)),
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
+            load_request_ids: Arc::new(DashMap::new()),
         }
     }
 
@@ -974,6 +976,15 @@ async fn handle_regular_request(
         "session/new" => {
             process_state.new_request_ids.insert(proxy_id.clone());
         }
+        // We intercept load requests since we need to handle the unsuccessful case
+        // and clear the session mapping.
+        "session/load" => {
+            if let Some(session_id) = session_id {
+                process_state
+                    .load_request_ids
+                    .insert(proxy_id.clone(), session_id);
+            }
+        }
         _ => (),
     }
 
@@ -1249,6 +1260,14 @@ async fn handle_process_response(
 
         // Handle special response types
         maybe_handle_init_response(process_state, response, &mut client_response).await;
+        maybe_handle_failed_session_load(
+            process_state,
+            state,
+            websocket_id,
+            response,
+            &client_response,
+        )
+        .await?;
         maybe_handle_session_new_response(
             process_state,
             state,
@@ -1288,6 +1307,34 @@ async fn maybe_handle_init_response(
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
     }
+}
+
+/// Handle load response - check if successful and kill session
+async fn maybe_handle_failed_session_load(
+    process_state: &Arc<ProcessState>,
+    state: &AcpProxyState,
+    websocket_id: WebSocketId,
+    response: &JsonRpcResponse,
+    client_response: &JsonRpcResponse,
+) -> Result<()> {
+    if let Some((_proxy_id, session_id)) = process_state.load_request_ids.remove(&response.id) {
+        if let Some(_) = &client_response.error {
+            info!("Failed to load session, removing mapping! {}", session_id);
+            state.sessions.remove(&session_id);
+            state.session_to_websocket.remove(&session_id);
+            if let Some(tx) = state.websocket_senders.get(&websocket_id) {
+                let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
+                    client_response.clone(),
+                )));
+            }
+            return Err(anyhow!(
+                "Failed to load session, removing mapping! {}",
+                session_id
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle session/new response - create new session
