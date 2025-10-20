@@ -149,9 +149,16 @@ pub fn run() {
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &restart_i, &quit_i])?;
 
+            let icon_bytes = include_bytes!("../icons/128x128@2x.png");
+            let icon_img = image::load_from_memory(icon_bytes)?.to_rgba8();
+            let (width, height) = icon_img.dimensions();
+            let icon_raw = icon_img.into_raw();
+            let icon = tauri::image::Image::new(&icon_raw, width, height);
+
             TrayIconBuilder::new()
             .menu(&menu)
-            .icon(app.default_window_icon().unwrap().clone())
+            .icon(icon)
+            .icon_as_template(true)
             .on_menu_event(move |app, event| match event.id.as_ref() {
                 "quit" => {
                     debug!("quit menu item was clicked");
