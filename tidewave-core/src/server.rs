@@ -32,15 +32,11 @@ struct ShellParams {
 
 #[derive(Deserialize)]
 struct ReadFileParams {
-    cwd: String,
     path: String,
-    limit: Option<usize>,
-    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct WriteFileParams {
-    cwd: String,
     path: String,
     content: String,
     parents: Option<bool>,
@@ -49,7 +45,6 @@ struct WriteFileParams {
 #[derive(Serialize)]
 struct ReadFileResponse {
     content: String,
-    start_line: usize,
     total_lines: usize,
 }
 
@@ -267,37 +262,10 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
     }
 }
 
-fn validate_path_is_safe(cwd: &str, path: &str) -> Result<std::path::PathBuf, StatusCode> {
-    let cwd_path = Path::new(cwd);
-    let target_path = cwd_path.join(path);
-
-    let canonical_cwd = cwd_path
-        .canonicalize()
-        .map_err(|_e| StatusCode::BAD_REQUEST)?;
-
-    let canonical_target = match target_path.parent() {
-        Some(parent) if parent.exists() => {
-            let canonical_parent = parent
-                .canonicalize()
-                .map_err(|_e| StatusCode::BAD_REQUEST)?;
-            canonical_parent.join(target_path.file_name().unwrap_or_default())
-        }
-        _ => canonical_cwd.join(path),
-    };
-
-    if !canonical_target.starts_with(&canonical_cwd) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    Ok(canonical_target)
-}
-
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
-    let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
-
-    let content = tokio::fs::read_to_string(&safe_path)
+    let content = tokio::fs::read_to_string(&payload.path)
         .await
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
@@ -305,25 +273,11 @@ async fn read_file_handler(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
 
-    let offset = payload.offset.unwrap_or(0);
-
-    let all_lines: Vec<&str> = content.lines().collect();
-    let total_lines = all_lines.len();
-    let limit = payload.limit.unwrap_or(total_lines);
-
-    let lines: Vec<String> = all_lines
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|line| line.to_string())
-        .collect();
-
-    let formatted_content = lines.join("\n");
-    let start_line = offset + 1;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
 
     Ok(Json(ReadFileResponse {
-        content: formatted_content,
-        start_line,
+        content: lines.join("\n"),
         total_lines,
     }))
 }
@@ -331,8 +285,8 @@ async fn read_file_handler(
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
-    let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
-    let parent_path = safe_path.parent().unwrap_or_else(|| &safe_path);
+    let path = Path::new(&payload.path);
+    let parent_path = path.parent().unwrap_or_else(|| &path);
 
     if payload.parents.unwrap_or(false) && !parent_path.exists() {
         tokio::fs::create_dir_all(parent_path)
@@ -340,7 +294,7 @@ async fn write_file_handler(
             .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
-    tokio::fs::write(&safe_path, &payload.content)
+    tokio::fs::write(&path, &payload.content)
         .await
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
