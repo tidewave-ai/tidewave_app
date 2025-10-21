@@ -18,10 +18,6 @@ use std::process::Stdio;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
 
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-const MAX_READ_LINES: usize = 2000; // Default max lines to read
-const MAX_LINE_LENGTH: usize = 2000; // Max chars per line
-
 #[derive(Deserialize)]
 struct ProxyParams {
     url: String,
@@ -301,23 +297,6 @@ async fn read_file_handler(
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
     let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
 
-    let metadata = tokio::fs::metadata(&safe_path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
-
-    if metadata.len() > MAX_FILE_SIZE {
-        error!(
-            "File too large: {} bytes (max: {} bytes)",
-            metadata.len(),
-            MAX_FILE_SIZE
-        );
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
     let content = tokio::fs::read_to_string(&safe_path)
         .await
         .map_err(|e| match e.kind() {
@@ -327,22 +306,16 @@ async fn read_file_handler(
         })?;
 
     let offset = payload.offset.unwrap_or(0);
-    let limit = payload.limit.unwrap_or(MAX_READ_LINES);
 
     let all_lines: Vec<&str> = content.lines().collect();
     let total_lines = all_lines.len();
+    let limit = payload.limit.unwrap_or(total_lines);
 
     let lines: Vec<String> = all_lines
         .iter()
         .skip(offset)
         .take(limit)
-        .map(|line| {
-            if line.len() > MAX_LINE_LENGTH {
-                format!("{}...", &line[..MAX_LINE_LENGTH])
-            } else {
-                line.to_string()
-            }
-        })
+        .map(|line| line.to_string())
         .collect();
 
     let formatted_content = lines.join("\n");
@@ -358,15 +331,6 @@ async fn read_file_handler(
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
-    if payload.content.len() as u64 > MAX_FILE_SIZE {
-        error!(
-            "Content too large: {} bytes (max: {} bytes)",
-            payload.content.len(),
-            MAX_FILE_SIZE
-        );
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
     let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
     let parent_path = safe_path.parent().unwrap_or_else(|| &safe_path);
 
