@@ -10,13 +10,17 @@ use axum::{
 };
 use bytes::BytesMut;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
+
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+const MAX_READ_LINES: usize = 2000; // Default max lines to read
+const MAX_LINE_LENGTH: usize = 2000; // Max chars per line
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -28,6 +32,35 @@ struct ShellParams {
     command: String,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct ReadFileParams {
+    cwd: String,
+    path: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct WriteFileParams {
+    cwd: String,
+    path: String,
+    content: String,
+    parents: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ReadFileResponse {
+    content: String,
+    start_line: usize,
+    total_lines: usize,
+}
+
+#[derive(Serialize)]
+struct WriteFileResponse {
+    success: bool,
+    bytes_written: usize,
 }
 
 #[derive(Clone)]
@@ -100,6 +133,8 @@ pub async fn serve_http_server_with_shutdown(
         }))
         .route("/", get(root))
         .route("/shell", post(shell_handler))
+        .route("/read", post(read_file_handler))
+        .route("/write", post(write_file_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -234,6 +269,127 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
     {
         ("sh", vec!["-c", cmd])
     }
+}
+
+fn validate_path_is_safe(cwd: &str, path: &str) -> Result<std::path::PathBuf, StatusCode> {
+    let cwd_path = Path::new(cwd);
+    let target_path = cwd_path.join(path);
+
+    let canonical_cwd = cwd_path
+        .canonicalize()
+        .map_err(|_e| StatusCode::BAD_REQUEST)?;
+
+    let canonical_target = match target_path.parent() {
+        Some(parent) if parent.exists() => {
+            let canonical_parent = parent
+                .canonicalize()
+                .map_err(|_e| StatusCode::BAD_REQUEST)?;
+            canonical_parent.join(target_path.file_name().unwrap_or_default())
+        }
+        _ => canonical_cwd.join(path),
+    };
+
+    if !canonical_target.starts_with(&canonical_cwd) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(canonical_target)
+}
+
+async fn read_file_handler(
+    Json(payload): Json<ReadFileParams>,
+) -> Result<Json<ReadFileResponse>, StatusCode> {
+    let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
+
+    let metadata = tokio::fs::metadata(&safe_path)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+
+    if metadata.len() > MAX_FILE_SIZE {
+        error!(
+            "File too large: {} bytes (max: {} bytes)",
+            metadata.len(),
+            MAX_FILE_SIZE
+        );
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let content = tokio::fs::read_to_string(&safe_path)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+
+    let offset = payload.offset.unwrap_or(0);
+    let limit = payload.limit.unwrap_or(MAX_READ_LINES);
+
+    let all_lines: Vec<&str> = content.lines().collect();
+    let total_lines = all_lines.len();
+
+    let lines: Vec<String> = all_lines
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|line| {
+            if line.len() > MAX_LINE_LENGTH {
+                format!("{}...", &line[..MAX_LINE_LENGTH])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    let formatted_content = lines.join("\n");
+    let start_line = offset + 1;
+
+    Ok(Json(ReadFileResponse {
+        content: formatted_content,
+        start_line,
+        total_lines,
+    }))
+}
+
+async fn write_file_handler(
+    Json(payload): Json<WriteFileParams>,
+) -> Result<Json<WriteFileResponse>, StatusCode> {
+    if payload.content.len() as u64 > MAX_FILE_SIZE {
+        error!(
+            "Content too large: {} bytes (max: {} bytes)",
+            payload.content.len(),
+            MAX_FILE_SIZE
+        );
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let safe_path = validate_path_is_safe(&payload.cwd, &payload.path)?;
+    let parent_path = safe_path.parent().unwrap_or_else(|| &safe_path);
+
+    if payload.parents.unwrap_or(false) && !parent_path.exists() {
+        tokio::fs::create_dir_all(parent_path)
+            .await
+            .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    tokio::fs::write(&safe_path, &payload.content)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+
+    let bytes_written = payload.content.len();
+
+    Ok(Json(WriteFileResponse {
+        success: true,
+        bytes_written,
+    }))
 }
 
 async fn proxy_handler(
