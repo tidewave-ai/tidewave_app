@@ -1,22 +1,33 @@
 use crate::config::Config;
 use axum::{
-    body::Body,
-    extract::{Query, Request},
+    body::{Body, Bytes},
+    extract::{Json, Query, Request},
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
     routing::{get, post},
     Router,
 };
+use bytes::BytesMut;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
-use tokio::net::TcpListener;
+use std::path::Path;
+use std::process::Stdio;
+use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
 
 #[derive(Deserialize)]
 struct ProxyParams {
     url: String,
+}
+
+#[derive(Deserialize)]
+struct ShellParams {
+    command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -88,6 +99,7 @@ pub async fn serve_http_server_with_shutdown(
             verify_origin(req, next)
         }))
         .route("/", get(root))
+        .route("/shell", post(shell_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -127,6 +139,101 @@ async fn verify_origin(
     }
 
     Ok(next.run(req).await)
+}
+
+async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
+    let (cmd, args) = get_shell_command(&payload.command);
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .envs(env)
+        .current_dir(Path::new(&cwd))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut stdout = Some(
+        child
+            .stdout
+            .take()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    let mut stderr = Some(
+        child
+            .stderr
+            .take()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+
+    let stream = async_stream::stream! {
+        let (mut stdout_buf, mut stderr_buf) = (vec![0u8; 4096], vec![0u8; 4096]);
+
+        loop {
+            tokio::select! {
+                result = async { stdout.as_mut().unwrap().read(&mut stdout_buf).await }, if stdout.is_some() => {
+                    match result {
+                        Ok(0) => stdout = None,
+                        Ok(n) => yield Ok(create_data_chunk(&stdout_buf[..n])),
+                        Err(e) => { yield Err(e); break; }
+                    }
+                }
+                result = async { stderr.as_mut().unwrap().read(&mut stderr_buf).await }, if stderr.is_some() => {
+                    match result {
+                        Ok(0) => stderr = None,
+                        Ok(n) => yield Ok(create_data_chunk(&stderr_buf[..n])),
+                        Err(e) => { yield Err(e); break; }
+                    }
+                }
+                else => break,
+            }
+        }
+
+        match child.wait().await {
+            Ok(status) => yield Ok(create_status_chunk(status.code().unwrap_or(-1))),
+            Err(e) => yield Err(e),
+        }
+    };
+
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+}
+
+fn create_data_chunk(data: &[u8]) -> Bytes {
+    let mut chunk = BytesMut::new();
+    chunk.extend_from_slice(&[0u8]); // type = 0 (data)
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes()); // length
+    chunk.extend_from_slice(data); // data
+    chunk.freeze()
+}
+
+fn create_status_chunk(status: i32) -> Bytes {
+    let json = format!(r#"{{"status":{}}}"#, status);
+    let mut chunk = BytesMut::new();
+    chunk.extend_from_slice(&[1u8]); // type = 1 (status)
+    chunk.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(json.as_bytes());
+    chunk.freeze()
+}
+
+fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        ("cmd.exe", vec!["/s", "/c", cmd])
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ("sh", vec!["-c", cmd])
+    }
 }
 
 async fn proxy_handler(
