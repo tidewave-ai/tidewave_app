@@ -45,7 +45,6 @@ struct WriteFileParams {
 #[derive(Serialize)]
 struct ReadFileResponse {
     content: String,
-    total_lines: usize,
 }
 
 #[derive(Serialize)]
@@ -273,13 +272,7 @@ async fn read_file_handler(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-
-    Ok(Json(ReadFileResponse {
-        content: lines.join("\n"),
-        total_lines,
-    }))
+    Ok(Json(ReadFileResponse { content }))
 }
 
 async fn write_file_handler(
