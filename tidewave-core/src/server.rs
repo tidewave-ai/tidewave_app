@@ -32,6 +32,11 @@ struct ShellParams {
 }
 
 #[derive(Deserialize)]
+struct StatFileParams {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct ReadFileParams {
     path: String,
 }
@@ -40,6 +45,13 @@ struct ReadFileParams {
 struct WriteFileParams {
     path: String,
     content: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum StatFileResponse {
+    StatFileResponseOk { success: bool, mtime: u64 },
+    StatFileResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -142,6 +154,7 @@ pub async fn serve_http_server_with_shutdown(
         .route("/shell", post(shell_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
+        .route("/stat", get(stat_file_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -280,7 +293,13 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
 
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
-) -> Json<ReadFileResponse> {
+) -> Result<Json<ReadFileResponse>, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let result = async {
         let content = tokio::fs::read_to_string(&payload.path)
             .await
@@ -291,31 +310,33 @@ async fn read_file_handler(
     .await;
 
     match result {
-        Ok((content, mtime)) => Json(ReadFileResponse::ReadFileResponseOk {
+        Ok((content, mtime)) => Ok(Json(ReadFileResponse::ReadFileResponseOk {
             success: true,
             content,
             mtime,
-        }),
-        Err(error) => Json(ReadFileResponse::ReadFileResponseErr {
+        })),
+        Err(error) => Ok(Json(ReadFileResponse::ReadFileResponseErr {
             success: false,
             error,
-        }),
+        })),
     }
 }
 
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
-) -> Json<WriteFileResponse> {
+) -> Result<Json<WriteFileResponse>, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let path_str = payload.path.clone();
     let content = payload.content.clone();
     let bytes_written = content.len();
 
     let result = async {
         let path = Path::new(&path_str);
-
-        if !path.is_absolute() {
-            return Err("path must be absolute".to_string());
-        }
 
         let parent_path = path.parent().unwrap_or_else(|| &path);
         if !parent_path.exists() {
@@ -334,15 +355,38 @@ async fn write_file_handler(
     .await;
 
     match result {
-        Ok(mtime) => Json(WriteFileResponse::WriteFileResponseOk {
+        Ok(mtime) => Ok(Json(WriteFileResponse::WriteFileResponseOk {
             success: true,
             bytes_written,
             mtime,
-        }),
-        Err(error) => Json(WriteFileResponse::WriteFileResponseErr {
+        })),
+        Err(error) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
             success: false,
             error,
-        }),
+        })),
+    }
+}
+
+async fn stat_file_handler(
+    Query(query): Query<StatFileParams>,
+) -> Result<Json<StatFileResponse>, StatusCode> {
+    let path = Path::new(&query.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mtime_op = fetch_mtime(query.path);
+
+    match mtime_op {
+        Ok(mtime) => Ok(Json(StatFileResponse::StatFileResponseOk {
+            success: true,
+            mtime,
+        })),
+        Err(error) => Ok(Json(StatFileResponse::StatFileResponseErr {
+            success: false,
+            error,
+        })),
     }
 }
 
