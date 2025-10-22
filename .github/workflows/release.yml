@@ -107,7 +107,7 @@ jobs:
 
       - name: Install Tauri CLI
         if: matrix.gui_targets
-        run: cargo install tauri-cli --version "^2.0.0" --locked
+        run: cargo install tauri-cli --version "=2.8.0" --locked
 
       - name: Install Apple certificate
         if: matrix.os == 'macos'
