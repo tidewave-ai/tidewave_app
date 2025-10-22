@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::UNIX_EPOCH;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
 
@@ -39,18 +40,34 @@ struct ReadFileParams {
 struct WriteFileParams {
     path: String,
     content: String,
-    parents: Option<bool>,
 }
 
 #[derive(Serialize)]
-struct ReadFileResponse {
-    content: String,
+#[serde(untagged)]
+enum ReadFileResponse {
+    ReadFileResponseOk {
+        success: bool,
+        content: String,
+        mtime: u64,
+    },
+    ReadFileResponseErr {
+        success: bool,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
-struct WriteFileResponse {
-    success: bool,
-    bytes_written: usize,
+#[serde(untagged)]
+enum WriteFileResponse {
+    WriteFileResponseOk {
+        success: bool,
+        bytes_written: usize,
+        mtime: u64,
+    },
+    WriteFileResponseErr {
+        success: bool,
+        error: String,
+    },
 }
 
 #[derive(Clone)]
@@ -263,44 +280,80 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
 
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
-) -> Result<Json<ReadFileResponse>, StatusCode> {
-    let content = tokio::fs::read_to_string(&payload.path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+) -> Json<ReadFileResponse> {
+    let result = async {
+        let content = tokio::fs::read_to_string(&payload.path)
+            .await
+            .map_err(|e| e.kind().to_string())?;
+        let mtime = fetch_mtime(payload.path)?;
+        Ok::<_, String>((content, mtime))
+    }
+    .await;
 
-    Ok(Json(ReadFileResponse { content }))
+    match result {
+        Ok((content, mtime)) => Json(ReadFileResponse::ReadFileResponseOk {
+            success: true,
+            content,
+            mtime,
+        }),
+        Err(error) => Json(ReadFileResponse::ReadFileResponseErr {
+            success: false,
+            error,
+        }),
+    }
 }
 
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
-) -> Result<Json<WriteFileResponse>, StatusCode> {
-    let path = Path::new(&payload.path);
-    let parent_path = path.parent().unwrap_or_else(|| &path);
+) -> Json<WriteFileResponse> {
+    let path_str = payload.path.clone();
+    let content = payload.content.clone();
+    let bytes_written = content.len();
 
-    if payload.parents.unwrap_or(false) && !parent_path.exists() {
-        tokio::fs::create_dir_all(parent_path)
+    let result = async {
+        let path = Path::new(&path_str);
+
+        if !path.is_absolute() {
+            return Err("path must be absolute".to_string());
+        }
+
+        let parent_path = path.parent().unwrap_or_else(|| &path);
+        if !parent_path.exists() {
+            tokio::fs::create_dir_all(parent_path)
+                .await
+                .map_err(|e| e.kind().to_string())?;
+        }
+
+        tokio::fs::write(&path, content)
             .await
-            .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| e.kind().to_string())?;
+
+        let mtime = fetch_mtime(path_str)?;
+        Ok::<_, String>(mtime)
     }
+    .await;
 
-    tokio::fs::write(&path, &payload.content)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-            std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    match result {
+        Ok(mtime) => Json(WriteFileResponse::WriteFileResponseOk {
+            success: true,
+            bytes_written,
+            mtime,
+        }),
+        Err(error) => Json(WriteFileResponse::WriteFileResponseErr {
+            success: false,
+            error,
+        }),
+    }
+}
 
-    let bytes_written = payload.content.len();
+fn fetch_mtime(path: String) -> Result<u64, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.kind().to_string())?;
+    let mtime = metadata.modified().map_err(|e| e.kind().to_string())?;
 
-    Ok(Json(WriteFileResponse {
-        success: true,
-        bytes_written,
-    }))
+    return mtime
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| "system time error".to_string());
 }
 
 async fn proxy_handler(
