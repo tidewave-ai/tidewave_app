@@ -10,11 +10,12 @@ use axum::{
 };
 use bytes::BytesMut;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::UNIX_EPOCH;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
 
@@ -28,6 +29,57 @@ struct ShellParams {
     command: String,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct StatFileParams {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ReadFileParams {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct WriteFileParams {
+    path: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum StatFileResponse {
+    StatFileResponseOk { success: bool, mtime: u64 },
+    StatFileResponseErr { success: bool, error: String },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ReadFileResponse {
+    ReadFileResponseOk {
+        success: bool,
+        content: String,
+        mtime: u64,
+    },
+    ReadFileResponseErr {
+        success: bool,
+        error: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WriteFileResponse {
+    WriteFileResponseOk {
+        success: bool,
+        bytes_written: usize,
+        mtime: u64,
+    },
+    WriteFileResponseErr {
+        success: bool,
+        error: String,
+    },
 }
 
 #[derive(Clone)]
@@ -100,6 +152,9 @@ pub async fn serve_http_server_with_shutdown(
         }))
         .route("/", get(root))
         .route("/shell", post(shell_handler))
+        .route("/read", post(read_file_handler))
+        .route("/write", post(write_file_handler))
+        .route("/stat", get(stat_file_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -234,6 +289,115 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
     {
         ("sh", vec!["-c", cmd])
     }
+}
+
+async fn read_file_handler(
+    Json(payload): Json<ReadFileParams>,
+) -> Result<Json<ReadFileResponse>, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = async {
+        let content = tokio::fs::read_to_string(&payload.path)
+            .await
+            .map_err(|e| e.kind().to_string())?;
+        let mtime = fetch_mtime(payload.path)?;
+        Ok::<_, String>((content, mtime))
+    }
+    .await;
+
+    match result {
+        Ok((content, mtime)) => Ok(Json(ReadFileResponse::ReadFileResponseOk {
+            success: true,
+            content,
+            mtime,
+        })),
+        Err(error) => Ok(Json(ReadFileResponse::ReadFileResponseErr {
+            success: false,
+            error,
+        })),
+    }
+}
+
+async fn write_file_handler(
+    Json(payload): Json<WriteFileParams>,
+) -> Result<Json<WriteFileResponse>, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let path_str = payload.path.clone();
+    let content = payload.content.clone();
+    let bytes_written = content.len();
+
+    let result = async {
+        let path = Path::new(&path_str);
+
+        let parent_path = path.parent().unwrap_or_else(|| &path);
+        if !parent_path.exists() {
+            tokio::fs::create_dir_all(parent_path)
+                .await
+                .map_err(|e| e.kind().to_string())?;
+        }
+
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|e| e.kind().to_string())?;
+
+        let mtime = fetch_mtime(path_str)?;
+        Ok::<_, String>(mtime)
+    }
+    .await;
+
+    match result {
+        Ok(mtime) => Ok(Json(WriteFileResponse::WriteFileResponseOk {
+            success: true,
+            bytes_written,
+            mtime,
+        })),
+        Err(error) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
+            success: false,
+            error,
+        })),
+    }
+}
+
+async fn stat_file_handler(
+    Query(query): Query<StatFileParams>,
+) -> Result<Json<StatFileResponse>, StatusCode> {
+    let path = Path::new(&query.path);
+
+    if !path.is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mtime_op = fetch_mtime(query.path);
+
+    match mtime_op {
+        Ok(mtime) => Ok(Json(StatFileResponse::StatFileResponseOk {
+            success: true,
+            mtime,
+        })),
+        Err(error) => Ok(Json(StatFileResponse::StatFileResponseErr {
+            success: false,
+            error,
+        })),
+    }
+}
+
+fn fetch_mtime(path: String) -> Result<u64, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.kind().to_string())?;
+    let mtime = metadata.modified().map_err(|e| e.kind().to_string())?;
+
+    return mtime
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| "system time error".to_string());
 }
 
 async fn proxy_handler(
