@@ -489,7 +489,8 @@ async fn root() -> Html<String> {
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
     let html = format!(
-        r#"<html>
+        r#"<!DOCTYPE html>
+<html>
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
