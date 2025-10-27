@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::time::UNIX_EPOCH;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
+use which::which;
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -45,6 +46,11 @@ struct ReadFileParams {
 struct WriteFileParams {
     path: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct WhichParams {
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -80,6 +86,11 @@ enum WriteFileResponse {
         success: bool,
         error: String,
     },
+}
+
+#[derive(Serialize)]
+struct WhichResponse {
+    path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -155,6 +166,7 @@ pub async fn serve_http_server_with_shutdown(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
+        .route("/which", get(which_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -400,6 +412,22 @@ fn fetch_mtime(path: String) -> Result<u64, String> {
         .map_err(|_| "system time error".to_string());
 }
 
+async fn which_handler(
+    Query(params): Query<WhichParams>,
+) -> Result<Json<WhichResponse>, StatusCode> {
+    let result = tokio::task::spawn_blocking(|| which(params.command)).await;
+
+    match result {
+        Ok(Ok(path)) => Ok(Json(WhichResponse {
+            // this is a lossy conversion in case the path contains non UTF-8 
+            // characters, but we don't try to use the path as is and it's also unlikely,
+            // so it's fine
+            path: Some(path.display().to_string()),
+        })),
+        _ => Ok(Json(WhichResponse { path: None })),
+    }
+}
+
 async fn proxy_handler(
     Query(params): Query<ProxyParams>,
     req: Request,
@@ -502,4 +530,39 @@ async fn root() -> Html<String> {
     );
 
     Html(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Query;
+
+    #[tokio::test]
+    async fn test_which_handler_finds_common_command() {
+        let params = WhichParams {
+            command: "sh".to_string(),
+        };
+
+        let result = which_handler(Query(params)).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.path.is_some());
+        let path = response.path.unwrap();
+        assert!(!path.is_empty());
+        assert!(path.contains("sh"));
+    }
+
+    #[tokio::test]
+    async fn test_which_handler_nonexistent_command() {
+        let params = WhichParams {
+            command: "this_command_definitely_does_not_exist_12345".to_string(),
+        };
+
+        let result = which_handler(Query(params)).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.path.is_none());
+    }
 }
