@@ -17,11 +17,13 @@ jobs:
   ensure-release:
     runs-on: ubuntu-latest
     outputs:
-      release_name: ${{ steps.determine-release.outputs.release_name }}
+      release-name: ${{ steps.ensure-release.outputs.release-name }}
     steps:
       - name: Create or update release
-        id: determine-release
+        id: ensure-release
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           repo="${GITHUB_REPOSITORY}"
 
@@ -47,28 +49,28 @@ jobs:
               --notes "${notes}"
           fi
 
-          echo "release_name=${ref_name}" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "release-name=${ref_name}" >> $GITHUB_OUTPUT
 
   build:
-    needs: ensure-release
+    name: "build (${{ matrix.gui_target }})"
+    needs: [ensure-release]
+    outputs:
+      app-version: ${{ steps.app-version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-15
-            os: macos
-            cli_targets: "x86_64-apple-darwin aarch64-apple-darwin"
-            gui_targets: "x86_64-apple-darwin aarch64-apple-darwin"
+            gui_target:  "aarch64-apple-darwin"
+            cli_targets: "aarch64-apple-darwin x86_64-apple-darwin"
+          - platform: macos-15
+            gui_target:  "x86_64-apple-darwin"
           - platform: windows-2025
-            os: windows
             cli_targets: "x86_64-pc-windows-msvc"
-            gui_targets: "x86_64-pc-windows-msvc"
+            gui_target:  "x86_64-pc-windows-msvc"
           - platform: ubuntu-22.04
-            os: linux
             cli_targets: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
-            gui_targets: "x86_64-unknown-linux-gnu"
+            gui_target:  "x86_64-unknown-linux-gnu"
 
     runs-on: ${{ matrix.platform }}
 
@@ -84,16 +86,11 @@ jobs:
         with:
           cache-directories: |
             ~/.cargo/bin
-
-      - name: Install targets
-        shell: bash
-        run: |
-          for target in ${{ matrix.cli_targets }}; do
-            rustup target add $target
-          done
+          key: ${{ matrix.platform }}
 
       - name: Install Linux dependencies
-        if: matrix.os == 'linux'
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -106,11 +103,17 @@ jobs:
             patchelf
 
       - name: Install Tauri CLI
-        if: matrix.gui_targets
-        run: cargo install tauri-cli --version "=2.8.0" --locked
+        shell: bash
+        run: |
+          # Only install if not already cached
+          if ! command -v cargo-tauri &> /dev/null; then
+            cargo install tauri-cli --version "=2.8.0" --locked
+          else
+            echo "cargo-tauri already installed: $(cargo-tauri --version)"
+          fi
 
       - name: Install Apple certificate
-        if: matrix.os == 'macos'
+        if: startsWith(matrix.platform, 'macos')
         env:
           P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
@@ -134,37 +137,42 @@ jobs:
             security list-keychain -d user -s $KEYCHAIN_PATH
           fi
 
-      - name: Build Tauri app
-        if: matrix.gui_targets
+      - name: Install targets
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.gui_target }}"
+
+      - name: Build GUI
+        uses: tauri-apps/tauri-action@v0
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        shell: bash
-        run: |
-          for target in ${{ matrix.gui_targets }}; do
-            echo "Building GUI for $target"
-            cargo tauri build --target $target
-          done
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target ${{ matrix.gui_target }}
+          tagName: ${{ needs.ensure-release.outputs.release-name }}
 
-      - name: Verify Tauri macOS app code signing and notarization
-        if: matrix.os == 'macos' && matrix.gui_targets
+      - name: Verify GUI notarization (macos)
+        if: startsWith(matrix.platform, 'macos')
         shell: bash
         run: |
-          for target in ${{ matrix.gui_targets }}; do
-            app_path="target/$target/release/bundle/macos/tidewave.app"
-            echo "Verifying $app_path"
-            spctl -a -t exec -vvv "$app_path"
-          done
+          app_path="target/${{ matrix.gui_target }}/release/bundle/macos/tidewave.app"
+          echo "Verifying $app_path"
+          spctl -a -t exec -vvv "$app_path"
 
       - name: Build CLI binaries
         shell: bash
+        if: matrix.cli_targets != ''
         run: |
           for target in ${{ matrix.cli_targets }}; do
             echo "Building CLI for $target"
+            rustup target add "$target"
 
             # Set linker for aarch64 cross-compilation
             if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
@@ -176,8 +184,8 @@ jobs:
             cargo build -p tidewave-cli --release --target $target
           done
 
-      - name: Sign and notarize macOS CLI binaries
-        if: matrix.os == 'macos'
+      - name: Sign CLI binaries (macos)
+        if: startsWith(matrix.platform, 'macos') && matrix.cli_targets != ''
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -207,8 +215,8 @@ jobs:
               --wait
           done
 
-      - name: Sign Windows files with Azure Trusted Signing
-        if: matrix.os == 'windows'
+      - name: Sign CLI binaries (windows)
+        if: startsWith(matrix.platform, 'windows')
         uses: azure/trusted-signing-action@v0.4.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -224,86 +232,20 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Upload artifacts
+      - name: Upload CLI binaries
+        if: matrix.cli_targets != ''
         shell: bash
-        run: |
-          release_name="${{ needs.ensure-release.outputs.release_name }}"
-
-          product_name=$(jq -r '.productName' src-tauri/tauri.conf.json)
-          app_version=$(jq -r '.version' src-tauri/tauri.conf.json)
-
-          # Upload GUI artifacts
-          if [ -n "${{ matrix.gui_targets }}" ]; then
-            if [ "${{ matrix.os }}" = "macos" ]; then
-              for target in ${{ matrix.gui_targets }}; do
-                if [[ "$target" == *"x86_64"* ]]; then
-                  arch="x64"
-                  bundle_arch="x64"
-                else
-                  arch="arm64"
-                  bundle_arch="aarch64"
-                fi
-
-                dmg_path="target/$target/release/bundle/dmg/${product_name}_${app_version}_${bundle_arch}.dmg"
-                if [ ! -f "$dmg_path" ]; then
-                  echo "Expected DMG not found at ${dmg_path}" >&2
-                  exit 1
-                fi
-
-                cp "$dmg_path" tidewave-app-macos-$arch.dmg
-                gh release upload --clobber "${release_name}" tidewave-app-macos-$arch.dmg
-              done
-            elif [ "${{ matrix.os }}" = "windows" ]; then
-              for target in ${{ matrix.gui_targets }}; do
-                msi_path="target/$target/release/bundle/msi/${product_name}_${app_version}_x64_en-US.msi"
-                if [ ! -f "$msi_path" ]; then
-                  echo "Expected MSI not found at ${msi_path}" >&2
-                  exit 1
-                fi
-
-                cp "$msi_path" tidewave-app-windows-x64.msi
-                gh release upload --clobber "${release_name}" tidewave-app-windows-x64.msi
-
-                # Upload NSIS .exe (disabled for now)
-                # nsis_path="target/$target/release/bundle/nsis/${product_name}_${app_version}_x64.exe"
-                # cp "$nsis_path" tidewave-app-windows-x64.exe
-                # gh release upload --clobber "${release_name}" tidewave-app-windows-x64.exe
-              done
-            elif [ "${{ matrix.os }}" = "linux" ]; then
-              for target in ${{ matrix.gui_targets }}; do
-                # Upload .deb (disabled for now)
-                # deb_path="target/$target/release/bundle/deb/${product_name}_${app_version}_amd64.deb"
-                # cp "$deb_path" tidewave-app-linux-x64.deb
-                # gh release upload --clobber "${release_name}" tidewave-app-linux-x64.deb
-
-                # Upload .AppImage (Tauri emits AppImages with `amd64` suffix even for x86_64 targets)
-                appimage_path="target/$target/release/bundle/appimage/${product_name}_${app_version}_amd64.AppImage"
-                if [ ! -f "$appimage_path" ]; then
-                  echo "Expected AppImage not found at ${appimage_path}" >&2
-                  exit 1
-                fi
-
-                cp "$appimage_path" tidewave-app-linux-x64.AppImage
-                gh release upload --clobber "${release_name}" tidewave-app-linux-x64.AppImage
-              done
-            fi
-          fi
-
-          # Upload CLI binaries
-          for target in ${{ matrix.cli_targets }}; do
-            binary_name="tidewave"
-            if [ "${{ matrix.os }}" = "windows" ]; then
-              binary_name="tidewave.exe"
-            fi
-
-            src="target/$target/release/$binary_name"
-            dest="tidewave-cli-$target"
-            if [ "${{ matrix.os }}" = "windows" ]; then
-              dest="$dest.exe"
-            fi
-
-            cp "$src" "$dest"
-            gh release upload --clobber "${release_name}" "$dest"
-          done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_name="${{ needs.ensure-release.outputs.release-name }}"
+          for target in ${{ matrix.cli_targets }}; do
+            src_path="target/$target/release/tidewave"
+            dst_path="tidewave-cli-$target"
+            if [[ "${{ matrix.platform }}" = windows* ]]; then
+              src_path="$src_path.exe"
+              dst_path="$dst_path.exe"
+            fi
+            cp "$src_path" "$dst_path"
+            gh release upload --clobber "$release_name" "$dst_path"
+          done
