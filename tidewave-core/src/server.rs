@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::time::UNIX_EPOCH;
 use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
 use tracing::{debug, error, info};
-use which::which;
+use which;
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -51,6 +51,9 @@ struct WriteFileParams {
 #[derive(Deserialize)]
 struct WhichParams {
     command: String,
+    // Note that cwd is only used in case PATH in env is also set
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -166,7 +169,7 @@ pub async fn serve_http_server_with_shutdown(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
-        .route("/which", get(which_handler))
+        .route("/which", post(which_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -412,14 +415,23 @@ fn fetch_mtime(path: String) -> Result<u64, String> {
         .map_err(|_| "system time error".to_string());
 }
 
-async fn which_handler(
-    Query(params): Query<WhichParams>,
-) -> Result<Json<WhichResponse>, StatusCode> {
-    let result = tokio::task::spawn_blocking(|| which(params.command)).await;
+async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResponse>, StatusCode> {
+    let result = if let Some(env) = params.env {
+        if let Some(paths) = env.get("PATH") {
+            let paths = paths.clone();
+            let cwd = params.cwd.unwrap_or(".".to_string());
+            let command = params.command.clone();
+            tokio::task::spawn_blocking(move || which::which_in(command, Some(paths), cwd)).await
+        } else {
+            tokio::task::spawn_blocking(|| which::which(params.command)).await
+        }
+    } else {
+        tokio::task::spawn_blocking(|| which::which(params.command)).await
+    };
 
     match result {
         Ok(Ok(path)) => Ok(Json(WhichResponse {
-            // this is a lossy conversion in case the path contains non UTF-8 
+            // this is a lossy conversion in case the path contains non UTF-8
             // characters, but we don't try to use the path as is and it's also unlikely,
             // so it's fine
             path: Some(path.display().to_string()),
@@ -535,15 +547,17 @@ async fn root() -> Html<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::Query;
+    use axum::Json;
 
     #[tokio::test]
     async fn test_which_handler_finds_common_command() {
         let params = WhichParams {
             command: "sh".to_string(),
+            cwd: None,
+            env: None,
         };
 
-        let result = which_handler(Query(params)).await;
+        let result = which_handler(Json(params)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
@@ -557,12 +571,69 @@ mod tests {
     async fn test_which_handler_nonexistent_command() {
         let params = WhichParams {
             command: "this_command_definitely_does_not_exist_12345".to_string(),
+            cwd: None,
+            env: None,
         };
 
-        let result = which_handler(Query(params)).await;
+        let result = which_handler(Json(params)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
         assert!(response.path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_which_handler_respects_custom_path() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!("which_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let executable_name = "test_executable_unique_12345";
+        let executable_path = temp_dir.join(executable_name);
+        fs::write(&executable_path, "#!/bin/sh\necho test").expect("Failed to write executable");
+
+        let mut perms = fs::metadata(&executable_path)
+            .expect("Failed to get metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&executable_path, perms).expect("Failed to set permissions");
+
+        // First, verify the binary is NOT found without custom PATH
+        let params_without_env = WhichParams {
+            command: executable_name.to_string(),
+            cwd: None,
+            env: None,
+        };
+
+        let result_without_env = which_handler(Json(params_without_env)).await;
+        assert!(result_without_env.is_ok());
+        let response_without_env = result_without_env.unwrap().0;
+        assert!(
+            response_without_env.path.is_none(),
+            "Binary should not be found in system PATH"
+        );
+
+        // Now verify the binary IS found with custom PATH
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), temp_dir.to_string_lossy().to_string());
+
+        let params = WhichParams {
+            command: executable_name.to_string(),
+            cwd: Some(temp_dir.to_string_lossy().to_string()),
+            env: Some(env),
+        };
+
+        let result = which_handler(Json(params)).await;
+
+        fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.path.is_some());
+        let path = response.path.unwrap();
+        assert!(path.contains(executable_name));
+        assert!(path.contains(temp_dir.to_string_lossy().as_ref()));
     }
 }
