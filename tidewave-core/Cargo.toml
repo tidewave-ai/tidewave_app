@@ -19,6 +19,7 @@ toml = "0.8"
 dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
+which = "8.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
