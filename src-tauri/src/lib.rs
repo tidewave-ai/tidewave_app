@@ -7,8 +7,9 @@ use tauri::{
 };
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 use tracing::{debug, error, info};
 
 struct ServerState {
@@ -24,6 +25,7 @@ const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave ap
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|_app, args, _cwd| {
@@ -143,11 +145,12 @@ pub fn run() {
             open_tidewave(&app.handle(), port);
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, None::<&str>)?;
-            let open_config_i = MenuItem::with_id(app, "open_config", "Settings...", true, None::<&str>)?;
+            let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, None::<&str>)?;
+            let check_for_updates_i = MenuItem::with_id(app, "check_for_updates", "Check for Updates…", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &restart_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
             .menu(&menu)
@@ -202,11 +205,22 @@ pub fn run() {
                         }
                     }
                 }
+                "check_for_updates" => {
+                    check_for_updates(app.clone());
+                }
                 _ => {
                     debug!("menu item {:?} not handled", event.id);
                 }
             })
             .build(app)?;
+
+            let app_handle_for_updates = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = check_for_updates_on_boot(app_handle_for_updates).await {
+                    error!("Failed to check for updates on boot: {}", e);
+                }
+            });
+
             Ok(())
         }))
         .run(tauri::generate_context!())
@@ -267,4 +281,83 @@ fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
             )
             .expect("could not open url");
     }
+}
+
+async fn check_for_updates_on_boot(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
+    if let Some(update) = app.updater()?.check().await? {
+        let should_install = app.dialog()
+            .message(format!("Version {} is available!\n\nWould you like to download and install it now?", update.version))
+            .kind(MessageDialogKind::Info)
+            .title("Update Available")
+            .buttons(MessageDialogButtons::OkCancel)
+            .blocking_show();
+
+        if should_install {
+            match update.download_and_install(|_, _| {}, || {}).await {
+                Ok(()) => {
+                    app.restart();
+                }
+                Err(e) => {
+                    error!("Failed to install update: {}", e);
+                    app.dialog()
+                        .message(format!("Failed to install update: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Update Failed")
+                        .blocking_show();
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_for_updates(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        match check_for_updates_async(app.clone()).await {
+            Ok(()) => {}
+            Err(e) => {
+                error!("Failed to check for updates: {}", e);
+                app.dialog()
+                    .message(format!("Failed to check for updates: {}", e))
+                    .kind(MessageDialogKind::Error)
+                    .title("Update Check Failed")
+                    .blocking_show();
+            }
+        }
+    });
+}
+
+async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
+    if let Some(update) = app.updater()?.check().await? {
+        let should_install = app.dialog()
+            .message(format!("Version {} is available!\n\nWould you like to download and install it now?", update.version))
+            .kind(MessageDialogKind::Info)
+            .title("Update Available")
+            .buttons(MessageDialogButtons::OkCancel)
+            .blocking_show();
+
+        if should_install {
+            match update.download_and_install(|_, _| {}, || {}).await {
+                Ok(()) => {
+                    app.restart();
+                }
+                Err(e) => {
+                    app.dialog()
+                        .message(format!("Failed to install update: {}", e))
+                        .kind(MessageDialogKind::Error)
+                        .title("Update Failed")
+                        .blocking_show();
+                }
+            }
+        }
+    } else {
+        app.dialog()
+            .message(format!("You're running the latest version:\n\nv{}", app.package_info().version))
+            .kind(MessageDialogKind::Info)
+            .title("No Updates Available")
+            .blocking_show();
+    }
+
+    Ok(())
 }
