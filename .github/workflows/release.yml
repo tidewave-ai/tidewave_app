@@ -157,7 +157,7 @@ jobs:
         with:
           args: --target ${{ matrix.gui_target }}
           tagName: ${{ needs.ensure-release.outputs.release-name }}
-          assetNamePattern: "[name]-[arch][ext]"
+          assetNamePattern: "tidewave-app-[arch][ext]"
 
       - name: Verify GUI notarization (macos)
         if: startsWith(matrix.platform, 'macos')
