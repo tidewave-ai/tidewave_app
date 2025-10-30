@@ -559,11 +559,13 @@ async fn root() -> Html<String> {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="tidewave:source" content="cli" />
+    <meta name="tidewave:version" content="{}" />
     <script type="module" src="{}/tc/tc.js"></script>
   </head>
   <body></body>
 </html>"#,
-        client_url
+        client_url,
+        env!("CARGO_PKG_VERSION").to_string()
     );
 
     Html(html)
