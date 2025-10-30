@@ -543,7 +543,7 @@ async fn proxy_handler(
 
 async fn about() -> Json<AboutResponse> {
     Json(AboutResponse {
-        name: "tidewave-app".to_string(),
+        name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
