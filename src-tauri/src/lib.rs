@@ -21,6 +21,10 @@ const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave ap
 # If you change this file, you must restart Tidewave.
 
 # port = 9832
+# allow_remote_access = false
+
+[env]
+# SOME_API_KEY = "value"
 "#;
 
 pub fn run() {
@@ -64,6 +68,14 @@ pub fn run() {
                             }
                         }
                     }
+
+                    if let Some(allow_remote_arg) = matches.args.get("allow-remote-access") {
+                        if let Some(value) = allow_remote_arg.value.as_bool() {
+                            if value {
+                                config.allow_remote_access = true;
+                            }
+                        }
+                    }
                 }
                 Err(_) => {}
             }
@@ -81,6 +93,12 @@ pub fn run() {
             if config.debug {
                 debug!("Debug logging enabled");
                 debug!("{:?}", config);
+            }
+
+            // Set environment variables from config before server initialization
+            for (key, value) in &config.env {
+                debug!("Setting env var: {}={}", key, value);
+                std::env::set_var(key, value);
             }
 
             let port = config.port;

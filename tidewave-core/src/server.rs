@@ -112,8 +112,13 @@ pub async fn bind_http_server(
     config: Config,
 ) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
     let port = config.port;
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
-    info!("HTTP server bound to port {}", port);
+    let bind_addr = if config.allow_remote_access {
+        format!("0.0.0.0:{}", port)
+    } else {
+        format!("127.0.0.1:{}", port)
+    };
+    let listener = TcpListener::bind(&bind_addr).await?;
+    info!("HTTP server bound to {}", bind_addr);
     Ok(listener)
 }
 

@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::collections::HashMap;
 use tracing::{debug, error};
 
 #[derive(Parser, Debug)]
@@ -9,6 +10,9 @@ struct Cli {
 
     #[arg(short, long)]
     debug: bool,
+
+    #[arg(short, long)]
+    allow_remote_access: bool,
 }
 
 #[tokio::main]
@@ -18,6 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = tidewave_core::Config {
         port: cli.port.unwrap_or(9832),
         debug: cli.debug,
+        allow_remote_access: cli.allow_remote_access,
+        env: HashMap::new(),
     };
 
     let filter = if config.debug { "debug" } else { "info" };
@@ -29,6 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.debug {
         debug!("Debug logging enabled");
         debug!("Config: {:?}", config);
+    }
+
+    // Set environment variables from config before server initialization
+    for (key, value) in &config.env {
+        debug!("Setting env var: {}={}", key, value);
+        std::env::set_var(key, value);
     }
 
     if let Err(e) = tidewave_core::start_http_server(config).await {
