@@ -126,7 +126,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -136,6 +136,8 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
+    collections::HashMap,
+    path::Path,
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -218,6 +220,13 @@ pub struct JsonRpcError {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TidewaveSpawnOptions {
+    pub command: String,
+    pub env: HashMap<String, String>,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TidewaveSessionLoadRequest {
     #[serde(rename = "sessionId")]
     pub session_id: String,
@@ -266,7 +275,10 @@ pub type ProcessIo = (
 
 /// Function type for starting a process and returning its I/O streams
 pub type ProcessStarterFn = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessIo>> + Send>>
+    dyn Fn(
+            TidewaveSpawnOptions,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessIo>> + Send>>
         + Send
         + Sync,
 >;
@@ -320,7 +332,7 @@ impl AcpProxyState {
 
 pub struct ProcessState {
     pub key: ProcessKey,
-    pub command: String,
+    pub spawn_opts: TidewaveSpawnOptions,
     pub child: Arc<RwLock<Option<Child>>>,
     /// Channel used to forward a message to the ACP process.
     pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
@@ -356,10 +368,10 @@ pub struct BufferedMessage {
 }
 
 impl ProcessState {
-    pub fn new(key: ProcessKey, command: String) -> Self {
+    pub fn new(key: ProcessKey, spawn_opts: TidewaveSpawnOptions) -> Self {
         Self {
             key,
-            command,
+            spawn_opts,
             child: Arc::new(RwLock::new(None)),
             stdin_tx: Arc::new(RwLock::new(None)),
             next_proxy_id: Arc::new(AtomicU64::new(1)),
@@ -482,30 +494,19 @@ impl SessionState {
 // WebSocket Handler
 // ============================================================================
 
-#[derive(Deserialize)]
-pub struct AcpWebSocketQuery {
-    pub command: String,
-}
-
 pub async fn acp_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AcpProxyState>,
-    Query(query): Query<AcpWebSocketQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let websocket_id = Uuid::new_v4();
     debug!("New WebSocket connection: {}", websocket_id);
 
-    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, websocket_id, query.command)))
+    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, websocket_id)))
 }
 
-async fn handle_websocket(
-    socket: WebSocket,
-    state: AcpProxyState,
-    websocket_id: WebSocketId,
-    command: String,
-) {
+async fn handle_websocket(socket: WebSocket, state: AcpProxyState, websocket_id: WebSocketId) {
     let (ws_sender, ws_receiver) = socket.split();
-    unit_testable_ws_handler(ws_sender, ws_receiver, state, websocket_id, command).await;
+    unit_testable_ws_handler(ws_sender, ws_receiver, state, websocket_id).await;
 }
 
 pub async fn unit_testable_ws_handler<W, R>(
@@ -513,7 +514,6 @@ pub async fn unit_testable_ws_handler<W, R>(
     mut ws_receiver: R,
     state: AcpProxyState,
     websocket_id: WebSocketId,
-    command: String,
 ) where
     W: Sink<Message> + Unpin + Send + 'static,
     R: Stream<Item = Result<Message, axum::Error>> + Unpin + Send + 'static,
@@ -561,7 +561,7 @@ pub async fn unit_testable_ws_handler<W, R>(
                             let _ = tx.send(WebSocketMessage::Pong);
                         }
                     } else if let Err(e) =
-                        handle_client_message(&state_rx, websocket_id, &command, &text).await
+                        handle_client_message(&state_rx, websocket_id, &text).await
                     {
                         error!("Error handling client message: {}", e);
                     }
@@ -614,7 +614,6 @@ pub async fn unit_testable_ws_handler<W, R>(
 async fn handle_client_message(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    command: &str,
     text: &str,
 ) -> Result<()> {
     trace!("Received message from WebSocket {}: {}", websocket_id, text);
@@ -624,7 +623,7 @@ async fn handle_client_message(
     match &message {
         JsonRpcMessage::Request(req) => {
             debug!("Handling request: {} with method {}", req.id, req.method);
-            handle_client_request(state, websocket_id, command, req).await
+            handle_client_request(state, websocket_id, req).await
         }
         JsonRpcMessage::Notification(notif) => {
             debug!("Handling notification with method {}", notif.method);
@@ -643,14 +642,13 @@ async fn handle_client_message(
 async fn handle_client_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    command: &str,
     request: &JsonRpcRequest,
 ) -> Result<()> {
     match request.method.as_str() {
         // We handle init because we need to
         //   1. Start a new process in case there's no running one for the given parameters.
         //   2. In case we start, store the request ID to store the response later on.
-        "initialize" => handle_initialize_request(state, websocket_id, command, request).await,
+        "initialize" => handle_initialize_request(state, websocket_id, request).await,
         // Our custom session load handler
         "_tidewave.ai/session/load" => {
             handle_tidewave_session_load(state, websocket_id, request).await
@@ -685,12 +683,24 @@ async fn handle_client_notification(
 async fn handle_initialize_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    command: &str,
     request: &JsonRpcRequest,
 ) -> Result<()> {
-    debug!("Handling initialize request for command: {}", command);
+    // Extract spawn options from _meta.tidewave.ai/spawn
     let init_params = request.params.as_ref().unwrap_or(&Value::Null);
-    let process_key = generate_process_key(command, init_params);
+
+    let spawn_opts = init_params
+        .get("_meta")
+        .and_then(|meta| meta.get("tidewave.ai/spawn"))
+        .ok_or_else(|| anyhow::anyhow!("Missing _meta.tidewave.ai/spawn in initialize request"))?;
+
+    let spawn_opts: TidewaveSpawnOptions = serde_json::from_value(spawn_opts.clone())
+        .map_err(|e| anyhow::anyhow!("Invalid spawn options format: {}", e))?;
+
+    debug!(
+        "Handling initialize request for command: {}",
+        spawn_opts.command
+    );
+    let process_key = generate_process_key(&spawn_opts.command, &spawn_opts.cwd, init_params);
     trace!("Generated process key: {}", process_key);
 
     // Acquire or create a lock for this process_key to prevent concurrent starts
@@ -703,7 +713,8 @@ async fn handle_initialize_request(
 
     // Execute the initialization logic
     let result =
-        handle_initialize_request_locked(state, websocket_id, command, request, &process_key).await;
+        handle_initialize_request_locked(state, websocket_id, spawn_opts, request, &process_key)
+            .await;
 
     // Clean up the lock after initialization attempt (success or failure)
     drop(guard);
@@ -715,7 +726,7 @@ async fn handle_initialize_request(
 async fn handle_initialize_request_locked(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
-    command: &str,
+    spawn_opts: TidewaveSpawnOptions,
     request: &JsonRpcRequest,
     process_key: &ProcessKey,
 ) -> Result<()> {
@@ -768,7 +779,7 @@ async fn handle_initialize_request_locked(
         }
         None => {
             // Create new process
-            let new_process = Arc::new(ProcessState::new(process_key.clone(), command.to_string()));
+            let new_process = Arc::new(ProcessState::new(process_key.clone(), spawn_opts.clone()));
 
             // Start the ACP process
             match start_acp_process(new_process.clone(), state.clone()).await {
@@ -1063,9 +1074,9 @@ async fn forward_response_to_process(
 
 /// Real process starter that spawns actual OS processes
 pub fn real_process_starter() -> ProcessStarterFn {
-    Arc::new(|command: String| {
+    Arc::new(|spawn_opts: TidewaveSpawnOptions| {
         Box::pin(async move {
-            let parts: Vec<&str> = command.split_whitespace().collect();
+            let parts: Vec<&str> = spawn_opts.command.split_whitespace().collect();
             if parts.is_empty() {
                 return Err(anyhow!("Empty command"));
             }
@@ -1078,6 +1089,8 @@ pub fn real_process_starter() -> ProcessStarterFn {
 
             let mut child = Command::new(parts[0])
                 .args(&parts[1..])
+                .envs(spawn_opts.env)
+                .current_dir(Path::new(&spawn_opts.cwd))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1110,7 +1123,7 @@ pub fn real_process_starter() -> ProcessStarterFn {
 async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyState) -> Result<()> {
     // Call the process starter function
     let (stdin, stdout, stderr, child) =
-        (state.process_starter)(process_state.command.clone()).await?;
+        (state.process_starter)(process_state.spawn_opts.clone()).await?;
 
     // Store child process (if it's a real process)
     *process_state.child.write().await = child;
@@ -1572,12 +1585,28 @@ fn ensure_process_for_websocket(
     return Ok(process_state);
 }
 
-fn generate_process_key(command: &str, init_params: &Value) -> ProcessKey {
-    // String key of command + init params (from initialize request) for process deduplication
+fn generate_process_key(command: &str, cwd: &str, init_params: &Value) -> ProcessKey {
+    // String key of command + cwd + init params (from initialize request) for process deduplication
+    // We exclude _meta.tidewave.ai/spawn from the params since command and cwd are already
+    // explicitly part of the key
+    let mut params_without_spawn_meta = init_params.clone();
+    if let Some(obj) = params_without_spawn_meta.as_object_mut() {
+        if let Some(meta) = obj.get_mut("_meta") {
+            if let Some(meta_obj) = meta.as_object_mut() {
+                meta_obj.remove("tidewave.ai/spawn");
+                // If _meta is now empty, remove it entirely
+                if meta_obj.is_empty() {
+                    obj.remove("_meta");
+                }
+            }
+        }
+    }
+
     format!(
-        "{}:{}",
+        "{}:{}:{}",
         command,
-        serde_json::to_string(init_params).unwrap_or_default()
+        cwd,
+        serde_json::to_string(&params_without_spawn_meta).unwrap_or_default()
     )
 }
 
@@ -1671,6 +1700,15 @@ async fn send_exit_notification(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Helper function to create test TidewaveSpawnOptions
+    fn test_spawn_opts() -> TidewaveSpawnOptions {
+        TidewaveSpawnOptions {
+            command: "test_cmd".to_string(),
+            env: HashMap::new(),
+            cwd: ".".to_string(),
+        }
+    }
 
     // Helper function to create a test SessionState
     fn create_test_session() -> SessionState {
@@ -1961,7 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_generate_proxy_id() {
-        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
 
         let id1 = process.generate_proxy_id();
         let id2 = process.generate_proxy_id();
@@ -1974,7 +2012,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_id_mapping_basic() {
-        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
         let ws_id = Uuid::new_v4();
         let client_id = Value::String("client_1".to_string());
 
@@ -1990,7 +2028,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_id_mapping_with_session() {
-        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
         let ws_id = Uuid::new_v4();
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
@@ -2008,7 +2046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_id_cleanup() {
-        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
         let ws_id = Uuid::new_v4();
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
@@ -2029,7 +2067,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_multiple_clients_same_process() {
-        let process = ProcessState::new("test_key".to_string(), "test_cmd".to_string());
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
 
         let ws_id1 = Uuid::new_v4();
         let ws_id2 = Uuid::new_v4();
@@ -2156,9 +2194,10 @@ mod tests {
     #[test]
     fn test_generate_process_key() {
         let command = "test_agent";
+        let cwd = ".";
         let params = json!({"protocolVersion": 1, "clientCapabilities": {}});
 
-        let key = generate_process_key(command, &params);
+        let key = generate_process_key(command, cwd, &params);
 
         assert!(key.contains("test_agent"));
         assert!(key.contains("protocolVersion"));
@@ -2167,10 +2206,11 @@ mod tests {
     #[test]
     fn test_generate_process_key_same_params() {
         let command = "test_agent";
+        let cwd = ".";
         let params = json!({"protocolVersion": 1});
 
-        let key1 = generate_process_key(command, &params);
-        let key2 = generate_process_key(command, &params);
+        let key1 = generate_process_key(command, cwd, &params);
+        let key2 = generate_process_key(command, cwd, &params);
 
         assert_eq!(key1, key2);
     }
@@ -2178,11 +2218,12 @@ mod tests {
     #[test]
     fn test_generate_process_key_different_params() {
         let command = "test_agent";
+        let cwd = ".";
         let params1 = json!({"protocolVersion": 1});
         let params2 = json!({"protocolVersion": 2});
 
-        let key1 = generate_process_key(command, &params1);
-        let key2 = generate_process_key(command, &params2);
+        let key1 = generate_process_key(command, cwd, &params1);
+        let key2 = generate_process_key(command, cwd, &params2);
 
         assert_ne!(key1, key2);
     }

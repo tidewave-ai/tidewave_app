@@ -13,11 +13,10 @@ async fn test_websocket_init_request_flow() {
 
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
-    let command = "test_acp".to_string();
 
     // Start the handler in background
     tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id, command).await;
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
     });
 
     // Send init request from client
@@ -25,7 +24,7 @@ async fn test_websocket_init_request_flow() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {}
+        "params": params_with_spawn_opts(json!({}))
     });
 
     ws_in_tx
@@ -72,11 +71,10 @@ async fn test_websocket_session_new_flow() {
 
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
-    let command = "test_acp".to_string();
 
     // Start the handler
     tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id, command).await;
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
     });
 
     // First send initialize to start the process
@@ -84,7 +82,7 @@ async fn test_websocket_session_new_flow() {
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
-        "params": {}
+        "params": params_with_spawn_opts(json!({}))
     });
 
     ws_in_tx
@@ -151,11 +149,10 @@ async fn test_websocket_notification_forwarding() {
 
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
-    let command = "test_acp".to_string();
 
     // Start the handler
     tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id, command).await;
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
     });
 
     // First send initialize to start the process
@@ -163,7 +160,7 @@ async fn test_websocket_notification_forwarding() {
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
-        "params": {}
+        "params": params_with_spawn_opts(json!({}))
     });
 
     ws_in_tx
@@ -264,7 +261,7 @@ async fn test_concurrent_initialize_requests() {
     let (started_tx, _started_rx) = tokio::sync::oneshot::channel::<()>();
     let started_tx = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
 
-    let starter: ProcessStarterFn = Arc::new(move |_command: String| {
+    let starter: ProcessStarterFn = Arc::new(move |_spawn_opts: TidewaveSpawnOptions| {
         let process_stdin = process_stdin.clone();
         let process_stdout = process_stdout.clone();
         let barrier = barrier.clone();
@@ -318,23 +315,14 @@ async fn test_concurrent_initialize_requests() {
 
     let websocket_id1 = uuid::Uuid::new_v4();
     let websocket_id2 = uuid::Uuid::new_v4();
-    let command = "test_acp".to_string();
-    let command_clone = command.clone();
 
     // Start both handlers
     tokio::spawn(async move {
-        unit_testable_ws_handler(ws1_out_tx, ws1_in_rx, state, websocket_id1, command).await;
+        unit_testable_ws_handler(ws1_out_tx, ws1_in_rx, state, websocket_id1).await;
     });
 
     tokio::spawn(async move {
-        unit_testable_ws_handler(
-            ws2_out_tx,
-            ws2_in_rx,
-            state_clone,
-            websocket_id2,
-            command_clone,
-        )
-        .await;
+        unit_testable_ws_handler(ws2_out_tx, ws2_in_rx, state_clone, websocket_id2).await;
     });
 
     // Send init requests from both clients with SAME params (same process_key)
@@ -342,7 +330,7 @@ async fn test_concurrent_initialize_requests() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {}
+        "params": params_with_spawn_opts(json!({}))
     });
 
     // Send both requests at nearly the same time
@@ -413,11 +401,11 @@ async fn test_concurrent_initialize_requests() {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "initialize",
-        "params": {
+        "params": params_with_spawn_opts(json!({
             "clientCapabilities": {
                 "experimental": true
             }
-        }
+        }))
     });
 
     ws2_in_tx
@@ -473,7 +461,7 @@ fn create_fake_process_starter() -> (
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let started_tx = Arc::new(Mutex::new(Some(started_tx)));
 
-    let starter: ProcessStarterFn = Arc::new(move |_command: String| {
+    let starter: ProcessStarterFn = Arc::new(move |_spawn_opts: TidewaveSpawnOptions| {
         let process_stdin = process_stdin.clone();
         let process_stdout = process_stdout.clone();
         let started_tx = started_tx.clone();
@@ -549,4 +537,23 @@ async fn write_json_line(stream: &mut DuplexStream, value: &Value) {
         .await
         .expect("Failed to write newline");
     stream.flush().await.expect("Failed to flush");
+}
+
+/// Helper to create params with spawn options for initialize requests
+fn params_with_spawn_opts(additional_params: Value) -> Value {
+    let mut params = if additional_params.is_object() {
+        additional_params
+    } else {
+        json!({})
+    };
+
+    params["_meta"] = json!({
+        "tidewave.ai/spawn": {
+            "command": "test_acp",
+            "env": {},
+            "cwd": "."
+        }
+    });
+
+    params
 }
