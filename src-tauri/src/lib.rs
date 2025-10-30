@@ -83,6 +83,12 @@ pub fn run() {
                 debug!("{:?}", config);
             }
 
+            // Set environment variables from config before server initialization
+            for (key, value) in &config.env {
+                debug!("Setting env var: {}={}", key, value);
+                std::env::set_var(key, value);
+            }
+
             let port = config.port;
 
             let listener = match tidewave_core::bind_http_server(config.clone()).await {
