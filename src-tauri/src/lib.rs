@@ -21,6 +21,10 @@ const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave ap
 # If you change this file, you must restart Tidewave.
 
 # port = 9832
+# allow_remote_access = false
+
+[env]
+# SOME_API_KEY = "value"
 "#;
 
 pub fn run() {
