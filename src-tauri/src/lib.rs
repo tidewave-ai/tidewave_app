@@ -6,7 +6,6 @@ use tauri::{
     Manager,
 };
 use tauri_plugin_cli::CliExt;
-use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -31,7 +30,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|_app, args, _cwd| {
             debug!("a new app instance was opened with {args:?} and the deep link event was already triggered");
         }))
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| tauri::async_runtime::block_on(async move {
             let mut config = match tidewave_core::load_config() {
@@ -126,20 +124,6 @@ pub fn run() {
             app.manage(ServerState {
                 handle: handle_holder_clone,
                 shutdown_tx,
-            });
-
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            app.deep_link()
-                .register("tidewave")
-                .expect("failed to register tidewave:// handler");
-
-            if let Some(urls) = app.deep_link().get_current()? {
-                handle_urls(&app.handle(), port, &urls);
-            }
-
-            let app_handle_for_open = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                handle_urls(&app_handle_for_open, port, &event.urls());
             });
 
             open_tidewave(&app.handle(), port);
@@ -261,26 +245,6 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     }
 
     Ok(())
-}
-
-fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
-    for url in urls.iter().filter(|u| u.scheme() == "tidewave") {
-        let s = if url.host_str() == Some("localhost") {
-            url.as_str().replacen("tidewave://", "http://", 1)
-        } else {
-            url.as_str().replacen("tidewave://", "https://", 1)
-        };
-
-        debug!("Handling tidewave URL: {}", s);
-
-        app_handle
-            .opener()
-            .open_path(
-                &format!("http://localhost:{}?path={}", port, s),
-                None::<&str>,
-            )
-            .expect("could not open url");
-    }
 }
 
 async fn check_for_updates_on_boot(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {

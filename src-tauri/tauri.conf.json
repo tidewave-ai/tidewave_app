@@ -49,11 +49,6 @@
     "createUpdaterArtifacts": true
   },
   "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": ["tidewave"]
-      }
-    },
     "cli": {
       "description": "Tidewave CLI",
       "args": [
