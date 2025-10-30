@@ -65,3 +65,56 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     debug!("Loaded config: {:?}", config);
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_empty_config() {
+        let toml_content = "";
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.port, 9832);
+        assert_eq!(config.debug, false);
+        assert_eq!(config.allow_remote_access, false);
+        assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn test_parse_config_with_env_section() {
+        let toml_content = r#"
+port = 8080
+debug = true
+allow_remote_access = true
+
+[env]
+API_KEY = "secret"
+DATABASE_URL = "postgres://localhost"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.debug, true);
+        assert_eq!(config.allow_remote_access, true);
+        assert_eq!(config.env.len(), 2);
+        assert_eq!(config.env.get("API_KEY"), Some(&"secret".to_string()));
+        assert_eq!(
+            config.env.get("DATABASE_URL"),
+            Some(&"postgres://localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_with_commented_env() {
+        let toml_content = r#"
+# port = 9832
+# allow_remote_access = false
+
+[env]
+# SOME_API_KEY = "value"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.port, 9832); // default
+        assert_eq!(config.allow_remote_access, false); // default
+        assert!(config.env.is_empty()); // no keys since all commented
+    }
+}

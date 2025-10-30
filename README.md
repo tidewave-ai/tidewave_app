@@ -14,3 +14,13 @@ To run as macOS app bundle (to use Info.plist, test tidewave:// handler, etc), r
 ### CLI
 
     $ cargo run -p tidewave-cli [-- --help]
+
+### Tests
+
+Run all tests:
+
+    $ cargo test
+
+Run tests for a specific package:
+
+    $ cargo test -p tidewave-core
