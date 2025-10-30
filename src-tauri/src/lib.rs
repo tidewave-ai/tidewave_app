@@ -285,8 +285,12 @@ fn handle_urls(app_handle: &tauri::AppHandle, port: u16, urls: &[tauri::Url]) {
 
 async fn check_for_updates_on_boot(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
-        let should_install = app.dialog()
-            .message(format!("Version {} is available!\n\nWould you like to download and install it now?", update.version))
+        let should_install = app
+            .dialog()
+            .message(format!(
+                "Version {} is available!\n\nWould you like to download and install it now?",
+                update.version
+            ))
             .kind(MessageDialogKind::Info)
             .title("Update Available")
             .buttons(MessageDialogButtons::OkCancel)
@@ -330,8 +334,12 @@ fn check_for_updates(app: tauri::AppHandle) {
 
 async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
-        let should_install = app.dialog()
-            .message(format!("Version {} is available!\n\nWould you like to download and install it now?", update.version))
+        let should_install = app
+            .dialog()
+            .message(format!(
+                "Version {} is available!\n\nWould you like to download and install it now?",
+                update.version
+            ))
             .kind(MessageDialogKind::Info)
             .title("Update Available")
             .buttons(MessageDialogButtons::OkCancel)
@@ -353,7 +361,10 @@ async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater:
         }
     } else {
         app.dialog()
-            .message(format!("You're running the latest version:\n\nv{}", app.package_info().version))
+            .message(format!(
+                "You're running the latest version:\n\nv{}",
+                app.package_info().version
+            ))
             .kind(MessageDialogKind::Info)
             .title("No Updates Available")
             .blocking_show();

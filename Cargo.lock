@@ -4935,7 +4935,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-app"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4956,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "tidewave-core",
@@ -4967,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
