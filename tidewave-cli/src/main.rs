@@ -10,6 +10,9 @@ struct Cli {
 
     #[arg(short, long)]
     debug: bool,
+
+    #[arg(short, long)]
+    allow_remote_access: bool,
 }
 
 #[tokio::main]
@@ -19,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = tidewave_core::Config {
         port: cli.port.unwrap_or(9832),
         debug: cli.debug,
+        allow_remote_access: cli.allow_remote_access,
         env: HashMap::new(),
     };
 

@@ -68,6 +68,12 @@
           "description": "Enable debug logging",
           "short": "d",
           "takesValue": false
+        },
+        {
+          "name": "allow-remote-access",
+          "description": "Allow remote access by binding to 0.0.0.0 instead of 127.0.0.1",
+          "short": "a",
+          "takesValue": false
         }
       ]
     },

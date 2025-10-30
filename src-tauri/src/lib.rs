@@ -64,6 +64,14 @@ pub fn run() {
                             }
                         }
                     }
+
+                    if let Some(allow_remote_arg) = matches.args.get("allow-remote-access") {
+                        if let Some(value) = allow_remote_arg.value.as_bool() {
+                            if value {
+                                config.allow_remote_access = true;
+                            }
+                        }
+                    }
                 }
                 Err(_) => {}
             }
