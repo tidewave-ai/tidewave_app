@@ -661,4 +661,48 @@ mod tests {
         assert!(path.contains(executable_name));
         assert!(path.contains(temp_dir.to_string_lossy().as_ref()));
     }
+
+    #[tokio::test]
+    async fn test_verify_origin() {
+        use tower::ServiceExt;
+
+        let config = ServerConfig {
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+        };
+
+        let app = Router::new()
+            .route("/stat", get(stat_file_handler))
+            .route("/about", get(about))
+            .layer(middleware::from_fn(move |mut req: Request, next| {
+                req.extensions_mut().insert(config.clone());
+                verify_origin(req, next)
+            }));
+
+        // Test 1: Allowed origin should pass on /stat
+        let req = Request::builder()
+            .uri("/stat?path=/tmp")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // Test 2: Evil origin should be blocked on /stat
+        let req = Request::builder()
+            .uri("/stat?path=/tmp")
+            .header("Origin", "http://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Test 3: Evil origin should work on /about
+        let req = Request::builder()
+            .uri("/about")
+            .header("Origin", "http://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
