@@ -564,8 +564,8 @@ async fn root() -> Html<String> {
   </head>
   <body></body>
 </html>"#,
+        env!("CARGO_PKG_VERSION").to_string(),
         client_url,
-        env!("CARGO_PKG_VERSION").to_string()
     );
 
     Html(html)
