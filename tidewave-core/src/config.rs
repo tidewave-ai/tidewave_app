@@ -90,6 +90,7 @@ allow_remote_access = true
 [env]
 API_KEY = "secret"
 DATABASE_URL = "postgres://localhost"
+# COMMENTED_VAR = "unknown"
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.port, 8080);
@@ -101,20 +102,5 @@ DATABASE_URL = "postgres://localhost"
             config.env.get("DATABASE_URL"),
             Some(&"postgres://localhost".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_config_with_commented_env() {
-        let toml_content = r#"
-# port = 9832
-# allow_remote_access = false
-
-[env]
-# SOME_API_KEY = "value"
-"#;
-        let config: Config = toml::from_str(toml_content).unwrap();
-        assert_eq!(config.port, 9832); // default
-        assert_eq!(config.allow_remote_access, false); // default
-        assert!(config.env.is_empty()); // no keys since all commented
     }
 }
