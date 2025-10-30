@@ -96,6 +96,12 @@ struct WhichResponse {
     path: Option<String>,
 }
 
+#[derive(Serialize)]
+struct AboutResponse {
+    name: String,
+    version: String,
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     allowed_origins: Vec<String>,
@@ -170,6 +176,7 @@ pub async fn serve_http_server_with_shutdown(
             verify_origin(req, next)
         }))
         .route("/", get(root))
+        .route("/about", get(about))
         .route("/shell", post(shell_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
@@ -195,6 +202,11 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
+    // Skip origin verification for /about route
+    if req.uri().path() == "/about" {
+        return Ok(next.run(req).await);
+    }
+
     let headers = req.headers();
 
     if let Some(origin) = headers.get(header::ORIGIN) {
@@ -527,6 +539,13 @@ async fn proxy_handler(
     resp_builder
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn about() -> Json<AboutResponse> {
+    Json(AboutResponse {
+        name: "tidewave-app".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 async fn root() -> Html<String> {
