@@ -12,7 +12,7 @@ Tidewave's Desktop app and CLI.
     $ cargo install tauri-cli --version "=2.8.0" --locked
     $ cargo tauri dev -- -- --debug
 
-To run as macOS app bundle (to use Info.plist, test tidewave:// handler, etc), run:
+To run as macOS app bundle (to use Info.plist, etc), run:
 
     $ ./run_macos.sh
 
