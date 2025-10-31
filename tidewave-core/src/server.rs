@@ -96,6 +96,12 @@ struct WhichResponse {
     path: Option<String>,
 }
 
+#[derive(Serialize)]
+struct AboutResponse {
+    name: String,
+    version: String,
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     allowed_origins: Vec<String>,
@@ -170,6 +176,7 @@ pub async fn serve_http_server_with_shutdown(
             verify_origin(req, next)
         }))
         .route("/", get(root))
+        .route("/about", get(about))
         .route("/shell", post(shell_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
@@ -195,6 +202,11 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
+    // Skip origin verification for /about route
+    if req.uri().path() == "/about" {
+        return Ok(next.run(req).await);
+    }
+
     let headers = req.headers();
 
     if let Some(origin) = headers.get(header::ORIGIN) {
@@ -529,6 +541,13 @@ async fn proxy_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn about() -> Json<AboutResponse> {
+    Json(AboutResponse {
+        name: "tidewave-cli".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
 async fn root() -> Html<String> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
@@ -540,11 +559,13 @@ async fn root() -> Html<String> {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="tidewave:source" content="cli" />
+    <meta name="tidewave:version" content="{}" />
     <script type="module" src="{}/tc/tc.js"></script>
   </head>
   <body></body>
 </html>"#,
-        client_url
+        env!("CARGO_PKG_VERSION").to_string(),
+        client_url,
     );
 
     Html(html)
@@ -641,5 +662,49 @@ mod tests {
         let path = response.path.unwrap();
         assert!(path.contains(executable_name));
         assert!(path.contains(temp_dir.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn test_verify_origin() {
+        use tower::ServiceExt;
+
+        let config = ServerConfig {
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+        };
+
+        let app = Router::new()
+            .route("/stat", get(stat_file_handler))
+            .route("/about", get(about))
+            .layer(middleware::from_fn(move |mut req: Request, next| {
+                req.extensions_mut().insert(config.clone());
+                verify_origin(req, next)
+            }));
+
+        // Test 1: Allowed origin should pass on /stat
+        let req = Request::builder()
+            .uri("/stat?path=/tmp")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // Test 2: Evil origin should be blocked on /stat
+        let req = Request::builder()
+            .uri("/stat?path=/tmp")
+            .header("Origin", "http://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Test 3: Evil origin should work on /about
+        let req = Request::builder()
+            .uri("/about")
+            .header("Origin", "http://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
