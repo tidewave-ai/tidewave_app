@@ -386,6 +386,8 @@ pub struct ProcessState {
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
+    pub resume_request_ids: Arc<DashSet<Value>>,
+    pub fork_request_ids: Arc<DashSet<Value>>,
 }
 
 pub struct SessionState {
@@ -420,6 +422,8 @@ impl ProcessState {
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
             load_request_ids: Arc::new(DashMap::new()),
+            resume_request_ids: Arc::new(DashSet::<Value>::new()),
+            fork_request_ids: Arc::new(DashSet::<Value>::new()),
         }
     }
 
@@ -1146,6 +1150,13 @@ async fn handle_regular_request(
                     .insert(proxy_id.clone(), session_id);
             }
         }
+        // We intercept resume / fork sessions to map the sessionId to the websocket
+        "_claude/session/resume" => {
+            process_state.resume_request_ids.insert(proxy_id.clone());
+        }
+        "_claude/session/fork" => {
+            process_state.fork_request_ids.insert(proxy_id.clone());
+        }
         _ => (),
     }
 
@@ -1589,7 +1600,17 @@ async fn maybe_handle_session_new_response(
     client_response: &JsonRpcResponse,
     websocket_id: WebSocketId,
 ) {
-    if let Some(_) = process_state.new_request_ids.remove(&response.id) {
+    // check if new / resume or fork
+    if let Some(_) = process_state
+        .new_request_ids
+        .remove(&response.id)
+        .or_else(|| {
+            process_state
+                .resume_request_ids
+                .remove(&response.id)
+                .or_else(|| process_state.fork_request_ids.remove(&response.id))
+        })
+    {
         if let Some(result) = &client_response.result {
             if let Ok(session_response) =
                 serde_json::from_value::<NewSessionResponse>(result.clone())
@@ -1599,7 +1620,7 @@ async fn maybe_handle_session_new_response(
                     let process_key = find_process_key_for_websocket(state, websocket_id).await;
 
                     if let Some(process_key) = process_key {
-                        // Create session state and store model state
+                        // Create session state
                         let session_state = Arc::new(SessionState::new(process_key));
 
                         state
