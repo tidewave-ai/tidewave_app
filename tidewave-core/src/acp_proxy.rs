@@ -365,6 +365,7 @@ pub struct SessionState {
     pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
     pub notification_id_counter: Arc<AtomicU64>,
     pub cancelled: Arc<AtomicBool>,
+    pub cancel_counter: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +451,7 @@ impl SessionState {
             message_buffer: Arc::new(RwLock::new(Vec::new())),
             notification_id_counter: Arc::new(AtomicU64::new(1)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -606,11 +608,16 @@ pub async fn unit_testable_ws_handler<W, R>(
     let mut sessions_for_websocket = Vec::new();
     for entry in state.session_to_websocket.iter() {
         if *entry.value() == websocket_id {
-            sessions_for_websocket.push(entry.key().clone());
+            if let Some(session) = state.sessions.get(entry.key()) {
+                sessions_for_websocket.push((
+                    entry.key().clone(),
+                    session.cancel_counter.load(Ordering::Relaxed),
+                ));
+            }
         }
     }
 
-    for session_id in &sessions_for_websocket {
+    for (session_id, _counter) in &sessions_for_websocket {
         state.session_to_websocket.remove(session_id);
     }
 
@@ -621,37 +628,44 @@ pub async fn unit_testable_ws_handler<W, R>(
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-        for session_id in sessions_for_websocket {
+        for (session_id, counter) in sessions_for_websocket {
             // Check if session is still unmapped (not reconnected)
-            if !state_clone.session_to_websocket.contains_key(&session_id) {
+            if state_clone.session_to_websocket.contains_key(&session_id) {
+                debug!("Skipping session/cancel for {} (reconnected)", session_id);
+            } else if let Some(session_state) = state_clone.sessions.get(&session_id) {
+                // Check if cancel_counter matches (session hasn't been reloaded)
+                if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
+                    debug!(
+                        "Skipping session/cancel for {} because counter does not match!",
+                        session_id
+                    );
+                    continue;
+                }
+
                 // Session is still unmapped, send cancel notification
-                if let Some(session_state) = state_clone.sessions.get(&session_id) {
-                    let process_key = &session_state.process_key;
+                let process_key = &session_state.process_key;
 
-                    if let Some(process_state) = state_clone.processes.get(process_key) {
-                        // Mark session as cancelled
-                        session_state.cancelled.store(true, Ordering::SeqCst);
+                if let Some(process_state) = state_clone.processes.get(process_key) {
+                    // Mark session as cancelled
+                    session_state.cancelled.store(true, Ordering::SeqCst);
 
-                        let cancel_notification = JsonRpcNotification {
-                            jsonrpc: "2.0".to_string(),
-                            method: "session/cancel".to_string(),
-                            params: Some(serde_json::json!({
-                                "sessionId": session_id
-                            })),
-                        };
+                    let cancel_notification = JsonRpcNotification {
+                        jsonrpc: "2.0".to_string(),
+                        method: "session/cancel".to_string(),
+                        params: Some(serde_json::json!({
+                            "sessionId": session_id
+                        })),
+                    };
 
-                        if let Err(e) = process_state
-                            .send_to_process(JsonRpcMessage::Notification(cancel_notification))
-                            .await
-                        {
-                            error!("Failed to send session/cancel for {}: {}", session_id, e);
-                        } else {
-                            debug!("Sent session/cancel for unmapped session: {}", session_id);
-                        }
+                    if let Err(e) = process_state
+                        .send_to_process(JsonRpcMessage::Notification(cancel_notification))
+                        .await
+                    {
+                        error!("Failed to send session/cancel for {}: {}", session_id, e);
+                    } else {
+                        debug!("Sent session/cancel for unmapped session: {}", session_id);
                     }
                 }
-            } else {
-                debug!("Skipping session/cancel for {} (reconnected)", session_id);
             }
         }
     });
@@ -895,7 +909,11 @@ async fn handle_tidewave_session_load(
 
     // Check if this session exists
     let session_state = match state.sessions.get(&params.session_id) {
-        Some(session) => session.clone(),
+        Some(session) => {
+            let state = session.clone();
+            state.cancel_counter.fetch_add(1, Ordering::SeqCst);
+            state
+        }
         None => {
             send_error_and_bail(
                 state,
