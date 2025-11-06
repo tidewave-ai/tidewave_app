@@ -140,7 +140,7 @@ use std::{
     path::Path,
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -232,6 +232,11 @@ pub struct TidewaveSessionLoadRequest {
     pub session_id: String,
     #[serde(rename = "latestId")]
     pub latest_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TidewaveSessionLoadResponse {
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +364,7 @@ pub struct SessionState {
     pub process_key: ProcessKey,
     pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
     pub notification_id_counter: Arc<AtomicU64>,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +449,7 @@ impl SessionState {
             process_key,
             message_buffer: Arc::new(RwLock::new(Vec::new())),
             notification_id_counter: Arc::new(AtomicU64::new(1)),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -595,19 +602,59 @@ pub async fn unit_testable_ws_handler<W, R>(
     state.websocket_senders.remove(&websocket_id);
     state.websocket_to_process.remove(&websocket_id);
 
-    // Remove session mappings for this WebSocket
-    let mut sessions_to_remove = Vec::new();
+    // Capture sessions for this WebSocket and remove mappings
+    let mut sessions_for_websocket = Vec::new();
     for entry in state.session_to_websocket.iter() {
         if *entry.value() == websocket_id {
-            sessions_to_remove.push(entry.key().clone());
+            sessions_for_websocket.push(entry.key().clone());
         }
     }
 
-    for session_id in sessions_to_remove {
-        state.session_to_websocket.remove(&session_id);
+    for session_id in &sessions_for_websocket {
+        state.session_to_websocket.remove(session_id);
     }
 
     debug!("WebSocket connection closed: {}", websocket_id);
+
+    // Spawn a task to send session/cancel after 10 seconds
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        for session_id in sessions_for_websocket {
+            // Check if session is still unmapped (not reconnected)
+            if !state_clone.session_to_websocket.contains_key(&session_id) {
+                // Session is still unmapped, send cancel notification
+                if let Some(session_state) = state_clone.sessions.get(&session_id) {
+                    let process_key = &session_state.process_key;
+
+                    if let Some(process_state) = state_clone.processes.get(process_key) {
+                        // Mark session as cancelled
+                        session_state.cancelled.store(true, Ordering::SeqCst);
+
+                        let cancel_notification = JsonRpcNotification {
+                            jsonrpc: "2.0".to_string(),
+                            method: "session/cancel".to_string(),
+                            params: Some(serde_json::json!({
+                                "sessionId": session_id
+                            })),
+                        };
+
+                        if let Err(e) = process_state
+                            .send_to_process(JsonRpcMessage::Notification(cancel_notification))
+                            .await
+                        {
+                            error!("Failed to send session/cancel for {}: {}", session_id, e);
+                        } else {
+                            debug!("Sent session/cancel for unmapped session: {}", session_id);
+                        }
+                    }
+                }
+            } else {
+                debug!("Skipping session/cancel for {} (reconnected)", session_id);
+            }
+        }
+    });
 }
 
 /// Called whenever we receive a message on the WebSocket (except ping).
@@ -877,6 +924,9 @@ async fn handle_tidewave_session_load(
         .websocket_to_process
         .insert(websocket_id, session_state.process_key.clone());
 
+    // Check if session was cancelled and reset the flag
+    let was_cancelled = session_state.cancelled.swap(false, Ordering::SeqCst);
+
     // Send buffered messages after the latest_id
     let buffered_messages = session_state
         .get_buffered_messages_after(&params.latest_id)
@@ -888,10 +938,14 @@ async fn handle_tidewave_session_load(
             let _ = tx.send(WebSocketMessage::JsonRpc(buffered.message));
         }
 
+        let response_data = TidewaveSessionLoadResponse {
+            cancelled: was_cancelled,
+        };
+
         let success_response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id.clone(),
-            result: serde_json::to_value(Map::new()).ok(),
+            result: serde_json::to_value(response_data).ok(),
             error: None,
         };
 
