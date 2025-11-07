@@ -146,12 +146,17 @@ pub fn run() {
 
             open_tidewave(&app.handle(), port);
 
-            let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, None::<&str>)?;
-            let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, None::<&str>)?;
+            #[cfg(target_os = "macos")]
+            let maybe_hotkey = |s: &str| Some(s);
+            #[cfg(not(target_os = "macos"))]
+            let maybe_hotkey = |_s: &str| None::<&str>;
+
+            let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, maybe_hotkey("Command+O"))?;
+            let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, maybe_hotkey("Command+,"))?;
             let check_for_updates_i = MenuItem::with_id(app, "check_for_updates", "Check for Updates…", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, maybe_hotkey("Command+Q"))?;
             let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
@@ -252,8 +257,10 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
 
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        Command::new("notepad.exe").arg(&config_path).spawn()?;
+        // silence unused variable warning
+        let _ = app;
+
+        std::process::Command::new("notepad.exe").arg(&config_path).spawn()?;
     }
 
     #[cfg(not(target_os = "windows"))]
