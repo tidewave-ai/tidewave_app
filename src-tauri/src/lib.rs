@@ -147,7 +147,7 @@ pub fn run() {
             open_tidewave(&app.handle(), port);
 
             #[cfg(target_os = "macos")]
-            let maybe_hotkey = |s: &str| Some(s);
+            let maybe_hotkey = Some;
             #[cfg(not(target_os = "macos"))]
             let maybe_hotkey = |_s: &str| None::<&str>;
 
