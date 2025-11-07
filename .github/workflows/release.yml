@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - 'v*.*.*'
+    # TODO: remove
+    branches:
+      - 'wm-*'
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
   workflow_dispatch:
@@ -84,7 +87,7 @@ jobs:
         with:
           cache-directories: |
             ~/.cargo/bin
-          key: ${{ matrix.platform }}
+          key: ${{ matrix.gui_target }}
 
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
