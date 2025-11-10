@@ -2,6 +2,7 @@ pub mod acp_proxy;
 pub mod config;
 mod mcp_remote;
 pub mod server;
+pub mod tls;
 
 pub use config::{get_config_path, load_config, Config};
 pub use server::{

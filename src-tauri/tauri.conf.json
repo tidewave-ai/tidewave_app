@@ -69,6 +69,21 @@
           "description": "Allow remote access by binding to 0.0.0.0 instead of 127.0.0.1",
           "short": "a",
           "takesValue": false
+        },
+        {
+          "name": "https-port",
+          "description": "Enable HTTPS on the specified port",
+          "takesValue": true
+        },
+        {
+          "name": "https-cert-path",
+          "description": "Path to HTTPS certificate file (PEM format)",
+          "takesValue": true
+        },
+        {
+          "name": "https-key-path",
+          "description": "Path to HTTPS private key file (PEM format)",
+          "takesValue": true
         }
       ]
     },
