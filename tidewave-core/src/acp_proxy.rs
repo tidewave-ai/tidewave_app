@@ -108,6 +108,21 @@ An overview of our protocol extensions:
       }
     }
 
+6. Exit request
+
+    To allow a client to stop an ACP process (for example in order to restart
+    after logging in in Claude Code), we add a `_tidewave.ai/exit` request.
+
+    This will stop the ACP process for that WebSocket and send exit notifications to all
+    connected clients. When they reconnect, a new process will be started.
+
+    {
+      "jsonrpc": "2.0",
+      "id": ...,
+      "method": "_tidewave.ai/exit",
+      "params": {}
+    }
+
 The proxy keeps a mapping of sessionId to the active socket connection.
 There is a bit of nuance on how to do this. Imagine the following situation:
 
@@ -341,6 +356,8 @@ pub struct ProcessState {
     pub child: Arc<RwLock<Option<Child>>>,
     /// Channel used to forward a message to the ACP process.
     pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    /// Channel used to signal the exit monitor to kill the process.
+    pub exit_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     pub next_proxy_id: Arc<AtomicU64>,
 
     // ID mapping for multiplexed connections
@@ -381,6 +398,7 @@ impl ProcessState {
             spawn_opts,
             child: Arc::new(RwLock::new(None)),
             stdin_tx: Arc::new(RwLock::new(None)),
+            exit_tx: Arc::new(RwLock::new(None)),
             next_proxy_id: Arc::new(AtomicU64::new(1)),
             client_to_proxy_ids: Arc::new(DashMap::new()),
             proxy_to_client_ids: Arc::new(DashMap::new()),
@@ -716,6 +734,8 @@ async fn handle_client_request(
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
         "session/load" => handle_acp_session_load(state, websocket_id, request).await,
+        // Exit request
+        "_tidewave.ai/exit" => handle_exit_request(state, websocket_id).await,
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, websocket_id, request).await,
     }
@@ -1040,6 +1060,47 @@ async fn handle_acp_session_load(
     handle_regular_request(state, websocket_id, request).await
 }
 
+async fn handle_exit_request(state: &AcpProxyState, websocket_id: WebSocketId) -> Result<()> {
+    let process_key = match state.websocket_to_process.get(&websocket_id) {
+        Some(key) => key.clone(),
+        None => {
+            warn!(
+                "Exit request for websocket {} with no process mapping",
+                websocket_id
+            );
+            return Ok(());
+        }
+    };
+
+    let process_state = match state.processes.get(&process_key) {
+        Some(process) => process.clone(),
+        None => {
+            warn!("Exit request for non-existent process: {}", process_key);
+            return Ok(());
+        }
+    };
+
+    info!("Exit request received for process: {}", process_key);
+
+    // Send exit signal through the channel
+    if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+        if let Err(e) = exit_tx.send(()) {
+            error!(
+                "Failed to send exit signal for process {}: {}",
+                process_key, e
+            );
+        } else {
+            info!("Sent exit signal for process: {}", process_key);
+        }
+    } else {
+        warn!("No exit channel available for process: {}", process_key);
+    }
+
+    // The exit monitor will handle killing the process, sending notifications, and cleanup
+
+    Ok(())
+}
+
 async fn handle_regular_request(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
@@ -1251,60 +1312,89 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
         debug!("Process stderr handler ended");
     });
 
+    // Create exit channel and store the sender in process_state
+    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<()>();
+    *process_state.exit_tx.write().await = Some(exit_tx);
+
     // Start process exit monitor
     let process_state_exit = process_state.clone();
     let state_exit = state.clone();
     tokio::spawn(async move {
-        // Wait for the process to exit
-        let exit_status = {
+        let exit_reason = {
             let mut child_guard = process_state_exit.child.write().await;
             if let Some(child) = child_guard.as_mut() {
-                child.wait().await
+                // Use tokio::select! to wait for either process exit or exit signal
+                tokio::select! {
+                    // Process exited naturally
+                    status = child.wait() => {
+                        match status {
+                            Ok(s) => {
+                                if s.success() {
+                                    debug!("Process exited successfully");
+                                    ("process_exit", format!("ACP process exited with code {}", s.code().unwrap_or(0)))
+                                } else {
+                                    debug!("Process exited with status: {}", s);
+                                    ("process_exit", format!("ACP process exited with code {}", s.code().unwrap_or(-1)))
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to wait for process: {}", e);
+                                ("process_exit", format!("ACP process failed: {}", e))
+                            }
+                        }
+                    }
+                    // Received exit signal
+                    _ = exit_rx.recv() => {
+                        debug!("Exit signal received for process: {}", process_state_exit.key);
+                        // Kill the process
+                        if let Err(e) = child.kill().await {
+                            error!("Failed to kill process {}: {}", process_state_exit.key, e);
+                        } else {
+                            debug!("Successfully killed process: {}", process_state_exit.key);
+                        }
+                        ("exit_requested", "ACP process was stopped by exit request".to_string())
+                    }
+                }
             } else {
                 return;
             }
         };
 
-        let exit_message = match exit_status {
-            Ok(status) => {
-                if status.success() {
-                    info!("Process exited successfully");
-                    format!(
-                        "ACP process exited with code {}",
-                        status.code().unwrap_or(0)
-                    )
-                } else {
-                    error!("Process exited with status: {}", status);
-                    format!(
-                        "ACP process exited with code {}",
-                        status.code().unwrap_or(-1)
-                    )
-                }
-            }
-            Err(e) => {
-                error!("Failed to wait for process: {}", e);
-                format!("ACP process failed: {}", e)
-            }
-        };
+        let (error_type, exit_message) = exit_reason;
 
-        // Send exit notification to all connected websockets using this process
+        // Collect all websockets connected to this process
+        let websockets_to_close: Vec<WebSocketId> = state_exit
+            .websocket_to_process
+            .iter()
+            .filter(|entry| entry.value() == &process_state_exit.key)
+            .map(|entry| *entry.key())
+            .collect();
 
-        for entry in state_exit.websocket_to_process.iter() {
-            if entry.value() == &process_state_exit.key {
-                send_exit_notification(
-                    &state_exit,
-                    entry.key().clone(),
-                    "process_exit",
-                    &exit_message,
-                )
-                .await;
-            }
+        // Send exit notification (the client will disconnect)
+        for websocket_id in websockets_to_close {
+            // Send exit notification
+            send_exit_notification(&state_exit, websocket_id, error_type, &exit_message).await;
+        }
+
+        // Clean up all sessions associated with this process
+        let sessions_to_remove: Vec<SessionId> = state_exit
+            .sessions
+            .iter()
+            .filter(|entry| entry.value().process_key == process_state_exit.key)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for session_id in &sessions_to_remove {
+            state_exit.sessions.remove(session_id);
         }
 
         // Clean up the process from the state
         state_exit.processes.remove(&process_state_exit.key);
 
-        debug!("Process exit handler ended");
+        debug!(
+            "Process exit handler ended, cleaned up {} sessions",
+            sessions_to_remove.len()
+        );
     });
 
     Ok(())
@@ -1389,6 +1479,7 @@ async fn maybe_handle_init_response(
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
         inject_tidewave_version(client_response, version());
+        inject_proxy_capabilities(client_response);
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
     }
@@ -1697,6 +1788,29 @@ fn inject_tidewave_version(response: &mut JsonRpcResponse, version: &str) {
             meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
 
             result_obj.insert("_meta".to_string(), Value::Object(meta_obj));
+        }
+    }
+}
+
+fn inject_proxy_capabilities(response: &mut JsonRpcResponse) {
+    if let Some(result) = &mut response.result {
+        if let Some(result_obj) = result.as_object_mut() {
+            if let Some(agent_caps) = result_obj.get_mut("agentCapabilities") {
+                if let Some(caps_obj) = agent_caps.as_object_mut() {
+                    // Add our custom _meta capabilities within agentCapabilities
+                    let mut meta_obj = caps_obj
+                        .get("_meta")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let mut tidewave_obj = Map::new();
+                    tidewave_obj.insert("exit".to_string(), Value::Bool(true));
+                    meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
+
+                    caps_obj.insert("_meta".to_string(), Value::Object(meta_obj));
+                }
+            }
         }
     }
 }
@@ -2355,5 +2469,60 @@ mod tests {
         // Should add tidewave meta
         let tidewave = meta.get("tidewave.ai").unwrap();
         assert_eq!(tidewave.get("version").unwrap(), "0.2.0");
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+        let tidewave = meta.get("tidewave.ai").unwrap();
+
+        assert_eq!(tidewave.get("exit").unwrap(), true);
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities_preserves_existing_meta() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "_meta": {
+                        "existing": "metadata"
+                    }
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "metadata");
+
+        // Should add tidewave meta
+        let tidewave = meta.get("tidewave.ai").unwrap();
+        assert_eq!(tidewave.get("exit").unwrap(), true);
     }
 }

@@ -260,7 +260,9 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
         // silence unused variable warning
         let _ = app;
 
-        std::process::Command::new("notepad.exe").arg(&config_path).spawn()?;
+        std::process::Command::new("notepad.exe")
+            .arg(&config_path)
+            .spawn()?;
     }
 
     #[cfg(not(target_os = "windows"))]
