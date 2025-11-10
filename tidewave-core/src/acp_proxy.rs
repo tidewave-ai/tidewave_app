@@ -1479,6 +1479,7 @@ async fn maybe_handle_init_response(
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
         inject_tidewave_version(client_response, version());
+        inject_proxy_capabilities(client_response);
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
     }
@@ -1787,6 +1788,29 @@ fn inject_tidewave_version(response: &mut JsonRpcResponse, version: &str) {
             meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
 
             result_obj.insert("_meta".to_string(), Value::Object(meta_obj));
+        }
+    }
+}
+
+fn inject_proxy_capabilities(response: &mut JsonRpcResponse) {
+    if let Some(result) = &mut response.result {
+        if let Some(result_obj) = result.as_object_mut() {
+            if let Some(agent_caps) = result_obj.get_mut("agentCapabilities") {
+                if let Some(caps_obj) = agent_caps.as_object_mut() {
+                    // Add our custom _meta capabilities within agentCapabilities
+                    let mut meta_obj = caps_obj
+                        .get("_meta")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let mut tidewave_obj = Map::new();
+                    tidewave_obj.insert("exit".to_string(), Value::Bool(true));
+                    meta_obj.insert("tidewave.ai".to_string(), Value::Object(tidewave_obj));
+
+                    caps_obj.insert("_meta".to_string(), Value::Object(meta_obj));
+                }
+            }
         }
     }
 }
@@ -2445,5 +2469,60 @@ mod tests {
         // Should add tidewave meta
         let tidewave = meta.get("tidewave.ai").unwrap();
         assert_eq!(tidewave.get("version").unwrap(), "0.2.0");
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+        let tidewave = meta.get("tidewave.ai").unwrap();
+
+        assert_eq!(tidewave.get("exit").unwrap(), true);
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities_preserves_existing_meta() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "_meta": {
+                        "existing": "metadata"
+                    }
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "metadata");
+
+        // Should add tidewave meta
+        let tidewave = meta.get("tidewave.ai").unwrap();
+        assert_eq!(tidewave.get("exit").unwrap(), true);
     }
 }
