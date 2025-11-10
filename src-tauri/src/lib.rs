@@ -20,6 +20,9 @@ const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave ap
 # If you change this file, you must restart Tidewave.
 
 # port = 9832
+# https_port = 9833
+# https_cert_path = "/path/to/cert.pem"
+# https_key_path = "/path/to/key.pem"
 # allow_remote_access = false
 
 [env]
@@ -74,6 +77,26 @@ pub fn run() {
                             }
                         }
                     }
+
+                    if let Some(https_port_arg) = matches.args.get("https-port") {
+                        if let Some(port_str) = https_port_arg.value.as_str() {
+                            if let Ok(p) = port_str.parse::<u16>() {
+                                config.https_port = Some(p);
+                            }
+                        }
+                    }
+
+                    if let Some(https_cert_arg) = matches.args.get("https-cert-path") {
+                        if let Some(cert_str) = https_cert_arg.value.as_str() {
+                            config.https_cert_path = Some(cert_str.to_string());
+                        }
+                    }
+
+                    if let Some(https_key_arg) = matches.args.get("https-key-path") {
+                        if let Some(key_str) = https_key_arg.value.as_str() {
+                            config.https_key_path = Some(key_str.to_string());
+                        }
+                    }
                 }
                 Err(_) => {}
             }
@@ -100,6 +123,7 @@ pub fn run() {
             }
 
             let port = config.port;
+            let https_port = config.https_port;
 
             let listener = match tidewave_core::bind_http_server(config.clone()).await {
                 Ok(listener) => listener,
@@ -144,7 +168,7 @@ pub fn run() {
                 shutdown_tx,
             });
 
-            open_tidewave(&app.handle(), port);
+            open_tidewave(&app.handle(), port, https_port);
 
             #[cfg(target_os = "macos")]
             let maybe_hotkey = Some;
@@ -169,7 +193,7 @@ pub fn run() {
                     app.exit(0);
                 }
                 "open_tidewave" => {
-                    open_tidewave(app, port);
+                    open_tidewave(app, port, https_port);
                 }
                 "open_config" => {
                     if let Err(e) = open_config_file(app) {
@@ -234,9 +258,14 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn open_tidewave(app: &tauri::AppHandle, port: u16) {
+fn open_tidewave(app: &tauri::AppHandle, port: u16, https_port: Option<u16>) {
     debug!("Opening Tidewave in browser");
-    let url = format!("http://localhost:{}", port);
+    // Prefer HTTPS if available
+    let url = if let Some(https_port) = https_port {
+        format!("https://localhost:{}", https_port)
+    } else {
+        format!("http://localhost:{}", port)
+    };
     if let Err(e) = app.opener().open_url(url, None::<&str>) {
         error!("Failed to open Tidewave: {}", e);
     }

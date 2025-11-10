@@ -13,6 +13,15 @@ struct Cli {
 
     #[arg(short, long)]
     allow_remote_access: bool,
+
+    #[arg(long)]
+    https_port: Option<u16>,
+
+    #[arg(long)]
+    https_cert_path: Option<String>,
+
+    #[arg(long)]
+    https_key_path: Option<String>,
 }
 
 #[tokio::main]
@@ -23,6 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: cli.port.unwrap_or(9832),
         debug: cli.debug,
         allow_remote_access: cli.allow_remote_access,
+        https_port: cli.https_port,
+        https_cert_path: cli.https_cert_path,
+        https_key_path: cli.https_key_path,
         env: HashMap::new(),
     };
 

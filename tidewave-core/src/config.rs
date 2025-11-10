@@ -17,6 +17,15 @@ pub struct Config {
     pub allow_remote_access: bool,
 
     #[serde(default)]
+    pub https_port: Option<u16>,
+
+    #[serde(default)]
+    pub https_cert_path: Option<String>,
+
+    #[serde(default)]
+    pub https_key_path: Option<String>,
+
+    #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
@@ -46,6 +55,9 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
             port: default_port(),
             debug: false,
             allow_remote_access: false,
+            https_port: None,
+            https_cert_path: None,
+            https_key_path: None,
             env: HashMap::new(),
         });
     }
@@ -57,13 +69,47 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     // Use serde to deserialize the full config
     let config: Config = toml::from_str(&content).map_err(|e| {
         format!(
-            "Failed to parse config: {}\n\nExpected format:\nport = 9832\ndebug = false\nallow_remote_access = false\n\n[env]\nKEY = \"value\"",
+            "Failed to parse config: {}\n\nExpected format:\nport = 9832\n# https_port = 9833\n# https_cert_path = \"/path/to/cert.pem\"\n# https_key_path = \"/path/to/key.pem\"\ndebug = false\nallow_remote_access = false\n\n\n[env]\nKEY = \"value\"",
             e
         )
     })?;
 
     debug!("Loaded config: {:?}", config);
+
+    // Validate HTTPS configuration: all three options must be provided or none
+    validate_https_config(&config)?;
+
     Ok(config)
+}
+
+fn validate_https_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let has_port = config.https_port.is_some();
+    let has_cert = config.https_cert_path.is_some();
+    let has_key = config.https_key_path.is_some();
+
+    // All three must be present or all three must be absent
+    if has_port || has_cert || has_key {
+        if !has_port {
+            return Err(
+                "HTTPS configuration error: https_port is required when using custom certificates"
+                    .into(),
+            );
+        }
+        if !has_cert {
+            return Err(
+                "HTTPS configuration error: https_cert_path is required when https_port is set"
+                    .into(),
+            );
+        }
+        if !has_key {
+            return Err(
+                "HTTPS configuration error: https_key_path is required when https_port is set"
+                    .into(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -77,6 +123,7 @@ mod tests {
         assert_eq!(config.port, 9832);
         assert_eq!(config.debug, false);
         assert_eq!(config.allow_remote_access, false);
+        assert_eq!(config.https_port, None);
         assert!(config.env.is_empty());
     }
 
@@ -84,8 +131,11 @@ mod tests {
     fn test_parse_config_with_env_section() {
         let toml_content = r#"
 port = 8080
-debug = true
+https_port = 8443
+https_cert_path = "/path/to/cert.pem"
+https_key_path = "/path/to/key.pem"
 allow_remote_access = true
+debug = true
 
 [env]
 API_KEY = "secret"
@@ -96,11 +146,59 @@ DATABASE_URL = "postgres://localhost"
         assert_eq!(config.port, 8080);
         assert_eq!(config.debug, true);
         assert_eq!(config.allow_remote_access, true);
+        assert_eq!(config.https_port, Some(8443));
+        assert_eq!(
+            config.https_cert_path,
+            Some("/path/to/cert.pem".to_string())
+        );
+        assert_eq!(config.https_key_path, Some("/path/to/key.pem".to_string()));
         assert_eq!(config.env.len(), 2);
         assert_eq!(config.env.get("API_KEY"), Some(&"secret".to_string()));
         assert_eq!(
             config.env.get("DATABASE_URL"),
             Some(&"postgres://localhost".to_string())
         );
+    }
+
+    #[test]
+    fn test_validate_https_config_all_present() {
+        let config = Config {
+            port: 9832,
+            debug: false,
+            allow_remote_access: false,
+            https_port: Some(9833),
+            https_cert_path: Some("/path/to/cert.pem".to_string()),
+            https_key_path: Some("/path/to/key.pem".to_string()),
+            env: HashMap::new(),
+        };
+        assert!(validate_https_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_https_config_all_absent() {
+        let config = Config {
+            port: 9832,
+            debug: false,
+            allow_remote_access: false,
+            https_port: None,
+            https_cert_path: None,
+            https_key_path: None,
+            env: HashMap::new(),
+        };
+        assert!(validate_https_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_https_missing_config() {
+        let config = Config {
+            port: 9832,
+            debug: false,
+            allow_remote_access: false,
+            https_port: Some(9833),
+            https_cert_path: Some("/path/to/cert.pem".to_string()),
+            https_key_path: None,
+            env: HashMap::new(),
+        };
+        assert!(validate_https_config(&config).is_err());
     }
 }

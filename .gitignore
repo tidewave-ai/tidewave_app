@@ -11,12 +11,15 @@ node_modules
 dist
 dist-ssr
 *.local
+key.pem
+cert.pem
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+.claude
 *.suo
 *.ntvs*
 *.njsproj

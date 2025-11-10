@@ -114,15 +114,18 @@ pub async fn start_http_server(
     serve_http_server(config, listener).await
 }
 
-pub async fn bind_http_server(
-    config: Config,
-) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
-    let port = config.port;
-    let bind_addr = if config.allow_remote_access {
+fn get_bind_addr(port: u16, allow_remote_access: bool) -> String {
+    if allow_remote_access {
         format!("0.0.0.0:{}", port)
     } else {
         format!("127.0.0.1:{}", port)
-    };
+    }
+}
+
+pub async fn bind_http_server(
+    config: Config,
+) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+    let bind_addr = get_bind_addr(config.port, config.allow_remote_access);
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("HTTP server bound to {}", bind_addr);
     Ok(listener)
@@ -142,15 +145,22 @@ pub async fn serve_http_server_with_shutdown(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let port = config.port;
+    let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
     let acp_state = crate::acp_proxy::AcpProxyState::new();
 
-    let config = ServerConfig {
-        allowed_origins: vec![
-            format!("http://localhost:{}", port),
-            format!("http://127.0.0.1:{}", port),
-        ],
-    };
+    // Build allowed origins for both HTTP and HTTPS
+    let mut allowed_origins = vec![
+        format!("http://localhost:{}", port),
+        format!("http://127.0.0.1:{}", port),
+    ];
+
+    if let Some(https_port) = https_port {
+        allowed_origins.push(format!("https://localhost:{}", https_port));
+        allowed_origins.push(format!("https://127.0.0.1:{}", https_port));
+    }
+
+    let server_config = ServerConfig { allowed_origins };
 
     // Create the MCP routes that need state
     let mcp_routes = Router::new()
@@ -172,7 +182,7 @@ pub async fn serve_http_server_with_shutdown(
     // Create the main app without state
     let app = Router::new()
         .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(config.clone());
+            req.extensions_mut().insert(server_config.clone());
             verify_origin(req, next)
         }))
         .route("/", get(root))
@@ -192,9 +202,55 @@ pub async fn serve_http_server_with_shutdown(
         .merge(mcp_routes)
         .merge(acp_routes);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    // Start HTTP server
+    let http_task = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal)
+                .await
+        })
+    };
+
+    // Optionally start HTTPS server
+    let https_task = if let Some(https_port) = https_port {
+        info!("Starting HTTPS server on port {}", https_port);
+
+        let cert_path = config
+            .https_cert_path
+            .as_ref()
+            .expect("https_cert_path validated");
+        let key_path = config
+            .https_key_path
+            .as_ref()
+            .expect("https_key_path validated");
+        let rustls_config = crate::tls::load_tls_config_from_paths(cert_path, key_path)?;
+
+        // Create HTTPS listener using the same binding logic as HTTP
+        let bind_addr = get_bind_addr(https_port, config.allow_remote_access);
+        let https_addr: std::net::SocketAddr = bind_addr.parse()?;
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
+        let https_handle = axum_server::Handle::new();
+
+        Some(tokio::spawn(async move {
+            axum_server::bind_rustls(https_addr, tls_config)
+                .handle(https_handle)
+                .serve(app.into_make_service())
+                .await
+        }))
+    } else {
+        None
+    };
+
+    // Wait for both servers
+    let http_result = http_task.await;
+    if let Some(https_task) = https_task {
+        let https_result = https_task.await;
+        https_result??;
+    }
+    http_result??;
+
     Ok(())
 }
 

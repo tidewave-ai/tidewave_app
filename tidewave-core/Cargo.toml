@@ -5,11 +5,14 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 async-stream = "0.3"
 bytes = "1.10.1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+rustls = "0.23"
+rustls-pemfile = "2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
