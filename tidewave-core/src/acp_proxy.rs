@@ -1330,10 +1330,10 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                         match status {
                             Ok(s) => {
                                 if s.success() {
-                                    info!("Process exited successfully");
+                                    debug!("Process exited successfully");
                                     ("process_exit", format!("ACP process exited with code {}", s.code().unwrap_or(0)))
                                 } else {
-                                    error!("Process exited with status: {}", s);
+                                    debug!("Process exited with status: {}", s);
                                     ("process_exit", format!("ACP process exited with code {}", s.code().unwrap_or(-1)))
                                 }
                             }
@@ -1345,12 +1345,12 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                     }
                     // Received exit signal
                     _ = exit_rx.recv() => {
-                        info!("Exit signal received for process: {}", process_state_exit.key);
+                        debug!("Exit signal received for process: {}", process_state_exit.key);
                         // Kill the process
                         if let Err(e) = child.kill().await {
                             error!("Failed to kill process {}: {}", process_state_exit.key, e);
                         } else {
-                            info!("Successfully killed process: {}", process_state_exit.key);
+                            debug!("Successfully killed process: {}", process_state_exit.key);
                         }
                         ("exit_requested", "ACP process was stopped by exit request".to_string())
                     }
@@ -1370,7 +1370,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
             .map(|entry| *entry.key())
             .collect();
 
-        // Send exit notification and close websockets
+        // Send exit notification (the client will disconnect)
         for websocket_id in websockets_to_close {
             // Send exit notification
             send_exit_notification(&state_exit, websocket_id, error_type, &exit_message).await;
