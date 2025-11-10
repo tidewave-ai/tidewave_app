@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -101,14 +102,33 @@ pub fn run() {
                 Err(_) => {}
             }
 
-            // Initialize tracing
+            // Initialize tracing with file logging
+            let log_path = get_log_path();
+
+            // Create log directory if it doesn't exist
+            if let Some(parent) = log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
             let filter = if config.debug {
                 "debug"
             } else {
                 "info"
             };
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
+
+            // Set up file appender
+            let file_appender = tracing_appender::rolling::never(
+                log_path.parent().unwrap(),
+                log_path.file_name().unwrap()
+            );
+
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(filter))
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+                .with(tracing_subscriber::fmt::layer().with_writer(file_appender).with_ansi(false))
                 .init();
 
             if config.debug {
@@ -128,11 +148,16 @@ pub fn run() {
             let listener = match tidewave_core::bind_http_server(config.clone()).await {
                 Ok(listener) => listener,
                 Err(e) => {
-                    app.dialog()
+                    let result = app.dialog()
                         .message(format!("Failed to bind HTTP server: {}", e))
                         .kind(MessageDialogKind::Error)
                         .title("Error")
+                        .buttons(MessageDialogButtons::OkCancelCustom("OK".to_string(), "View Logs".to_string()))
                         .blocking_show();
+
+                    if !result {
+                        view_logs(&app.handle());
+                    }
                     std::process::exit(1);
                 }
             };
@@ -151,11 +176,16 @@ pub fn run() {
                 };
 
                 if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, listener, shutdown_signal).await {
-                    app_handle_for_server.dialog()
+                    let result = app_handle_for_server.dialog()
                         .message(format!("HTTP server error: {}", e))
                         .kind(MessageDialogKind::Error)
                         .title("Error")
+                        .buttons(MessageDialogButtons::OkCancelCustom("OK".to_string(), "View Logs".to_string()))
                         .blocking_show();
+
+                    if !result {
+                        view_logs(&app_handle_for_server);
+                    }
                     app_handle_for_server.exit(1);
                 }
             });
@@ -177,11 +207,12 @@ pub fn run() {
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, maybe_hotkey("Command+O"))?;
             let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, maybe_hotkey("Command+,"))?;
+            let view_logs_i = MenuItem::with_id(app, "view_logs", "View Logs", true, maybe_hotkey("Command+L"))?;
             let check_for_updates_i = MenuItem::with_id(app, "check_for_updates", "Check for Updates…", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, maybe_hotkey("Command+Q"))?;
-            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &check_for_updates_i, &restart_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &view_logs_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
             .menu(&menu)
@@ -204,6 +235,9 @@ pub fn run() {
                             .title("Error")
                             .blocking_show();
                     }
+                }
+                "view_logs" => {
+                    view_logs(app);
                 }
                 "restart" => {
                     match tidewave_core::load_config() {
@@ -303,6 +337,14 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn view_logs(app: &tauri::AppHandle) {
+    let log_path = get_log_path();
+
+    if let Err(e) = app.opener().open_path(log_path.to_string_lossy().as_ref(), None::<&str>) {
+        error!("Failed to open log file: {}", e);
+    }
+}
+
 async fn check_for_updates_on_boot(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
         let should_install = app
@@ -391,4 +433,28 @@ async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater:
     }
 
     Ok(())
+}
+
+fn get_log_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join("Library/Logs/Tidewave.log")
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let local_app_data = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| {
+                let user_profile = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
+                format!("{}\\AppData\\Local", user_profile)
+            });
+        PathBuf::from(local_app_data).join("Tidewave\\Logs\\Tidewave.log")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".local/share/Tidewave/logs/Tidewave.log")
+    }
 }
