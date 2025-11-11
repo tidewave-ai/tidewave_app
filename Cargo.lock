@@ -5093,7 +5093,6 @@ dependencies = [
 name = "tidewave-app"
 version = "0.1.0"
 dependencies = [
- "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -5115,7 +5114,6 @@ name = "tidewave-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "rustls",
  "tidewave-core",
  "tokio",
  "tracing",

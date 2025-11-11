@@ -27,7 +27,6 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let config = tidewave_core::Config {
         port: cli.port.unwrap_or(9832),
