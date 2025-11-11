@@ -24,6 +24,9 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
 which = "8.0"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }

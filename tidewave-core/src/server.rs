@@ -289,12 +289,18 @@ async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .envs(env)
         .current_dir(Path::new(&cwd))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+
+    let mut child = command
         .spawn()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -369,7 +375,6 @@ fn create_status_chunk(status: i32) -> Bytes {
 fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
     #[cfg(target_os = "windows")]
     {
-        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         ("cmd.exe", vec!["/s", "/c", cmd])
     }
 
