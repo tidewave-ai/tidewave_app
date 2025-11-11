@@ -1201,6 +1201,18 @@ async fn forward_response_to_process(
     Ok(())
 }
 
+fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        ("cmd.exe", vec!["/s", "/c", cmd])
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ("sh", vec!["-c", cmd])
+    }
+}
+
 // ============================================================================
 // Process Management
 // ============================================================================
@@ -1209,24 +1221,22 @@ async fn forward_response_to_process(
 pub fn real_process_starter() -> ProcessStarterFn {
     Arc::new(|spawn_opts: TidewaveSpawnOptions| {
         Box::pin(async move {
-            let parts: Vec<&str> = spawn_opts.command.split_whitespace().collect();
-            if parts.is_empty() {
-                return Err(anyhow!("Empty command"));
-            }
+            let (cmd, args) = get_shell_command(&spawn_opts.command);
 
-            info!(
-                "Starting ACP process: {} with args: {:?}",
-                parts[0],
-                &parts[1..]
-            );
+            info!("Starting ACP process: {} with args: {:?}", cmd, args);
 
-            let mut child = Command::new(parts[0])
-                .args(&parts[1..])
+            let mut cmd = Command::new(cmd);
+            cmd.args(args)
                 .envs(spawn_opts.env)
                 .current_dir(Path::new(&spawn_opts.cwd))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            #[cfg(windows)]
+            cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
 

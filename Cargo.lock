@@ -5099,6 +5099,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "which",
+ "winapi",
 ]
 
 [[package]]
