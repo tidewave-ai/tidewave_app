@@ -145,7 +145,7 @@ pub async fn serve_http_server_with_shutdown(
     listener: TcpListener,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
         .build()?;
