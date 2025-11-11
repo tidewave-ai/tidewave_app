@@ -13,6 +13,7 @@ futures = "0.3"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2.2"
+rustls-platform-verifier = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

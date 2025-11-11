@@ -10,6 +10,8 @@ use axum::{
 };
 use bytes::BytesMut;
 use reqwest::Client;
+use rustls::ClientConfig;
+use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -143,7 +145,9 @@ pub async fn serve_http_server_with_shutdown(
     listener: TcpListener,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::new();
+    let client = Client::builder()
+        .use_preconfigured_tls(ClientConfig::with_platform_verifier())
+        .build()?;
     let port = config.port;
     let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
