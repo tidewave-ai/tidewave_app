@@ -60,17 +60,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-15
-            gui_target:  "aarch64-apple-darwin"
-            cli_targets: "aarch64-apple-darwin x86_64-apple-darwin"
-          - platform: macos-15
-            gui_target:  "x86_64-apple-darwin"
+          # - platform: macos-15
+          #   gui_target:  "aarch64-apple-darwin"
+          #   cli_targets: "aarch64-apple-darwin x86_64-apple-darwin"
+          # - platform: macos-15
+          #   gui_target:  "x86_64-apple-darwin"
           - platform: windows-2025
             cli_targets: "x86_64-pc-windows-msvc"
             gui_target:  "x86_64-pc-windows-msvc"
-          - platform: ubuntu-22.04
-            cli_targets: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
-            gui_target:  "x86_64-unknown-linux-gnu"
+          # - platform: ubuntu-22.04
+          #   cli_targets: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+          #   gui_target:  "x86_64-unknown-linux-gnu"
 
     runs-on: ${{ matrix.platform }}
 
@@ -152,16 +152,32 @@ jobs:
         run: |
           rustup target add "${{ matrix.gui_target }}"
 
-      - name: Install Azure Trusted Signing CLI (Windows)
+      - name: Setup Azure Trusted Signing (Windows)
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
+        env:
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
         run: |
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client" -OutFile "trustedsigning.zip"
+          # Download and extract Azure Trusted Signing dlib
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/1.0.95" -OutFile "trustedsigning.zip"
           Expand-Archive -Path "trustedsigning.zip" -DestinationPath "trustedsigning"
-          $cliPath = Join-Path $PWD "trustedsigning\bin\x64"
-          echo "$cliPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "Installed trusted-signing-cli to: $cliPath"
-          Get-ChildItem $cliPath
+
+          $dlibPath = Join-Path $PWD "trustedsigning\bin\x64\Azure.CodeSigning.Dlib.dll"
+          echo "AZURE_SIGNING_DLIB_PATH=$dlibPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Create metadata.json for SignTool
+          $metadata = @{
+            Endpoint = "https://eus.codesigning.azure.net/"
+            CodeSigningAccountName = $env:AZURE_TRUSTED_SIGNING_ACCOUNT_NAME
+            CertificateProfileName = $env:AZURE_CERTIFICATE_PROFILE_NAME
+          }
+          $metadataPath = Join-Path $PWD "metadata.json"
+          $metadata | ConvertTo-Json | Set-Content -Path $metadataPath
+          echo "AZURE_SIGNING_METADATA_PATH=$metadataPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          echo "Trusted Signing dlib: $dlibPath"
+          echo "Metadata file: $metadataPath"
 
       - name: Build GUI
         uses: tauri-apps/tauri-action@v0
