@@ -161,18 +161,20 @@ jobs:
         run: |
           # Download and extract Windows SDK Build Tools (contains SignTool)
           $buildToolsVersion = "10.0.26100.4188"
+          $buildToolsPath = Join-Path $env:GITHUB_WORKSPACE "buildtools"
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Windows.SDK.BuildTools/$buildToolsVersion" -OutFile "buildtools.zip"
-          Expand-Archive -Path "buildtools.zip" -DestinationPath "buildtools"
+          Expand-Archive -Path "buildtools.zip" -DestinationPath $buildToolsPath
 
-          $signtoolPath = Join-Path $PWD "buildtools\bin\$buildToolsVersion\x64\signtool.exe"
+          $signtoolPath = Join-Path $buildToolsPath "bin\$buildToolsVersion\x64\signtool.exe"
           echo "SIGNTOOL_PATH=$signtoolPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           # Download and extract Azure Trusted Signing dlib
           $trustedSigningVersion = "1.0.95"
+          $trustedSigningPath = Join-Path $env:GITHUB_WORKSPACE "trustedsigning"
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/$trustedSigningVersion" -OutFile "trustedsigning.zip"
-          Expand-Archive -Path "trustedsigning.zip" -DestinationPath "trustedsigning"
+          Expand-Archive -Path "trustedsigning.zip" -DestinationPath $trustedSigningPath
 
-          $dlibPath = Join-Path $PWD "trustedsigning\bin\x64\Azure.CodeSigning.Dlib.dll"
+          $dlibPath = Join-Path $trustedSigningPath "bin\x64\Azure.CodeSigning.Dlib.dll"
           echo "AZURE_SIGNING_DLIB_PATH=$dlibPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           # Create metadata.json for SignTool
@@ -181,7 +183,7 @@ jobs:
             CodeSigningAccountName = $env:AZURE_TRUSTED_SIGNING_ACCOUNT_NAME
             CertificateProfileName = $env:AZURE_CERTIFICATE_PROFILE_NAME
           }
-          $metadataPath = Join-Path $PWD "metadata.json"
+          $metadataPath = Join-Path $env:GITHUB_WORKSPACE "metadata.json"
           $metadata | ConvertTo-Json | Set-Content -Path $metadataPath
           echo "AZURE_SIGNING_METADATA_PATH=$metadataPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -190,11 +192,19 @@ jobs:
           echo "Metadata file: $metadataPath"
 
           # Create sign.bat wrapper script for NSIS
-          $signBatPath = Join-Path $PWD "sign.bat"
+          $signBatPath = Join-Path $env:GITHUB_WORKSPACE "sign.bat"
           $signBatContent = "@echo off`r`n`"$signtoolPath`" sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib `"$dlibPath`" /dmdf `"$metadataPath`" %1"
           [System.IO.File]::WriteAllText($signBatPath, $signBatContent)
+
+          # Verify the batch file was created
+          if (Test-Path $signBatPath) {
+            echo "Created sign.bat at: $signBatPath"
+            Get-Content $signBatPath | Write-Host
+          } else {
+            throw "Failed to create sign.bat"
+          }
+
           echo "SIGN_COMMAND_PATH=$signBatPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "Created sign.bat at: $signBatPath"
 
       - name: Build GUI
         uses: tauri-apps/tauri-action@v0
