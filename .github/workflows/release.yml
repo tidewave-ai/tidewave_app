@@ -67,8 +67,11 @@ jobs:
             cli_targets: "x86_64-pc-windows-msvc"
             gui_target:  "x86_64-pc-windows-msvc"
           - platform: ubuntu-22.04
-            cli_targets: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+            cli_targets: "x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
             gui_target:  "x86_64-unknown-linux-gnu"
+          - platform: ubuntu-22.04-arm
+            cli_targets: "aarch64-unknown-linux-gnu"
+            gui_target:  "aarch64-unknown-linux-gnu"
 
     runs-on: ${{ matrix.platform }}
 
@@ -80,7 +83,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Zig
-        if: startsWith(matrix.platform, 'ubuntu')
+        if: matrix.platform == 'ubuntu-22.04'
         shell: bash
         run: |
           wget -q https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
@@ -89,6 +92,7 @@ jobs:
           echo "/usr/local/zig" >> $GITHUB_PATH
 
       - name: Install zigbuild
+        if: matrix.platform == 'ubuntu-22.04'
         run: cargo install --locked cargo-zigbuild
 
       - name: Rust cache
@@ -162,6 +166,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NO_STRIP: ${{ matrix.platform == 'ubuntu-22.04-arm' && 'true' || '' }}
         with:
           args: --target ${{ matrix.gui_target }}
           tagName: ${{ needs.ensure-release.outputs.release-name }}
@@ -183,7 +188,7 @@ jobs:
             echo "Building CLI for $target"
             rustup target add "$target"
 
-            if [[ "$target" == "aarch64-unknown-linux-gnu" || "$target" == "aarch64-unknown-linux-musl" || "$target" == "x86_64-unknown-linux-musl" ]]; then
+            if [[ "$target" == "aarch64-unknown-linux-musl" || "$target" == "x86_64-unknown-linux-musl" ]]; then
               cargo zigbuild -p tidewave-cli --release --target $target
             else
               cargo build -p tidewave-cli --release --target $target
