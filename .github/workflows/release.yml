@@ -191,10 +191,8 @@ jobs:
 
           # Create sign.bat wrapper script for NSIS
           $signBatPath = Join-Path $PWD "sign.bat"
-          @"
-@echo off
-"$signtoolPath" sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "$dlibPath" /dmdf "$metadataPath" %1
-"@ | Set-Content -Path $signBatPath -Encoding ASCII
+          $signBatContent = "@echo off`r`n`"$signtoolPath`" sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib `"$dlibPath`" /dmdf `"$metadataPath`" %1"
+          [System.IO.File]::WriteAllText($signBatPath, $signBatContent)
           echo "SIGN_COMMAND_PATH=$signBatPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "Created sign.bat at: $signBatPath"
 
