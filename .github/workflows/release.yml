@@ -152,6 +152,17 @@ jobs:
         run: |
           rustup target add "${{ matrix.gui_target }}"
 
+      - name: Install Azure Trusted Signing CLI (Windows)
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client" -OutFile "trustedsigning.zip"
+          Expand-Archive -Path "trustedsigning.zip" -DestinationPath "trustedsigning"
+          $cliPath = Join-Path $PWD "trustedsigning\bin\x64"
+          echo "$cliPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "Installed trusted-signing-cli to: $cliPath"
+          Get-ChildItem $cliPath
+
       - name: Build GUI
         uses: tauri-apps/tauri-action@v0
         env:
@@ -164,6 +175,11 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
         with:
           args: --target ${{ matrix.gui_target }}
           tagName: ${{ needs.ensure-release.outputs.release-name }}
