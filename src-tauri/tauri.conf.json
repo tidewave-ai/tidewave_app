@@ -40,7 +40,7 @@
       }
     ],
     "windows": {
-      "signCommand": "powershell.exe -Command \"signtool.exe sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $env:AZURE_SIGNING_DLIB_PATH /dmdf $env:AZURE_SIGNING_METADATA_PATH '%1'\"",
+      "signCommand": "%SIGN_COMMAND_PATH% %1",
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "headerImage": "icons/installer-header.bmp",

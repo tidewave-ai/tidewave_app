@@ -159,8 +159,17 @@ jobs:
           AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
           AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
         run: |
+          # Download and extract Windows SDK Build Tools (contains SignTool)
+          $buildToolsVersion = "10.0.26100.4188"
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Windows.SDK.BuildTools/$buildToolsVersion" -OutFile "buildtools.zip"
+          Expand-Archive -Path "buildtools.zip" -DestinationPath "buildtools"
+
+          $signtoolPath = Join-Path $PWD "buildtools\bin\$buildToolsVersion\x64\signtool.exe"
+          echo "SIGNTOOL_PATH=$signtoolPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           # Download and extract Azure Trusted Signing dlib
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/1.0.95" -OutFile "trustedsigning.zip"
+          $trustedSigningVersion = "1.0.95"
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/$trustedSigningVersion" -OutFile "trustedsigning.zip"
           Expand-Archive -Path "trustedsigning.zip" -DestinationPath "trustedsigning"
 
           $dlibPath = Join-Path $PWD "trustedsigning\bin\x64\Azure.CodeSigning.Dlib.dll"
@@ -176,8 +185,18 @@ jobs:
           $metadata | ConvertTo-Json | Set-Content -Path $metadataPath
           echo "AZURE_SIGNING_METADATA_PATH=$metadataPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+          echo "SignTool: $signtoolPath"
           echo "Trusted Signing dlib: $dlibPath"
           echo "Metadata file: $metadataPath"
+
+          # Create sign.bat wrapper script for NSIS
+          $signBatPath = Join-Path $PWD "sign.bat"
+          @"
+@echo off
+"$signtoolPath" sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "$dlibPath" /dmdf "$metadataPath" %1
+"@ | Set-Content -Path $signBatPath -Encoding ASCII
+          echo "SIGN_COMMAND_PATH=$signBatPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "Created sign.bat at: $signBatPath"
 
       - name: Build GUI
         uses: tauri-apps/tauri-action@v0
