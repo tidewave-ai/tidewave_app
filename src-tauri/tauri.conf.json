@@ -40,6 +40,7 @@
       }
     ],
     "windows": {
+      "signCommand": "trusted-signing-cli sign -e https://eus.codesigning.azure.net/ -a %AZURE_TRUSTED_SIGNING_ACCOUNT_NAME% -c %AZURE_CERTIFICATE_PROFILE_NAME% -d \"Tidewave\" -td sha256 -tr http://timestamp.acs.microsoft.com %1",
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "headerImage": "icons/installer-header.bmp",
