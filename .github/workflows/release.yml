@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*.*.*'
+    branches:
+      - 'wm-*'
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
   workflow_dispatch:
@@ -83,7 +85,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Zig
-        if: matrix.platform == 'ubuntu-22.04'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
         run: |
           wget -q https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
@@ -92,7 +94,7 @@ jobs:
           echo "/usr/local/zig" >> $GITHUB_PATH
 
       - name: Install zigbuild
-        if: matrix.platform == 'ubuntu-22.04'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         run: cargo install --locked cargo-zigbuild
 
       - name: Rust cache
@@ -103,7 +105,7 @@ jobs:
           key: ${{ matrix.platform }}
 
       - name: Install Linux dependencies
-        if: startsWith(matrix.platform, 'ubuntu')
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
@@ -114,6 +116,15 @@ jobs:
             librsvg2-dev \
             patchelf \
             xdg-utils
+
+      - name: Verify xdg-open installation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "Checking for xdg-open..."
+          which xdg-open || echo "xdg-open not found in PATH"
+          ls -la /usr/bin/xdg-open || echo "/usr/bin/xdg-open not found"
+          dpkg -L xdg-utils | grep xdg-open || echo "xdg-open not in xdg-utils package"
 
       - name: Install Tauri CLI
         shell: bash
@@ -126,7 +137,7 @@ jobs:
           fi
 
       - name: Install Apple certificate
-        if: startsWith(matrix.platform, 'macos')
+        if: runner.os == 'macOS'
         env:
           P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
@@ -167,14 +178,14 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          NO_STRIP: ${{ matrix.platform == 'ubuntu-22.04-arm' && 'true' || '' }}
+          NO_STRIP: ${{ runner.os == 'Linux' && runner.arch == 'ARM64' && 'true' || '' }}
         with:
           args: --target ${{ matrix.gui_target }}
           tagName: ${{ needs.ensure-release.outputs.release-name }}
           assetNamePattern: "tidewave-app-[arch][ext]"
 
       - name: Verify GUI notarization (macos)
-        if: startsWith(matrix.platform, 'macos')
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           app_path="target/${{ matrix.gui_target }}/release/bundle/macos/tidewave.app"
@@ -197,7 +208,7 @@ jobs:
           done
 
       - name: Sign CLI binaries (macos)
-        if: startsWith(matrix.platform, 'macos') && matrix.cli_targets != ''
+        if: runner.os == 'macOS' && matrix.cli_targets != ''
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -228,7 +239,7 @@ jobs:
           done
 
       - name: Sign CLI binaries (windows)
-        if: startsWith(matrix.platform, 'windows')
+        if: runner.os == 'Windows'
         uses: azure/trusted-signing-action@v0.4.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -254,7 +265,7 @@ jobs:
           for target in ${{ matrix.cli_targets }}; do
             src_path="target/$target/release/tidewave"
             dst_path="tidewave-cli-$target"
-            if [[ "${{ matrix.platform }}" = windows* ]]; then
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
               src_path="$src_path.exe"
               dst_path="$dst_path.exe"
             fi
