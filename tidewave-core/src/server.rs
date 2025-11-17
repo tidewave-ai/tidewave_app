@@ -377,11 +377,22 @@ fn create_shell_command(cmd: &str, env: HashMap<String, String>, cwd: &str) -> C
     #[cfg(target_os = "windows")]
     {
         if env.get("WSL_DISTRO_NAME").is_some() {
-            // WSL case: use --cd flag instead of .current_dir()
-            // Set WSLENV to pass environment variables from Windows to WSL
-            let wslenv_vars: Vec<String> = env.keys().cloned().collect();
-            let mut wsl_env = env;
-            wsl_env.insert("WSLENV".to_string(), wslenv_vars.join(":"));
+            // WSL case: use --cd flag and construct env string
+            // Build env assignments string: VAR1=value1 VAR2=value2 ... command
+            let env_string: Vec<String> = env
+                .iter()
+                .map(|(k, v)| {
+                    // Escape single quotes in the value by replacing ' with '\''
+                    let escaped_value = v.replace("'", "'\\''");
+                    format!("{}='{}'", k, escaped_value)
+                })
+                .collect();
+
+            let full_command = if env_string.is_empty() {
+                cmd.to_string()
+            } else {
+                format!("{} {}", env_string.join(" "), cmd)
+            };
 
             let mut command = Command::new("wsl.exe");
             command
@@ -389,8 +400,7 @@ fn create_shell_command(cmd: &str, env: HashMap<String, String>, cwd: &str) -> C
                 .arg(cwd)
                 .arg("sh")
                 .arg("-c")
-                .arg(cmd)
-                .envs(wsl_env);
+                .arg(full_command);
             command
         } else {
             // Windows cmd case: use .current_dir()
