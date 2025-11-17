@@ -294,9 +294,7 @@ async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
     let mut command = create_shell_command(&payload.command, env, &cwd);
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     #[cfg(windows)]
     command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
@@ -538,6 +536,36 @@ fn fetch_mtime(path: String) -> Result<u64, String> {
 }
 
 async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResponse>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    {
+        // Check if we're in WSL context
+        if let Some(env) = &params.env {
+            if env.get("WSL_DISTRO_NAME").is_some() {
+                // Run which command inside WSL
+                let cwd = params.cwd.as_deref().unwrap_or(".");
+                let env_clone = env.clone();
+                let command_str = format!("which {}", params.command);
+
+                let mut command = create_shell_command(&command_str, env_clone, cwd);
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+                let output = command
+                    .output()
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return Ok(Json(WhichResponse { path: Some(path) }));
+                    }
+                }
+                return Ok(Json(WhichResponse { path: None }));
+            }
+        }
+    }
+
+    // Non-WSL case: use the which crate
     let result = if let Some(env) = params.env {
         if let Some(paths) = env.get("PATH") {
             let paths = paths.clone();
