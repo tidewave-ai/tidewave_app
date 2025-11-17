@@ -292,13 +292,9 @@ async fn verify_origin(
 async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
-    let (cmd, args) = get_shell_command(&payload.command, env.clone());
 
-    let mut command = Command::new(cmd);
+    let mut command = create_shell_command(&payload.command, env, &cwd);
     command
-        .args(args)
-        .envs(env)
-        .current_dir(Path::new(&cwd))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -377,20 +373,48 @@ fn create_status_chunk(status: i32) -> Bytes {
     chunk.freeze()
 }
 
-fn get_shell_command(cmd: &str, env: HashMap<String, String>) -> (&'static str, Vec<&str>) {
+fn create_shell_command(cmd: &str, env: HashMap<String, String>, cwd: &str) -> Command {
     #[cfg(target_os = "windows")]
     {
-        if let Some(_) = env.get("WSL_DISTRO_NAME") {
-            ("wsl.exe", vec!["sh", "-c", cmd])
+        if env.get("WSL_DISTRO_NAME").is_some() {
+            // WSL case: use --cd flag instead of .current_dir()
+            // Set WSLENV to pass environment variables from Windows to WSL
+            let wslenv_vars: Vec<String> = env.keys().cloned().collect();
+            let mut wsl_env = env;
+            wsl_env.insert("WSLENV".to_string(), wslenv_vars.join(":"));
+
+            let mut command = Command::new("wsl.exe");
+            command
+                .arg("--cd")
+                .arg(cwd)
+                .arg("sh")
+                .arg("-c")
+                .arg(cmd)
+                .envs(wsl_env);
+            command
         } else {
-            ("cmd.exe", vec!["/s", "/c", cmd])
+            // Windows cmd case: use .current_dir()
+            let mut command = Command::new("cmd.exe");
+            command
+                .arg("/s")
+                .arg("/c")
+                .arg(cmd)
+                .envs(env)
+                .current_dir(Path::new(cwd));
+            command
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        _ = env;
-        ("sh", vec!["-c", cmd])
+        // Unix case: use .current_dir()
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(cmd)
+            .envs(env)
+            .current_dir(Path::new(cwd));
+        command
     }
 }
 
