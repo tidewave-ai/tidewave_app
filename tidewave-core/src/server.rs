@@ -290,9 +290,9 @@ async fn verify_origin(
 }
 
 async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
-    let (cmd, args) = get_shell_command(&payload.command);
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    let (cmd, args) = get_shell_command(&payload.command, env.clone());
 
     let mut command = Command::new(cmd);
     command
@@ -377,14 +377,19 @@ fn create_status_chunk(status: i32) -> Bytes {
     chunk.freeze()
 }
 
-fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
+fn get_shell_command(cmd: &str, env: HashMap<String, String>) -> (&'static str, Vec<&str>) {
     #[cfg(target_os = "windows")]
     {
-        ("cmd.exe", vec!["/s", "/c", cmd])
+        if let Some(_) = env.get("WSL_DISTRO_NAME") {
+            ("wsl.exe", vec!["sh", "-c", cmd])
+        } else {
+            ("cmd.exe", vec!["/s", "/c", cmd])
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        _ = env;
         ("sh", vec!["-c", cmd])
     }
 }
