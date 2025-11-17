@@ -37,17 +37,26 @@ struct ShellParams {
 #[derive(Deserialize)]
 struct StatFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
 struct ReadFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
 struct WriteFileParams {
     path: String,
     content: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
@@ -426,6 +435,30 @@ fn create_shell_command(cmd: &str, env: HashMap<String, String>, cwd: &str) -> C
     }
 }
 
+#[cfg(target_os = "windows")]
+async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("wslpath")
+        .arg("-w")
+        .arg(wsl_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run wslpath: {}", e))?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(path)
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("wslpath failed: {}", error))
+    }
+}
+
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
@@ -435,11 +468,29 @@ async fn read_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(target_os = "windows")]
+    let file_path = if payload.is_wsl {
+        match wslpath_to_windows(&payload.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(ReadFileResponse::ReadFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        payload.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let file_path = payload.path.clone();
+
     let result = async {
-        let content = tokio::fs::read_to_string(&payload.path)
+        let content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| e.kind().to_string())?;
-        let mtime = fetch_mtime(payload.path)?;
+        let mtime = fetch_mtime(file_path)?;
         Ok::<_, String>((content, mtime))
     }
     .await;
@@ -466,7 +517,24 @@ async fn write_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(target_os = "windows")]
+    let path_str = if payload.is_wsl {
+        match wslpath_to_windows(&payload.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(WriteFileResponse::WriteFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        payload.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
     let path_str = payload.path.clone();
+
     let content = payload.content.clone();
     let bytes_written = content.len();
 
@@ -511,7 +579,25 @@ async fn stat_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mtime_op = fetch_mtime(query.path);
+    #[cfg(target_os = "windows")]
+    let file_path = if query.is_wsl {
+        match wslpath_to_windows(&query.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(StatFileResponse::StatFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        query.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let file_path = query.path.clone();
+
+    let mtime_op = fetch_mtime(file_path);
 
     match mtime_op {
         Ok(mtime) => Ok(Json(StatFileResponse::StatFileResponseOk {
