@@ -32,6 +32,9 @@ struct ShellParams {
     command: String,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +68,9 @@ struct WhichParams {
     // Note that cwd is only used in case PATH in env is also set
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Serialize)]
@@ -302,7 +308,7 @@ async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
-    let mut command = create_shell_command(&payload.command, env, &cwd);
+    let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     #[cfg(windows)]
@@ -380,10 +386,15 @@ fn create_status_chunk(status: i32) -> Bytes {
     chunk.freeze()
 }
 
-fn create_shell_command(cmd: &str, env: HashMap<String, String>, cwd: &str) -> Command {
+fn create_shell_command(
+    cmd: &str,
+    env: HashMap<String, String>,
+    cwd: &str,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] is_wsl: bool,
+) -> Command {
     #[cfg(target_os = "windows")]
     {
-        if env.get("WSL_DISTRO_NAME").is_some() {
+        if is_wsl {
             // WSL case: use --cd flag and construct env string
             // Build env assignments string: VAR1=value1 VAR2=value2 ... command
             let env_string: Vec<String> = env
@@ -630,7 +641,7 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
                 let env_clone = env.clone();
                 let command_str = format!("which {}", params.command);
 
-                let mut command = create_shell_command(&command_str, env_clone, cwd);
+                let mut command = create_shell_command(&command_str, env_clone, cwd, params.is_wsl);
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
                 let output = command
