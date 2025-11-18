@@ -462,14 +462,8 @@ async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
-    let path = Path::new(&payload.path);
-
-    if !path.is_absolute() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     #[cfg(target_os = "windows")]
-    let file_path = if payload.is_wsl {
+    if payload.is_wsl {
         match wslpath_to_windows(&payload.path).await {
             Ok(windows_path) => windows_path,
             Err(error) => {
@@ -485,6 +479,10 @@ async fn read_file_handler(
 
     #[cfg(not(target_os = "windows"))]
     let file_path = payload.path.clone();
+
+    if !Path::new(&file_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let result = async {
         let content = tokio::fs::read_to_string(&file_path)
