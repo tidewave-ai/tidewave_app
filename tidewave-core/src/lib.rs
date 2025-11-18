@@ -1,4 +1,5 @@
 pub mod acp_proxy;
+mod command;
 pub mod config;
 mod mcp_remote;
 pub mod server;

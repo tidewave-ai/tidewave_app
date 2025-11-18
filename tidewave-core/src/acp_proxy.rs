@@ -137,6 +137,7 @@ Because of this, we don't use the ACP SDK in the browser, but instead handle raw
 JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
 any requests to the new connection.
 */
+use crate::command::create_shell_command;
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{
@@ -152,7 +153,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
-    path::Path,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -161,7 +161,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::Child,
     sync::{mpsc, Mutex, RwLock},
 };
 use tracing::{debug, error, info, trace, warn};
@@ -239,6 +239,8 @@ pub struct TidewaveSpawnOptions {
     pub command: String,
     pub env: HashMap<String, String>,
     pub cwd: String,
+    #[serde(default)]
+    is_wsl: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1201,18 +1203,6 @@ async fn forward_response_to_process(
     Ok(())
 }
 
-fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
-    #[cfg(target_os = "windows")]
-    {
-        ("cmd.exe", vec!["/s", "/c", cmd])
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        ("sh", vec!["-c", cmd])
-    }
-}
-
 // ============================================================================
 // Process Management
 // ============================================================================
@@ -1221,20 +1211,18 @@ fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
 pub fn real_process_starter() -> ProcessStarterFn {
     Arc::new(|spawn_opts: TidewaveSpawnOptions| {
         Box::pin(async move {
-            let (cmd, args) = get_shell_command(&spawn_opts.command);
+            info!("Starting ACP process: {}", spawn_opts.command);
 
-            info!("Starting ACP process: {} with args: {:?}", cmd, args);
+            let mut cmd = create_shell_command(
+                &spawn_opts.command,
+                spawn_opts.env,
+                &spawn_opts.cwd,
+                spawn_opts.is_wsl,
+            );
 
-            let mut cmd = Command::new(cmd);
-            cmd.args(args)
-                .envs(spawn_opts.env)
-                .current_dir(Path::new(&spawn_opts.cwd))
-                .stdin(Stdio::piped())
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-
-            #[cfg(windows)]
-            cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
 
             let mut child = cmd
                 .spawn()
