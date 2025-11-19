@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 (2025-11-19)
+
+* Add ARM64 AppImage build for Linux
+* Ensure origin check runs for all routes
+
 ## v0.2.0 (2025-11-11)
 
 * Cancel ACP sessions when client disconnects but doesn't reconnect
