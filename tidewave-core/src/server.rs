@@ -1,3 +1,4 @@
+use crate::command::create_shell_command;
 use crate::config::Config;
 use axum::{
     body::{Body, Bytes},
@@ -18,7 +19,7 @@ use std::env;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::UNIX_EPOCH;
-use tokio::{io::AsyncReadExt, net::TcpListener, process::Command};
+use tokio::{io::AsyncReadExt, net::TcpListener};
 use tracing::{debug, error, info};
 use which;
 
@@ -32,22 +33,34 @@ struct ShellParams {
     command: String,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
 struct StatFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
 struct ReadFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
 struct WriteFileParams {
     path: String,
     content: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +69,9 @@ struct WhichParams {
     // Note that cwd is only used in case PATH in env is also set
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Serialize)]
@@ -290,20 +306,11 @@ async fn verify_origin(
 }
 
 async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
-    let (cmd, args) = get_shell_command(&payload.command);
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
-    let mut command = Command::new(cmd);
-    command
-        .args(args)
-        .envs(env)
-        .current_dir(Path::new(&cwd))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+    let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command
         .spawn()
@@ -377,32 +384,61 @@ fn create_status_chunk(status: i32) -> Bytes {
     chunk.freeze()
 }
 
-fn get_shell_command(cmd: &str) -> (&'static str, Vec<&str>) {
-    #[cfg(target_os = "windows")]
-    {
-        ("cmd.exe", vec!["/s", "/c", cmd])
-    }
+#[cfg(target_os = "windows")]
+async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+    use tokio::process::Command;
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("wslpath")
+        .arg("-w")
+        .arg(wsl_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        ("sh", vec!["-c", cmd])
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run wslpath: {}", e))?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(path)
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("wslpath failed: {}", error))
     }
 }
 
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
-    let path = Path::new(&payload.path);
+    #[cfg(target_os = "windows")]
+    let file_path = if payload.is_wsl {
+        match wslpath_to_windows(&payload.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(ReadFileResponse::ReadFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        payload.path.clone()
+    };
 
-    if !path.is_absolute() {
+    #[cfg(not(target_os = "windows"))]
+    let file_path = payload.path.clone();
+
+    if !Path::new(&file_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     let result = async {
-        let content = tokio::fs::read_to_string(&payload.path)
+        let content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| e.kind().to_string())?;
-        let mtime = fetch_mtime(payload.path)?;
+        let mtime = fetch_mtime(file_path)?;
         Ok::<_, String>((content, mtime))
     }
     .await;
@@ -429,7 +465,24 @@ async fn write_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(target_os = "windows")]
+    let path_str = if payload.is_wsl {
+        match wslpath_to_windows(&payload.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(WriteFileResponse::WriteFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        payload.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
     let path_str = payload.path.clone();
+
     let content = payload.content.clone();
     let bytes_written = content.len();
 
@@ -474,7 +527,25 @@ async fn stat_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mtime_op = fetch_mtime(query.path);
+    #[cfg(target_os = "windows")]
+    let file_path = if query.is_wsl {
+        match wslpath_to_windows(&query.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(StatFileResponse::StatFileResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        query.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let file_path = query.path.clone();
+
+    let mtime_op = fetch_mtime(file_path);
 
     match mtime_op {
         Ok(mtime) => Ok(Json(StatFileResponse::StatFileResponseOk {
@@ -499,6 +570,36 @@ fn fetch_mtime(path: String) -> Result<u64, String> {
 }
 
 async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResponse>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    {
+        // Check if we're in WSL context
+        if let Some(env) = &params.env {
+            if env.get("WSL_DISTRO_NAME").is_some() {
+                // Run which command inside WSL
+                let cwd = params.cwd.as_deref().unwrap_or(".");
+                let env_clone = env.clone();
+                let command_str = format!("which {}", params.command);
+
+                let mut command = create_shell_command(&command_str, env_clone, cwd, params.is_wsl);
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+                let output = command
+                    .output()
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return Ok(Json(WhichResponse { path: Some(path) }));
+                    }
+                }
+                return Ok(Json(WhichResponse { path: None }));
+            }
+        }
+    }
+
+    // Non-WSL case: use the which crate
     let result = if let Some(env) = params.env {
         if let Some(paths) = env.get("PATH") {
             let paths = paths.clone();
@@ -648,6 +749,7 @@ mod tests {
             command: "sh".to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
@@ -666,6 +768,7 @@ mod tests {
             command: "this_command_definitely_does_not_exist_12345".to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
@@ -698,6 +801,7 @@ mod tests {
             command: executable_name.to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result_without_env = which_handler(Json(params_without_env)).await;
@@ -716,6 +820,7 @@ mod tests {
             command: executable_name.to_string(),
             cwd: Some(temp_dir.to_string_lossy().to_string()),
             env: Some(env),
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
