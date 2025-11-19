@@ -186,10 +186,6 @@ pub async fn serve_http_server_with_shutdown(
 
     // Create the main app without state
     let app = Router::new()
-        .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(server_config.clone());
-            verify_origin(req, next)
-        }))
         .route("/", get(root))
         .route("/about", get(about))
         .route("/shell", post(shell_handler))
@@ -205,7 +201,11 @@ pub async fn serve_http_server_with_shutdown(
             }),
         )
         .merge(mcp_routes)
-        .merge(acp_routes);
+        .merge(acp_routes)
+        .layer(middleware::from_fn(move |mut req: Request, next| {
+            req.extensions_mut().insert(server_config.clone());
+            verify_origin(req, next)
+        }));
 
     // Start HTTP server
     let http_task = {
