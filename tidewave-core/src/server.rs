@@ -305,7 +305,23 @@ async fn verify_origin(
     Ok(next.run(req).await)
 }
 
-async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body>, StatusCode> {
+#[derive(Serialize)]
+struct ShellError {
+    error: String,
+}
+
+fn shell_error(message: &str) -> (StatusCode, Json<ShellError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ShellError {
+            error: message.to_string(),
+        }),
+    )
+}
+
+async fn shell_handler(
+    Json(payload): Json<ShellParams>,
+) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
@@ -314,19 +330,19 @@ async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body
 
     let mut child = command
         .spawn()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
 
     let mut stdout = Some(
         child
             .stdout
             .take()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+            .ok_or_else(|| shell_error("Failed to get process stdout"))?,
     );
     let mut stderr = Some(
         child
             .stderr
             .take()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+            .ok_or_else(|| shell_error("Failed to get process stderr"))?,
     );
 
     let stream = async_stream::stream! {
@@ -364,7 +380,7 @@ async fn shell_handler(Json(payload): Json<ShellParams>) -> Result<Response<Body
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
         .body(body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))?)
 }
 
 fn create_data_chunk(data: &[u8]) -> Bytes {
