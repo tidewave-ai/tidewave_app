@@ -17,6 +17,9 @@ jobs:
     outputs:
       release-name: ${{ steps.ensure-release.outputs.release-name }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Create or update release
         id: ensure-release
         shell: bash
@@ -27,20 +30,25 @@ jobs:
 
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             ref_name="${GITHUB_REF_NAME}"
-            title="${ref_name}"
-            flags=""
+            flags="--draft --title \"$ref_name\" --notes \"Release $ref_name.\""
             update_existing=false
+
+            # Verify tag matches Cargo.toml version
+            cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+
+            if [[ "$ref_name" != "v$cargo_version" ]]; then
+              echo "Error: Tag \"$ref_name\" does not match Cargo.toml version \"v$cargo_version\""
+              exit 1
+            fi
           else
             ref_name="nightly"
-            title="Nightly"
             notes="Automated nightly build for ${GITHUB_SHA}."
-            flags="--notes \"${notes}\" --prerelease"
+            flags="--title \"Nightly\" --notes \"${notes}\" --prerelease"
             update_existing=true
           fi
 
           if ! gh release view -R "${repo}" "${ref_name}" 2>/dev/null; then
             eval gh release create -R \"${repo}\" \"${ref_name}\" \
-              --title \"${title}\" \
               ${flags}
           elif [ "${update_existing}" = true ]; then
             gh release edit -R "${repo}" "${ref_name}" \
@@ -171,6 +179,8 @@ jobs:
         with:
           args: --target ${{ matrix.gui_target }}
           tagName: ${{ needs.ensure-release.outputs.release-name }}
+          releaseName: ${{ needs.ensure-release.outputs.release-name }}
+          releaseDraft: true
           assetNamePattern: "tidewave-app-[arch][ext]"
 
       - name: Verify GUI notarization (macos)
