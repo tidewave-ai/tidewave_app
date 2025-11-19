@@ -97,6 +97,18 @@ pub fn run() {
                             config.https_key_path = Some(key_str.to_string());
                         }
                     }
+
+                    if let Some(allowed_origins_arg) = matches.args.get("allowed-origins") {
+                        if let Some(origins_str) = allowed_origins_arg.value.as_str() {
+                            // Split by comma
+                            for origin in origins_str.split(',') {
+                                let trimmed = origin.trim();
+                                if !trimmed.is_empty() {
+                                    config.allowed_origins.push(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(_) => {}
             }

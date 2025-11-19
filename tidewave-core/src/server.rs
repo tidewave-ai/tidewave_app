@@ -171,10 +171,10 @@ pub async fn serve_http_server_with_shutdown(
     let acp_state = crate::acp_proxy::AcpProxyState::new();
 
     // Build allowed origins for both HTTP and HTTPS
-    let mut allowed_origins = vec![
-        format!("http://localhost:{}", port),
-        format!("http://127.0.0.1:{}", port),
-    ];
+    let mut allowed_origins = config.allowed_origins.clone();
+
+    allowed_origins.push(format!("http://localhost:{}", port));
+    allowed_origins.push(format!("http://127.0.0.1:{}", port));
 
     if let Some(https_port) = https_port {
         allowed_origins.push(format!("https://localhost:{}", https_port));

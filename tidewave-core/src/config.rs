@@ -27,6 +27,9 @@ pub struct Config {
 
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    #[serde(skip)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -59,6 +62,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
             https_cert_path: None,
             https_key_path: None,
             env: HashMap::new(),
+            allowed_origins: Vec::new(),
         });
     }
 
@@ -170,6 +174,7 @@ DATABASE_URL = "postgres://localhost"
             https_cert_path: Some("/path/to/cert.pem".to_string()),
             https_key_path: Some("/path/to/key.pem".to_string()),
             env: HashMap::new(),
+            allowed_origins: Vec::new(),
         };
         assert!(validate_https_config(&config).is_ok());
     }
@@ -184,6 +189,7 @@ DATABASE_URL = "postgres://localhost"
             https_cert_path: None,
             https_key_path: None,
             env: HashMap::new(),
+            allowed_origins: Vec::new(),
         };
         assert!(validate_https_config(&config).is_ok());
     }
@@ -198,6 +204,7 @@ DATABASE_URL = "postgres://localhost"
             https_cert_path: Some("/path/to/cert.pem".to_string()),
             https_key_path: None,
             env: HashMap::new(),
+            allowed_origins: Vec::new(),
         };
         assert!(validate_https_config(&config).is_err());
     }

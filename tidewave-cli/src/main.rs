@@ -22,6 +22,9 @@ struct Cli {
 
     #[arg(long)]
     https_key_path: Option<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    allowed_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -36,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         https_cert_path: cli.https_cert_path,
         https_key_path: cli.https_key_path,
         env: HashMap::new(),
+        allowed_origins: cli.allowed_origins,
     };
 
     let filter = if config.debug { "debug" } else { "info" };
