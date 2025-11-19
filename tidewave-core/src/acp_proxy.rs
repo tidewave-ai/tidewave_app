@@ -1891,6 +1891,7 @@ mod tests {
             command: "test_cmd".to_string(),
             env: HashMap::new(),
             cwd: ".".to_string(),
+            is_wsl: false,
         }
     }
 

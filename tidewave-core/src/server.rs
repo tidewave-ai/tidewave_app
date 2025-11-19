@@ -749,6 +749,7 @@ mod tests {
             command: "sh".to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
@@ -767,6 +768,7 @@ mod tests {
             command: "this_command_definitely_does_not_exist_12345".to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
@@ -799,6 +801,7 @@ mod tests {
             command: executable_name.to_string(),
             cwd: None,
             env: None,
+            is_wsl: false,
         };
 
         let result_without_env = which_handler(Json(params_without_env)).await;
@@ -817,6 +820,7 @@ mod tests {
             command: executable_name.to_string(),
             cwd: Some(temp_dir.to_string_lossy().to_string()),
             env: Some(env),
+            is_wsl: false,
         };
 
         let result = which_handler(Json(params)).await;
