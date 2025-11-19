@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 (2025-11-19)
+
+* Fix invalid version number on 0.2.1 release
+* Prepare WSL detection for Tidewave client
+
 ## v0.2.1 (2025-11-19)
 
 * Add ARM64 AppImage build for Linux
