@@ -76,6 +76,11 @@
           "name": "https-key-path",
           "description": "Path to HTTPS private key file (PEM format)",
           "takesValue": true
+        },
+        {
+          "name": "allowed-origins",
+          "description": "Additional allowed origins for CORS (comma-separated list)",
+          "takesValue": true
         }
       ]
     },
