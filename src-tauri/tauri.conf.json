@@ -13,12 +13,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app",
-      "dmg",
-      "nsis",
-      "appimage"
-    ],
+    "targets": ["app", "dmg", "nsis", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
@@ -29,9 +24,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "icons/AppIcon.icon"
-    ],
+    "resources": ["icons/AppIcon.icon"],
     "fileAssociations": [
       {
         "ext": ["tidewave"],
@@ -67,7 +60,6 @@
         {
           "name": "allow-remote-access",
           "description": "Allow remote access by binding to 0.0.0.0 instead of 127.0.0.1",
-          "short": "a",
           "takesValue": false
         },
         {
