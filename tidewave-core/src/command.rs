@@ -34,8 +34,9 @@ pub fn create_shell_command(
                 .arg(cwd)
                 .arg("sh")
                 .arg("-c")
-                .arg(full_command);
-            cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+                .arg(full_command)
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
         } else {
             // Windows cmd case: use .current_dir()
             let mut command = Command::new("cmd.exe");
@@ -44,8 +45,9 @@ pub fn create_shell_command(
                 .arg("/c")
                 .arg(cmd)
                 .envs(env)
-                .current_dir(Path::new(cwd));
-            cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+                .current_dir(Path::new(cwd))
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
         }
     }
 

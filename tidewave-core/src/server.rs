@@ -386,6 +386,7 @@ fn create_status_chunk(status: i32) -> Bytes {
 
 #[cfg(target_os = "windows")]
 async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+    use tokio::process::Command;
     let mut command = Command::new("wsl.exe");
     command
         .arg("wslpath")
@@ -412,7 +413,7 @@ async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
     #[cfg(target_os = "windows")]
-    if payload.is_wsl {
+    let file_path = if payload.is_wsl {
         match wslpath_to_windows(&payload.path).await {
             Ok(windows_path) => windows_path,
             Err(error) => {
