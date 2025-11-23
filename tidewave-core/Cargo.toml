@@ -3,6 +3,9 @@ name = "tidewave-core"
 version.workspace = true
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }

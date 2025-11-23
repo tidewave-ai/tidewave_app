@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::collections::HashMap;
 use tracing::{debug, error};
 
 #[derive(Parser, Debug)]
@@ -38,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         https_port: cli.https_port,
         https_cert_path: cli.https_cert_path,
         https_key_path: cli.https_key_path,
-        env: HashMap::new(),
         allowed_origins: cli.allowed_origins,
+        ..Default::default()
     };
 
     let filter = if config.debug { "debug" } else { "info" };
