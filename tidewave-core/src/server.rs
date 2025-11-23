@@ -920,4 +920,68 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_localhost_proxy_retry() {
+        use tokio::sync::oneshot;
+
+        // Create a minimal config for testing
+        let config = Config {
+            port: 0, // Random port
+            ..Default::default()
+        };
+
+        // Bind the server to get the port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Create a shutdown channel
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // Start the server in a background task
+        tokio::spawn(async move {
+            serve_http_server_with_shutdown(config, listener, async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Create an HTTP client
+        let client = reqwest::Client::new();
+
+        // Test 1: Proxy to localhost:PORT/about (should work directly)
+        let response = client
+            .get(format!(
+                "http://127.0.0.1:{}/proxy?url=http://localhost:{}/about",
+                port, port
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["name"], "tidewave-cli");
+
+        // Test 2: Proxy to tidewave-app-test.localhost:PORT/about (should retry to 127.0.0.1)
+        let response = client
+            .get(format!(
+                "http://127.0.0.1:{}/proxy?url=http://tidewave-app-test.localhost:{}/about",
+                port, port
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["name"], "tidewave-cli");
+
+        // Shutdown the server
+        shutdown_tx.send(()).ok();
+    }
 }
