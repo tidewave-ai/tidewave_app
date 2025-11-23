@@ -10,7 +10,7 @@ use axum::{
     Router,
 };
 use bytes::BytesMut;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
@@ -663,32 +663,58 @@ async fn proxy_handler(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Build the request
-    let mut req_builder = client.request(method, &target_url);
+    // Helper closure to build a request with the given URL and optional Host header
+    let build_request = |url: &str, custom_host: Option<&str>| {
+        let mut req_builder = client.request(method.clone(), url);
 
-    // Forward headers (excluding Host, connection-specific headers, and compression headers)
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str();
-        if ![
-            "host",
-            "connection",
-            "transfer-encoding",
-            "upgrade",
-            "accept-encoding",
-            "content-encoding",
-            "origin",
-        ]
-        .contains(&key_str)
-        {
-            req_builder = req_builder.header(key.clone(), value.clone());
+        // Forward headers (excluding Host, connection-specific headers, and compression headers)
+        for (key, value) in headers.iter() {
+            let key_str = key.as_str();
+            if ![
+                "host",
+                "connection",
+                "transfer-encoding",
+                "upgrade",
+                "accept-encoding",
+                "content-encoding",
+                "origin",
+            ]
+            .contains(&key_str)
+            {
+                req_builder = req_builder.header(key.clone(), value.clone());
+            }
+        }
+
+        // Set custom Host header if provided
+        if let Some(host) = custom_host {
+            req_builder = req_builder.header("Host", host);
+        }
+
+        req_builder.body(body_bytes.clone())
+    };
+
+    // Execute the request
+    let mut response = build_request(&target_url, None).send().await;
+
+    // If connection failed for *.localhost, retry with 127.0.0.1, as in RFC 6761
+    if let Err(e) = &response {
+        if e.is_connect() {
+            if let Ok(mut url) = Url::parse(&target_url) {
+                if let Some(host) = url.host_str() {
+                    if host.ends_with(".localhost") {
+                        let host_string = host.to_string();
+                        info!("Connection to {} failed, retrying with 127.0.0.1", host_string);
+                        url.set_host(Some("127.0.0.1")).ok();
+
+                        response = build_request(url.as_str(), Some(&host_string)).send().await;
+                    }
+                }
+            }
         }
     }
 
-    // Forward the body (bytes can be converted to reqwest::Body)
-    req_builder = req_builder.body(body_bytes);
-
-    // Execute the request
-    let response = req_builder.send().await.map_err(|e| {
+    // Unwrap the response or return error
+    let response = response.map_err(|e| {
         error!("Proxy request failed: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
