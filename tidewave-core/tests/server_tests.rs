@@ -230,3 +230,106 @@ async fn test_which_respects_custom_path() {
 
     shutdown_tx.send(()).ok();
 }
+
+#[tokio::test]
+async fn test_shell_echo_command() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/shell", port))
+        .json(&serde_json::json!({
+            "command": "echo hello"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.unwrap();
+    let output = String::from_utf8_lossy(&bytes);
+    assert!(output.contains("hello"));
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_read_file() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let readme_path = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("README.md");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/read", port))
+        .json(&serde_json::json!({
+            "path": readme_path.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["content"].is_string());
+    assert!(body["mtime"].is_number());
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_read_file_requires_absolute_path() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/read", port))
+        .json(&serde_json::json!({
+            "path": "relative/path.txt"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_stat_file() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let readme_path = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("README.md");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{}/stat?path={}",
+            port,
+            readme_path.to_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["mtime"].is_number());
+
+    shutdown_tx.send(()).ok();
+}
