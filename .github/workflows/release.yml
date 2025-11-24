@@ -163,6 +163,12 @@ jobs:
         run: |
           rustup target add "${{ matrix.gui_target }}"
 
+      - name: Install trusted-signing-cli (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # TODO: use git dependency until trusted-signing-cli next release (v0.8.1 or v0.9)
+          cargo install --git https://github.com/Levminer/trusted-signing-cli.git --rev 5415376 trusted-signing-cli
+
       - name: Build GUI
         uses: tauri-apps/tauri-action@v0
         env:
@@ -173,6 +179,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           NO_STRIP: ${{ runner.os == 'Linux' && runner.arch == 'ARM64' && 'true' || '' }}
