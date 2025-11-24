@@ -37,7 +37,8 @@
         "installerIcon": "icons/icon.ico",
         "headerImage": "icons/installer-header.bmp",
         "sidebarImage": "icons/installer-sidebar.bmp"
-      }
+      },
+      "signCommand": "trusted-signing-cli -e https://eus.codesigning.azure.net %1"
     },
     "createUpdaterArtifacts": true
   },
