@@ -36,6 +36,21 @@ fn default_port() -> u16 {
     9832
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            port: default_port(),
+            debug: false,
+            allow_remote_access: false,
+            https_port: None,
+            https_cert_path: None,
+            https_key_path: None,
+            env: HashMap::new(),
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
 pub fn get_config_path() -> PathBuf {
     let home = if cfg!(target_os = "windows") {
         std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set")
@@ -54,16 +69,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 
     if !config_path.exists() {
         debug!("Config file does not exist, using defaults");
-        return Ok(Config {
-            port: default_port(),
-            debug: false,
-            allow_remote_access: false,
-            https_port: None,
-            https_cert_path: None,
-            https_key_path: None,
-            env: HashMap::new(),
-            allowed_origins: Vec::new(),
-        });
+        return Ok(Config::default());
     }
 
     debug!("Loading config from: {:?}", config_path);
@@ -167,44 +173,26 @@ DATABASE_URL = "postgres://localhost"
     #[test]
     fn test_validate_https_config_all_present() {
         let config = Config {
-            port: 9832,
-            debug: false,
-            allow_remote_access: false,
             https_port: Some(9833),
             https_cert_path: Some("/path/to/cert.pem".to_string()),
             https_key_path: Some("/path/to/key.pem".to_string()),
-            env: HashMap::new(),
-            allowed_origins: Vec::new(),
+            ..Default::default()
         };
         assert!(validate_https_config(&config).is_ok());
     }
 
     #[test]
     fn test_validate_https_config_all_absent() {
-        let config = Config {
-            port: 9832,
-            debug: false,
-            allow_remote_access: false,
-            https_port: None,
-            https_cert_path: None,
-            https_key_path: None,
-            env: HashMap::new(),
-            allowed_origins: Vec::new(),
-        };
+        let config = Config::default();
         assert!(validate_https_config(&config).is_ok());
     }
 
     #[test]
     fn test_validate_https_missing_config() {
         let config = Config {
-            port: 9832,
-            debug: false,
-            allow_remote_access: false,
             https_port: Some(9833),
             https_cert_path: Some("/path/to/cert.pem".to_string()),
-            https_key_path: None,
-            env: HashMap::new(),
-            allowed_origins: Vec::new(),
+            ..Default::default()
         };
         assert!(validate_https_config(&config).is_err());
     }

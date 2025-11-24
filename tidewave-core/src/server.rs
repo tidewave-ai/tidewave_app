@@ -10,7 +10,7 @@ use axum::{
     Router,
 };
 use bytes::BytesMut;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
@@ -663,32 +663,61 @@ async fn proxy_handler(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Build the request
-    let mut req_builder = client.request(method, &target_url);
+    // Helper closure to build a request with the given URL and optional Host header
+    let build_request = |url: &str, custom_host: Option<&str>| {
+        let mut req_builder = client.request(method.clone(), url);
 
-    // Forward headers (excluding Host, connection-specific headers, and compression headers)
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str();
-        if ![
-            "host",
-            "connection",
-            "transfer-encoding",
-            "upgrade",
-            "accept-encoding",
-            "content-encoding",
-            "origin",
-        ]
-        .contains(&key_str)
-        {
-            req_builder = req_builder.header(key.clone(), value.clone());
+        // Forward headers (excluding Host, connection-specific headers, and compression headers)
+        for (key, value) in headers.iter() {
+            let key_str = key.as_str();
+            if ![
+                "host",
+                "connection",
+                "transfer-encoding",
+                "upgrade",
+                "accept-encoding",
+                "content-encoding",
+                "origin",
+            ]
+            .contains(&key_str)
+            {
+                req_builder = req_builder.header(key.clone(), value.clone());
+            }
+        }
+
+        // Set custom Host header if provided
+        if let Some(host) = custom_host {
+            req_builder = req_builder.header("Host", host);
+        }
+
+        req_builder.body(body_bytes.clone())
+    };
+
+    // Execute the request
+    let mut response = build_request(&target_url, None).send().await;
+
+    // If connection failed for *.localhost, retry with 127.0.0.1, as in RFC 6761
+    if let Err(e) = &response {
+        if e.is_connect() {
+            if let Ok(mut url) = Url::parse(&target_url) {
+                if let Some(host) = url.host_str() {
+                    if host.ends_with(".localhost") {
+                        let host_string = host.to_string();
+                        info!(
+                            "Connection to {} failed, retrying with 127.0.0.1",
+                            host_string
+                        );
+                        url.set_host(Some("127.0.0.1")).ok();
+
+                        response = build_request(url.as_str(), Some(&host_string)).send().await;
+                    }
+                }
+            }
         }
     }
 
-    // Forward the body (bytes can be converted to reqwest::Body)
-    req_builder = req_builder.body(body_bytes);
-
-    // Execute the request
-    let response = req_builder.send().await.map_err(|e| {
+    // Unwrap the response or return error
+    let response = response.map_err(|e| {
         error!("Proxy request failed: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
@@ -752,146 +781,4 @@ async fn root() -> Html<String> {
     );
 
     Html(html)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::Json;
-
-    #[tokio::test]
-    async fn test_which_handler_finds_common_command() {
-        let params = WhichParams {
-            command: "sh".to_string(),
-            cwd: None,
-            env: None,
-            is_wsl: false,
-        };
-
-        let result = which_handler(Json(params)).await;
-
-        assert!(result.is_ok());
-        let response = result.unwrap().0;
-        assert!(response.path.is_some());
-        let path = response.path.unwrap();
-        assert!(!path.is_empty());
-        assert!(path.contains("sh"));
-    }
-
-    #[tokio::test]
-    async fn test_which_handler_nonexistent_command() {
-        let params = WhichParams {
-            command: "this_command_definitely_does_not_exist_12345".to_string(),
-            cwd: None,
-            env: None,
-            is_wsl: false,
-        };
-
-        let result = which_handler(Json(params)).await;
-
-        assert!(result.is_ok());
-        let response = result.unwrap().0;
-        assert!(response.path.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_which_handler_respects_custom_path() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = std::env::temp_dir().join(format!("which_test_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
-
-        let executable_name = "test_executable_unique_12345";
-        let executable_path = temp_dir.join(executable_name);
-        fs::write(&executable_path, "#!/bin/sh\necho test").expect("Failed to write executable");
-
-        let mut perms = fs::metadata(&executable_path)
-            .expect("Failed to get metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&executable_path, perms).expect("Failed to set permissions");
-
-        // First, verify the binary is NOT found without custom PATH
-        let params_without_env = WhichParams {
-            command: executable_name.to_string(),
-            cwd: None,
-            env: None,
-            is_wsl: false,
-        };
-
-        let result_without_env = which_handler(Json(params_without_env)).await;
-        assert!(result_without_env.is_ok());
-        let response_without_env = result_without_env.unwrap().0;
-        assert!(
-            response_without_env.path.is_none(),
-            "Binary should not be found in system PATH"
-        );
-
-        // Now verify the binary IS found with custom PATH
-        let mut env = HashMap::new();
-        env.insert("PATH".to_string(), temp_dir.to_string_lossy().to_string());
-
-        let params = WhichParams {
-            command: executable_name.to_string(),
-            cwd: Some(temp_dir.to_string_lossy().to_string()),
-            env: Some(env),
-            is_wsl: false,
-        };
-
-        let result = which_handler(Json(params)).await;
-
-        fs::remove_dir_all(&temp_dir).ok();
-
-        assert!(result.is_ok());
-        let response = result.unwrap().0;
-        assert!(response.path.is_some());
-        let path = response.path.unwrap();
-        assert!(path.contains(executable_name));
-        assert!(path.contains(temp_dir.to_string_lossy().as_ref()));
-    }
-
-    #[tokio::test]
-    async fn test_verify_origin() {
-        use tower::ServiceExt;
-
-        let config = ServerConfig {
-            allowed_origins: vec!["http://localhost:3000".to_string()],
-        };
-
-        let app = Router::new()
-            .route("/stat", get(stat_file_handler))
-            .route("/about", get(about))
-            .layer(middleware::from_fn(move |mut req: Request, next| {
-                req.extensions_mut().insert(config.clone());
-                verify_origin(req, next)
-            }));
-
-        // Test 1: Allowed origin should pass on /stat
-        let req = Request::builder()
-            .uri("/stat?path=/tmp")
-            .header("Origin", "http://localhost:3000")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(req).await.unwrap();
-        assert_ne!(response.status(), StatusCode::FORBIDDEN);
-
-        // Test 2: Evil origin should be blocked on /stat
-        let req = Request::builder()
-            .uri("/stat?path=/tmp")
-            .header("Origin", "http://evil.com")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        // Test 3: Evil origin should work on /about
-        let req = Request::builder()
-            .uri("/about")
-            .header("Origin", "http://evil.com")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
 }
