@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.3 (2025-11-25)
+
+* Allow `*.localhost` access
+* Fix code signing on Windows
+
 ## v0.2.2 (2025-11-19)
 
 * Fix invalid version number on 0.2.1 release
