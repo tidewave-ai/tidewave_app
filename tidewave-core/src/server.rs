@@ -123,6 +123,8 @@ struct AboutResponse {
 #[derive(Clone)]
 struct ServerConfig {
     allowed_origins: Vec<String>,
+    port: u16,
+    https_port: Option<u16>,
 }
 
 pub async fn start_http_server(
@@ -165,7 +167,13 @@ pub async fn serve_http_server_with_shutdown(
     let client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
         .build()?;
-    let port = config.port;
+
+    let port = if config.port == 0 {
+        listener.local_addr()?.port()
+    } else {
+        config.port
+    };
+
     let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
     let acp_state = crate::acp_proxy::AcpProxyState::new();
@@ -181,7 +189,11 @@ pub async fn serve_http_server_with_shutdown(
         allowed_origins.push(format!("https://127.0.0.1:{}", https_port));
     }
 
-    let server_config = ServerConfig { allowed_origins };
+    let server_config = ServerConfig {
+        allowed_origins,
+        port,
+        https_port,
+    };
 
     // Create the MCP routes that need state
     let mcp_routes = Router::new()
@@ -294,12 +306,39 @@ async fn verify_origin(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if !config.allowed_origins.contains(&origin_str.to_string()) {
-            debug!("Rejected request with origin: {}", origin_str);
-            return Err(StatusCode::FORBIDDEN);
+        if config.allowed_origins.contains(&origin_str.to_string()) {
+            return Ok(next.run(req).await);
         }
 
-        return Ok(next.run(req).await);
+        if let Ok(origin_url) = Url::parse(origin_str) {
+            if let Some(host) = origin_url.host_str() {
+                let is_localhost_variant =
+                    host == "localhost" || host == "127.0.0.1" || host.ends_with(".localhost");
+
+                let scheme = origin_url.scheme();
+                let origin_port = origin_url.port();
+
+                // Check if scheme + port matches our HTTP server
+                if is_localhost_variant
+                    && scheme == "http"
+                    && origin_port.unwrap_or(80) == config.port
+                {
+                    return Ok(next.run(req).await);
+                }
+
+                // Check if scheme + port matches our HTTPS server
+                if is_localhost_variant
+                    && scheme == "https"
+                    && config.https_port.is_some()
+                    && origin_port.unwrap_or(443) == config.https_port.unwrap()
+                {
+                    return Ok(next.run(req).await);
+                }
+            }
+        }
+
+        debug!("Rejected request with origin: {}", origin_str);
+        return Err(StatusCode::FORBIDDEN);
     }
 
     Ok(next.run(req).await)
