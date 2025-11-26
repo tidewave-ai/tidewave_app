@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::process::Command;
 
+fn command_with_limited_env(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("APPIMAGE")
+        .env_remove("APPDIR");
+    command
+}
+
 pub fn create_shell_command(
     cmd: &str,
     env: HashMap<String, String>,
@@ -28,7 +37,7 @@ pub fn create_shell_command(
                 format!("{} {}", env_string.join(" "), cmd)
             };
 
-            let mut command = Command::new("wsl.exe");
+            let mut command = command_with_limited_env("wsl.exe");
             command
                 .arg("--cd")
                 .arg(cwd)
@@ -39,7 +48,7 @@ pub fn create_shell_command(
             command
         } else {
             // Windows cmd case: use .current_dir()
-            let mut command = Command::new("cmd.exe");
+            let mut command = command_with_limited_env("cmd.exe");
             command
                 .arg("/s")
                 .arg("/c")
@@ -54,7 +63,7 @@ pub fn create_shell_command(
     #[cfg(not(target_os = "windows"))]
     {
         // Unix case: use .current_dir()
-        let mut command = Command::new("sh");
+        let mut command = command_with_limited_env("sh");
         command
             .arg("-c")
             .arg(cmd)
