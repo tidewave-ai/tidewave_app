@@ -268,6 +268,10 @@ pub struct TidewaveAckNotification {
 pub struct TidewaveExitParams {
     pub error: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
 }
 
 // ============================================================================
@@ -372,6 +376,11 @@ pub struct ProcessState {
     /// The cached init response we resend when a client reconnects.
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
 
+    /// Buffers for stdout/stderr output before init completes.
+    /// Used to provide detailed error messages when process exits before init.
+    pub stdout_buffer: Arc<RwLock<Vec<String>>>,
+    pub stderr_buffer: Arc<RwLock<Vec<String>>>,
+
     // We store the request ID of init, session/new and session/load
     // because we need to handle their responses in a special way.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
@@ -406,6 +415,8 @@ impl ProcessState {
             proxy_to_client_ids: Arc::new(DashMap::new()),
             proxy_to_session_ids: Arc::new(DashMap::new()),
             cached_init_response: Arc::new(RwLock::new(None)),
+            stdout_buffer: Arc::new(RwLock::new(Vec::new())),
+            stderr_buffer: Arc::new(RwLock::new(Vec::new())),
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
             load_request_ids: Arc::new(DashMap::new()),
@@ -879,6 +890,8 @@ async fn handle_initialize_request_locked(
                         websocket_id,
                         "process_start_failed",
                         &e.to_string(),
+                        None,
+                        None,
                     )
                     .await;
                     return Ok(());
@@ -913,6 +926,8 @@ async fn handle_initialize_request_locked(
             websocket_id,
             "communication_error",
             "Failed to communicate with process",
+            None,
+            None,
         )
         .await;
     }
@@ -1296,16 +1311,35 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                 }
             } else {
                 debug!("Received non-JSON line from process: {}", line);
+                // Buffer if init hasn't completed yet
+                if process_state_clone
+                    .cached_init_response
+                    .read()
+                    .await
+                    .is_none()
+                {
+                    process_state_clone.stdout_buffer.write().await.push(line);
+                }
             }
         }
         debug!("Process stdout handler ended");
     });
 
     // Start stderr handler (for debugging)
+    let process_state_stderr = process_state.clone();
     tokio::spawn(async move {
         let mut lines = stderr.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             debug!("Process stderr: {}", line);
+            // Buffer if init hasn't completed yet
+            if process_state_stderr
+                .cached_init_response
+                .read()
+                .await
+                .is_none()
+            {
+                process_state_stderr.stderr_buffer.write().await.push(line);
+            }
         }
         debug!("Process stderr handler ended");
     });
@@ -1360,6 +1394,31 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
 
         let (error_type, exit_message) = exit_reason;
 
+        // If init never completed, include buffered output in the exit notification
+        let (stdout, stderr) = if process_state_exit
+            .cached_init_response
+            .read()
+            .await
+            .is_none()
+        {
+            let stdout_buf = process_state_exit.stdout_buffer.read().await;
+            let stderr_buf = process_state_exit.stderr_buffer.read().await;
+            (
+                if stdout_buf.is_empty() {
+                    None
+                } else {
+                    Some(stdout_buf.join("\n"))
+                },
+                if stderr_buf.is_empty() {
+                    None
+                } else {
+                    Some(stderr_buf.join("\n"))
+                },
+            )
+        } else {
+            (None, None)
+        };
+
         // Collect all websockets connected to this process
         let websockets_to_close: Vec<WebSocketId> = state_exit
             .websocket_to_process
@@ -1371,7 +1430,15 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
         // Send exit notification (the client will disconnect)
         for websocket_id in websockets_to_close {
             // Send exit notification
-            send_exit_notification(&state_exit, websocket_id, error_type, &exit_message).await;
+            send_exit_notification(
+                &state_exit,
+                websocket_id,
+                error_type,
+                &exit_message,
+                stdout.clone(),
+                stderr.clone(),
+            )
+            .await;
         }
 
         // Clean up all sessions associated with this process
@@ -1480,6 +1547,9 @@ async fn maybe_handle_init_response(
         inject_proxy_capabilities(client_response);
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
+        // Clear buffers
+        *process_state.stderr_buffer.write().await = Vec::new();
+        *process_state.stdout_buffer.write().await = Vec::new();
     }
 }
 
@@ -1856,6 +1926,8 @@ async fn send_exit_notification(
     websocket_id: WebSocketId,
     error_type: &str,
     message: &str,
+    stdout: Option<String>,
+    stderr: Option<String>,
 ) {
     let exit_notification = JsonRpcNotification {
         jsonrpc: "2.0".to_string(),
@@ -1864,6 +1936,8 @@ async fn send_exit_notification(
             serde_json::to_value(TidewaveExitParams {
                 error: error_type.to_string(),
                 message: message.to_string(),
+                stdout,
+                stderr,
             })
             .unwrap(),
         ),
