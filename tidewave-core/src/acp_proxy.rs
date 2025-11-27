@@ -1547,6 +1547,9 @@ async fn maybe_handle_init_response(
         inject_proxy_capabilities(client_response);
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
+        // Clear buffers
+        *process_state.stderr_buffer.write().await = Vec::new();
+        *process_state.stdout_buffer.write().await = Vec::new();
     }
 }
 
