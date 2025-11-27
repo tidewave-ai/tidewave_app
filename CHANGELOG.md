@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.4 (2025-11-27)
+
+* Add more detailed output when ACP fails to initialize
+* Do not forward app-specific env variables downstream
+
 ## v0.2.3 (2025-11-25)
 
 * Allow `*.localhost` access
