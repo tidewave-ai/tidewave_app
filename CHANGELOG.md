@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.5 (2025-12-02)
+
+* Also serve Tidewave at *.localhost if scheme+port matches
+
 ## v0.2.4 (2025-11-27)
 
 * Add more detailed output when ACP fails to initialize
