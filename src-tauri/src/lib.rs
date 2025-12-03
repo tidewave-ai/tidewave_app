@@ -43,11 +43,7 @@ pub fn run() {
                 Ok(config) => config,
                 Err(e) => {
                     error!("Failed to load config: {}", e);
-                    app.dialog()
-                        .message(format!("Failed to load config file: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Config Error")
-                        .blocking_show();
+                    error_dialog(&app.handle(), "Config Error", format!("Failed to load config file: {}", e));
                     std::process::exit(1);
                 }
             };
@@ -140,11 +136,7 @@ pub fn run() {
             let listener = match tidewave_core::bind_http_server(config.clone()).await {
                 Ok(listener) => listener,
                 Err(e) => {
-                    app.dialog()
-                        .message(format!("Failed to bind HTTP server: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Error")
-                        .blocking_show();
+                    error_dialog(&app.handle(), "Error", format!("Failed to bind HTTP server: {}", e));
                     std::process::exit(1);
                 }
             };
@@ -163,11 +155,7 @@ pub fn run() {
                 };
 
                 if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, listener, shutdown_signal).await {
-                    app_handle_for_server.dialog()
-                        .message(format!("HTTP server error: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Error")
-                        .blocking_show();
+                    error_dialog(&app_handle_for_server, "Error", format!("HTTP server error: {}", e));
                     app_handle_for_server.exit(1);
                 }
             });
@@ -210,11 +198,7 @@ pub fn run() {
                 "open_config" => {
                     if let Err(e) = open_config_file(app) {
                         error!("Failed to open config file: {}", e);
-                        app.dialog()
-                            .message(format!("Failed to open config file: {}", e))
-                            .kind(MessageDialogKind::Error)
-                            .title("Error")
-                            .blocking_show();
+                        error_dialog(app, "Error", format!("Failed to open config file: {}", e));
                     }
                 }
                 "restart" => {
@@ -240,11 +224,7 @@ pub fn run() {
                         }
                         Err(e) => {
                             error!("Failed to reload config: {}", e);
-                            app.dialog()
-                                .message(format!("Failed to reload config file: {}", e))
-                                .kind(MessageDialogKind::Error)
-                                .title("Config Error")
-                                .blocking_show();
+                            error_dialog(app, "Config Error", format!("Failed to reload config file: {}", e));
                         }
                     }
                 }
@@ -278,8 +258,10 @@ fn open_tidewave(app: &tauri::AppHandle, port: u16, https_port: Option<u16>) {
     } else {
         format!("http://localhost:{}", port)
     };
-    if let Err(e) = app.opener().open_url(url, None::<&str>) {
-        error!("Failed to open Tidewave: {}", e);
+    if let Err(e) = app.opener().open_url(&url, None::<&str>) {
+        let message = format!("Failed to open Tidewave: {}. Please open {} in your browser instead.", e, url);
+        error!(message);
+        error_dialog(app, "Error", message);
     }
 }
 
@@ -335,11 +317,7 @@ async fn check_for_updates_on_boot(app: tauri::AppHandle) -> tauri_plugin_update
                 }
                 Err(e) => {
                     error!("Failed to install update: {}", e);
-                    app.dialog()
-                        .message(format!("Failed to install update: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Update Failed")
-                        .blocking_show();
+                    error_dialog(&app, "Update Failed", format!("Failed to install update: {}", e));
                 }
             }
         }
@@ -354,11 +332,7 @@ fn check_for_updates(app: tauri::AppHandle) {
             Ok(()) => {}
             Err(e) => {
                 error!("Failed to check for updates: {}", e);
-                app.dialog()
-                    .message(format!("Failed to check for updates: {}", e))
-                    .kind(MessageDialogKind::Error)
-                    .title("Update Check Failed")
-                    .blocking_show();
+                error_dialog(&app, "Update Check Failed", format!("Failed to check for updates: {}", e));
             }
         }
     });
@@ -383,11 +357,7 @@ async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater:
                     app.restart();
                 }
                 Err(e) => {
-                    app.dialog()
-                        .message(format!("Failed to install update: {}", e))
-                        .kind(MessageDialogKind::Error)
-                        .title("Update Failed")
-                        .blocking_show();
+                    error_dialog(&app, "Update Failed", format!("Failed to install update: {}", e));
                 }
             }
         }
@@ -403,4 +373,12 @@ async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater:
     }
 
     Ok(())
+}
+
+fn error_dialog(app: &tauri::AppHandle, title: impl Into<String>, message: impl Into<String>) {
+    app.dialog()
+        .message(message.into())
+        .kind(MessageDialogKind::Error)
+        .title(title.into())
+        .blocking_show();
 }
