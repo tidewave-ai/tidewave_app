@@ -27,6 +27,7 @@ dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
 which = "8.0"
+portable-pty = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase"] }

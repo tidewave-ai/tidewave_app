@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tidewave Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1e1e1e;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+        }
+
+        #container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #status-bar {
+            background-color: #007acc;
+            color: white;
+            padding: 8px 16px;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        #status-bar.connecting {
+            background-color: #f39c12;
+        }
+
+        #status-bar.disconnected {
+            background-color: #e74c3c;
+        }
+
+        #status-text {
+            font-weight: 500;
+        }
+
+        #terminal-container {
+            flex: 1;
+            padding: 10px;
+            overflow: hidden;
+        }
+
+        #terminal {
+            width: 100%;
+            height: 100%;
+        }
+
+        .connection-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #2ecc71;
+            display: inline-block;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .connecting .connection-indicator {
+            background-color: #f39c12;
+        }
+
+        .disconnected .connection-indicator {
+            background-color: #e74c3c;
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .error-message {
+            color: #e74c3c;
+            padding: 20px;
+            text-align: center;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="status-bar" class="connecting">
+            <div>
+                <span class="connection-indicator"></span>
+                <span id="status-text">Connecting to terminal...</span>
+            </div>
+            <div id="info-text">Tidewave Web Terminal</div>
+        </div>
+        <div id="terminal-container">
+            <div id="terminal"></div>
+        </div>
+        <div id="error" class="error-message"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script>
+        // Initialize xterm.js
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4',
+                cursor: '#d4d4d4',
+                black: '#000000',
+                red: '#cd3131',
+                green: '#0dbc79',
+                yellow: '#e5e510',
+                blue: '#2472c8',
+                magenta: '#bc3fbc',
+                cyan: '#11a8cd',
+                white: '#e5e5e5',
+                brightBlack: '#666666',
+                brightRed: '#f14c4c',
+                brightGreen: '#23d18b',
+                brightYellow: '#f5f543',
+                brightBlue: '#3b8eea',
+                brightMagenta: '#d670d6',
+                brightCyan: '#29b8db',
+                brightWhite: '#ffffff'
+            },
+            allowProposedApi: true
+        });
+
+        // Initialize fit addon
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+
+        // Open terminal in DOM
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        // Status elements
+        const statusBar = document.getElementById('status-bar');
+        const statusText = document.getElementById('status-text');
+        const errorDiv = document.getElementById('error');
+
+        // WebSocket connection
+        let ws = null;
+        let isConnected = false;
+
+        function updateStatus(status, text) {
+            statusBar.className = status;
+            statusText.textContent = text;
+        }
+
+        function showError(message) {
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            document.getElementById('terminal-container').style.display = 'none';
+        }
+
+        function connect() {
+            // Determine WebSocket URL based on current location
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/terminal/ws`;
+
+            updateStatus('connecting', 'Connecting to terminal...');
+
+            try {
+                ws = new WebSocket(wsUrl);
+            } catch (e) {
+                updateStatus('disconnected', 'Connection failed');
+                showError('Failed to create WebSocket connection: ' + e.message);
+                return;
+            }
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                isConnected = true;
+                updateStatus('', 'Connected');
+                errorDiv.style.display = 'none';
+                document.getElementById('terminal-container').style.display = 'block';
+
+                // Focus terminal
+                term.focus();
+            };
+
+            ws.onmessage = (event) => {
+                // Handle both text and binary messages
+                if (event.data instanceof Blob) {
+                    // Binary data
+                    event.data.arrayBuffer().then(buffer => {
+                        const uint8Array = new Uint8Array(buffer);
+                        term.write(uint8Array);
+                    });
+                } else if (typeof event.data === 'string') {
+                    // Text data
+                    term.write(event.data);
+                } else {
+                    console.warn('Unknown message type:', typeof event.data);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('disconnected', 'Connection error');
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                isConnected = false;
+                updateStatus('disconnected', 'Disconnected from terminal');
+
+                // Show reconnect message in terminal
+                term.write('\r\n\x1b[31mConnection closed.\x1b[0m\r\n');
+            };
+        }
+
+        // Send terminal input to WebSocket
+        term.onData((data) => {
+            if (ws && isConnected && ws.readyState === WebSocket.OPEN) {
+                ws.send(data);
+            }
+        });
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            fitAddon.fit();
+        });
+
+        // Handle terminal resize to send PTY resize (future enhancement)
+        term.onResize((size) => {
+            console.log(`Terminal resized to ${size.cols}x${size.rows}`);
+            // TODO: Send resize message to server to resize PTY
+            // This would require implementing a message protocol
+        });
+
+        // Connect on load
+        connect();
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+    </script>
+</body>
+</html>

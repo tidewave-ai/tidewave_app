@@ -212,6 +212,11 @@ pub async fn serve_http_server_with_shutdown(
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state);
 
+    // Create terminal routes
+    let terminal_routes = Router::new()
+        .route("/terminal", get(serve_terminal_html))
+        .route("/terminal/ws", get(crate::terminal::terminal_ws_handler));
+
     // Create the main app without state
     let app = Router::new()
         .route("/", get(root))
@@ -230,6 +235,7 @@ pub async fn serve_http_server_with_shutdown(
         )
         .merge(mcp_routes)
         .merge(acp_routes)
+        .merge(terminal_routes)
         .layer(middleware::from_fn(move |mut req: Request, next| {
             req.extensions_mut().insert(server_config.clone());
             verify_origin(req, next)
@@ -820,4 +826,8 @@ async fn root() -> Html<String> {
     );
 
     Html(html)
+}
+
+async fn serve_terminal_html() -> Html<&'static str> {
+    Html(include_str!("../static/terminal.html"))
 }
