@@ -16,6 +16,11 @@ struct ServerState {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
+struct PortState {
+    port: u16,
+    https_port: Option<u16>,
+}
+
 const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
 # If you change this file, you must restart Tidewave.
 
@@ -180,6 +185,11 @@ pub fn run() {
                 shutdown_tx,
             });
 
+            app.manage(PortState {
+                port,
+                https_port,
+            });
+
             open_tidewave(&app.handle(), port, https_port);
 
             #[cfg(target_os = "macos")]
@@ -266,8 +276,15 @@ pub fn run() {
 
             Ok(())
         }))
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(port_state) = app_handle.try_state::<PortState>() {
+                    open_tidewave(app_handle, port_state.port, port_state.https_port);
+                }
+            }
+        });
 }
 
 fn open_tidewave(app: &tauri::AppHandle, port: u16, https_port: Option<u16>) {
