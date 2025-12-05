@@ -279,6 +279,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 if let Some(port_state) = app_handle.try_state::<PortState>() {
                     open_tidewave(app_handle, port_state.port, port_state.https_port);
