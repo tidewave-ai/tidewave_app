@@ -514,14 +514,8 @@ async fn read_file_handler(
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
-    let path = Path::new(&payload.path);
-
-    if !path.is_absolute() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     #[cfg(target_os = "windows")]
-    let path_str = if payload.is_wsl {
+    let file_path = if payload.is_wsl {
         match wslpath_to_windows(&payload.path).await {
             Ok(windows_path) => windows_path,
             Err(error) => {
@@ -536,13 +530,13 @@ async fn write_file_handler(
     };
 
     #[cfg(not(target_os = "windows"))]
-    let path_str = payload.path.clone();
+    let file_path = payload.path.clone();
 
     let content = payload.content.clone();
     let bytes_written = content.len();
 
     let result = async {
-        let path = Path::new(&path_str);
+        let path = Path::new(&file_path);
 
         let parent_path = path.parent().unwrap_or_else(|| &path);
         if !parent_path.exists() {
@@ -555,7 +549,7 @@ async fn write_file_handler(
             .await
             .map_err(|e| e.kind().to_string())?;
 
-        let mtime = fetch_mtime(path_str)?;
+        let mtime = fetch_mtime(file_path)?;
         Ok::<_, String>(mtime)
     }
     .await;
