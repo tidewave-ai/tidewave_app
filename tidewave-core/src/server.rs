@@ -532,6 +532,10 @@ async fn write_file_handler(
     #[cfg(not(target_os = "windows"))]
     let file_path = payload.path.clone();
 
+    if !Path::new(&file_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let content = payload.content.clone();
     let bytes_written = content.len();
 
