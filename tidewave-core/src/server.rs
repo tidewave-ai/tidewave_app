@@ -574,12 +574,6 @@ async fn write_file_handler(
 async fn stat_file_handler(
     Query(query): Query<StatFileParams>,
 ) -> Result<Json<StatFileResponse>, StatusCode> {
-    let path = Path::new(&query.path);
-
-    if !path.is_absolute() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     #[cfg(target_os = "windows")]
     let file_path = if query.is_wsl {
         match wslpath_to_windows(&query.path).await {
@@ -597,6 +591,10 @@ async fn stat_file_handler(
 
     #[cfg(not(target_os = "windows"))]
     let file_path = query.path.clone();
+
+    if !Path::new(&file_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let mtime_op = fetch_mtime(file_path);
 
