@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.6 (2025-12-07)
+
+* Fix write and stat endpoints on WSL
+* Reopening the app opens the browser
+* Display error dialog when we can't open url
+
 ## v0.2.5 (2025-12-02)
 
 * Also serve Tidewave at *.localhost if scheme+port matches
