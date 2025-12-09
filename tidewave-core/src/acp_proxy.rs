@@ -1151,10 +1151,10 @@ async fn handle_regular_request(
             }
         }
         // We intercept resume / fork sessions to map the sessionId to the websocket
-        "_claude/session/resume" => {
+        "session/resume" => {
             process_state.resume_request_ids.insert(proxy_id.clone());
         }
-        "_claude/session/fork" => {
+        "session/fork" => {
             process_state.fork_request_ids.insert(proxy_id.clone());
         }
         _ => (),
