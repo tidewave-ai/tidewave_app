@@ -788,11 +788,20 @@ async fn proxy_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn about() -> Json<AboutResponse> {
-    Json(AboutResponse {
+async fn about() -> Result<Response<Body>, StatusCode> {
+    let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+    };
+
+    let json_body = serde_json::to_string(&response_body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Response::builder()
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Content-Type", "application/json")
+        .body(Body::from(json_body))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn root() -> Html<String> {
