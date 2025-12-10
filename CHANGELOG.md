@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.7 (2025-12-10)
+
+* Return CORS headers at /about
+
 ## v0.2.6 (2025-12-07)
 
 * Fix write and stat endpoints on WSL
