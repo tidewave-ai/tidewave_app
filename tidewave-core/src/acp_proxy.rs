@@ -386,7 +386,7 @@ pub struct ProcessState {
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
-    pub resume_request_ids: Arc<DashSet<Value>>,
+    pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
     pub fork_request_ids: Arc<DashSet<Value>>,
 }
 
@@ -422,7 +422,7 @@ impl ProcessState {
             init_request_id: Arc::new(RwLock::new(None)),
             new_request_ids: Arc::new(DashSet::<Value>::new()),
             load_request_ids: Arc::new(DashMap::new()),
-            resume_request_ids: Arc::new(DashSet::<Value>::new()),
+            resume_request_ids: Arc::new(DashMap::new()),
             fork_request_ids: Arc::new(DashSet::<Value>::new()),
         }
     }
@@ -1152,7 +1152,11 @@ async fn handle_regular_request(
         }
         // We intercept resume / fork sessions to map the sessionId to the websocket
         "session/resume" => {
-            process_state.resume_request_ids.insert(proxy_id.clone());
+            if let Some(session_id) = session_id {
+                process_state
+                    .resume_request_ids
+                    .insert(proxy_id.clone(), session_id);
+            }
         }
         "session/fork" => {
             process_state.fork_request_ids.insert(proxy_id.clone());
@@ -1511,7 +1515,7 @@ async fn handle_process_response(
 
         // Handle special response types
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        maybe_handle_failed_session_load(
+        maybe_handle_session_load_resume(
             process_state,
             state,
             websocket_id,
@@ -1564,15 +1568,19 @@ async fn maybe_handle_init_response(
     }
 }
 
-/// Handle load response - check if successful and kill session
-async fn maybe_handle_failed_session_load(
+/// Handle load/resume response - check if successful and kill session
+async fn maybe_handle_session_load_resume(
     process_state: &Arc<ProcessState>,
     state: &AcpProxyState,
     websocket_id: WebSocketId,
     response: &JsonRpcResponse,
     client_response: &JsonRpcResponse,
 ) -> Result<()> {
-    if let Some((_proxy_id, session_id)) = process_state.load_request_ids.remove(&response.id) {
+    if let Some((_proxy_id, session_id)) = process_state
+        .load_request_ids
+        .remove(&response.id)
+        .or_else(|| process_state.resume_request_ids.remove(&response.id))
+    {
         if let Some(_) = &client_response.error {
             info!("Failed to load session, removing mapping! {}", session_id);
             state.sessions.remove(&session_id);
@@ -1586,6 +1594,9 @@ async fn maybe_handle_failed_session_load(
                 "Failed to load session, removing mapping! {}",
                 session_id
             ));
+        } else {
+            // Successful load or resume
+            map_session_id_to_websocket(state, session_id, websocket_id).await;
         }
     }
 
@@ -1600,47 +1611,45 @@ async fn maybe_handle_session_new_response(
     client_response: &JsonRpcResponse,
     websocket_id: WebSocketId,
 ) {
-    // check if new / resume or fork
+    // check if new or fork
     if let Some(_) = process_state
         .new_request_ids
         .remove(&response.id)
-        .or_else(|| {
-            process_state
-                .resume_request_ids
-                .remove(&response.id)
-                .or_else(|| process_state.fork_request_ids.remove(&response.id))
-        })
+        .or_else(|| process_state.fork_request_ids.remove(&response.id))
     {
         if let Some(result) = &client_response.result {
             if let Ok(session_response) =
                 serde_json::from_value::<NewSessionResponse>(result.clone())
             {
-                // Check if this sessionId is new (not already in our session mappings)
-                if !state.sessions.contains_key(&session_response.session_id) {
-                    let process_key = find_process_key_for_websocket(state, websocket_id).await;
-
-                    if let Some(process_key) = process_key {
-                        // Create session state
-                        let session_state = Arc::new(SessionState::new(process_key));
-
-                        state
-                            .sessions
-                            .insert(session_response.session_id.clone(), session_state);
-
-                        // Map session to websocket
-                        state
-                            .session_to_websocket
-                            .insert(session_response.session_id, websocket_id);
-                    }
-                } else {
-                    // Session already exists (e.g., from session/load), update model state
-                    warn!(
-                        "Unexpectedly got new session response for already known session! {}",
-                        session_response.session_id
-                    );
-                }
+                map_session_id_to_websocket(state, session_response.session_id, websocket_id).await;
             }
         }
+    }
+}
+
+async fn map_session_id_to_websocket(
+    state: &AcpProxyState,
+    session_id: SessionId,
+    websocket_id: WebSocketId,
+) {
+    // Check if this sessionId is new (not already in our session mappings)
+    if !state.sessions.contains_key(&session_id) {
+        let process_key = find_process_key_for_websocket(state, websocket_id).await;
+
+        if let Some(process_key) = process_key {
+            // Create session state
+            let session_state = Arc::new(SessionState::new(process_key));
+
+            state.sessions.insert(session_id.clone(), session_state);
+
+            // Map session to websocket
+            state.session_to_websocket.insert(session_id, websocket_id);
+        }
+    } else {
+        warn!(
+            "Unexpectedly got new/load/fork session response for already known session! {}",
+            session_id
+        );
     }
 }
 
