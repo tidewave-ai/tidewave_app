@@ -1,8 +1,8 @@
-use crate::command::create_shell_command;
+use crate::command::{create_shell_command, kill_process_group};
 use crate::config::Config;
 use axum::{
     body::{Body, Bytes},
-    extract::{Json, Query, Request},
+    extract::{Json, Query, Request, State},
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use bytes::BytesMut;
+use dashmap::DashMap;
 use reqwest::{Client, Url};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
@@ -18,8 +19,9 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use tokio::{io::AsyncReadExt, net::TcpListener};
+use tokio::{io::AsyncReadExt, net::TcpListener, process::Child, sync::RwLock};
 use tracing::{debug, error, info};
 use which;
 
@@ -127,6 +129,21 @@ struct ServerConfig {
     https_port: Option<u16>,
 }
 
+/// State for tracking running shell processes
+#[derive(Clone)]
+pub struct ShellState {
+    /// Active shell processes (pid -> child process)
+    pub processes: Arc<DashMap<u32, Arc<RwLock<Option<Child>>>>>,
+}
+
+impl ShellState {
+    pub fn new() -> Self {
+        Self {
+            processes: Arc::new(DashMap::new()),
+        }
+    }
+}
+
 pub async fn start_http_server(
     config: Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -177,6 +194,7 @@ pub async fn serve_http_server_with_shutdown(
     let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
     let acp_state = crate::acp_proxy::AcpProxyState::new();
+    let shell_state = ShellState::new();
 
     // Build allowed origins for both HTTP and HTTPS
     let mut allowed_origins = config.allowed_origins.clone();
@@ -212,11 +230,15 @@ pub async fn serve_http_server_with_shutdown(
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state.clone());
 
+    // Create shell routes
+    let shell_routes = Router::new()
+        .route("/shell", post(shell_handler))
+        .with_state(shell_state.clone());
+
     // Create the main app without state
     let app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
-        .route("/shell", post(shell_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
@@ -230,6 +252,7 @@ pub async fn serve_http_server_with_shutdown(
         )
         .merge(mcp_routes)
         .merge(acp_routes)
+        .merge(shell_routes)
         .layer(middleware::from_fn(move |mut req: Request, next| {
             req.extensions_mut().insert(server_config.clone());
             verify_origin(req, next)
@@ -287,13 +310,28 @@ pub async fn serve_http_server_with_shutdown(
     // Kill all ACP processes via their exit channels.
     // Note: We use the exit_tx channel instead of directly killing, because
     // the exit monitor task holds the child write lock while waiting.
-    let process_count = acp_state.processes.len();
-    debug!("Found {} processes to clean up", process_count);
+    let acp_process_count = acp_state.processes.len();
+    debug!("Found {} ACP processes to clean up", acp_process_count);
 
     for entry in acp_state.processes.iter() {
         let process_state = entry.value();
         if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
             let _ = exit_tx.send(());
+        }
+    }
+
+    // Kill all shell processes
+    let shell_process_count = shell_state.processes.len();
+    debug!("Found {} shell processes to clean up", shell_process_count);
+
+    for entry in shell_state.processes.iter() {
+        let pid = entry.key();
+        let child_holder = entry.value();
+        if let Some(mut child) = child_holder.write().await.take() {
+            debug!("Killing shell process with PID: {}", pid);
+            if let Err(e) = kill_process_group(&mut child).await {
+                error!("Failed to kill shell process {}: {}", pid, e);
+            }
         }
     }
 
@@ -372,6 +410,7 @@ fn shell_error(message: &str) -> (StatusCode, Json<ShellError>) {
 }
 
 async fn shell_handler(
+    State(state): State<ShellState>,
     Json(payload): Json<ShellParams>,
 ) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let cwd = payload.cwd.unwrap_or(".".to_string());
@@ -397,6 +436,17 @@ async fn shell_handler(
             .ok_or_else(|| shell_error("Failed to get process stderr"))?,
     );
 
+    // Track the process in state for cleanup on shutdown
+    let pid = child
+        .id()
+        .ok_or_else(|| shell_error("Failed to get process PID"))?;
+    let child_holder = Arc::new(RwLock::new(Some(child)));
+    state.processes.insert(pid, child_holder.clone());
+    debug!("Registered shell process with PID: {}", pid);
+
+    // Clone for cleanup in the stream
+    let state_for_cleanup = state.clone();
+
     let stream = async_stream::stream! {
         let (mut stdout_buf, mut stderr_buf) = (vec![0u8; 4096], vec![0u8; 4096]);
 
@@ -420,9 +470,26 @@ async fn shell_handler(
             }
         }
 
-        match child.wait().await {
-            Ok(status) => yield Ok(create_status_chunk(status.code().unwrap_or(-1))),
-            Err(e) => yield Err(e),
+        // Wait for the child to exit
+        let status = if let Some(mut child) = child_holder.write().await.take() {
+            match child.wait().await {
+                Ok(status) => Some(status.code().unwrap_or(-1)),
+                Err(e) => {
+                    yield Err(e);
+                    None
+                }
+            }
+        } else {
+            // Child was killed during shutdown
+            None
+        };
+
+        // Unregister from state
+        state_for_cleanup.processes.remove(&pid);
+        debug!("Unregistered shell process with PID: {}", pid);
+
+        if let Some(code) = status {
+            yield Ok(create_status_chunk(code));
         }
     };
 

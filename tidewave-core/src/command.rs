@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tracing::debug;
 
 fn command_with_limited_env(program: &str) -> Command {
     let mut command = Command::new(program);
@@ -73,4 +74,31 @@ pub fn create_shell_command(
             .process_group(0);
         command
     }
+}
+
+/// Kills the process and all its children by killing the process group.
+/// On Unix, we use kill(-pgid, SIGKILL) to kill the entire process group.
+/// On Windows, we fall back to just killing the child process.
+#[cfg(unix)]
+pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
+    if let Some(pid) = child.id() {
+        debug!("Killing process group with PGID: {}", pid);
+        // Kill the entire process group (negative PID means process group)
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if result == 0 {
+            // Wait for the child to be reaped
+            let _ = child.wait().await;
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    } else {
+        // Process already exited
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
+    child.kill().await
 }
