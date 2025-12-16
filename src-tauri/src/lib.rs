@@ -138,14 +138,6 @@ pub fn run() {
             let port = config.port;
             let https_port = config.https_port;
 
-            let listener = match tidewave_core::bind_http_server(config.clone()).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    error_dialog(&app.handle(), "Error", format!("Failed to bind HTTP server: {}", e));
-                    std::process::exit(1);
-                }
-            };
-
             // Create shutdown signal channel
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -159,7 +151,7 @@ pub fn run() {
                     let _ = shutdown_rx.changed().await;
                 };
 
-                if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, listener, shutdown_signal).await {
+                if let Err(e) = tidewave_core::serve_http_server_with_shutdown(server_config, shutdown_signal).await {
                     error_dialog(&app_handle_for_server, "Error", format!("HTTP server error: {}", e));
                     app_handle_for_server.exit(1);
                 }
