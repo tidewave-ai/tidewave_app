@@ -147,6 +147,22 @@ pub async fn serve_http_server_with_shutdown(
     config: Config,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_inner(config, None, shutdown_signal).await
+}
+
+pub async fn serve_http_server_with_listener(
+    config: Config,
+    listener: tokio::net::TcpListener,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_inner(config, Some(listener), shutdown_signal).await
+}
+
+async fn serve_http_server_inner(
+    config: Config,
+    listener: Option<tokio::net::TcpListener>,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
@@ -154,7 +170,13 @@ pub async fn serve_http_server_with_shutdown(
 
     let http_addr = get_bind_addr(config.port, config.allow_remote_access);
     let http_handle = axum_server::Handle::new();
-    let port = config.port;
+
+    // Determine the port - if listener provided, use its port; otherwise use config
+    let port = if let Some(ref listener) = listener {
+        listener.local_addr()?.port()
+    } else {
+        config.port
+    };
 
     let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
@@ -253,12 +275,22 @@ pub async fn serve_http_server_with_shutdown(
 
     // Start HTTP server
     let http_handle_clone = http_handle.clone();
-    let http_task = tokio::spawn(async move {
-        axum_server::bind(http_addr)
-            .handle(http_handle_clone)
-            .serve(app.into_make_service())
-            .await
-    });
+    let http_task = if let Some(listener) = listener {
+        let std_listener = listener.into_std()?;
+        tokio::spawn(async move {
+            axum_server::from_tcp(std_listener)
+                .handle(http_handle_clone)
+                .serve(app.into_make_service())
+                .await
+        })
+    } else {
+        tokio::spawn(async move {
+            axum_server::bind(http_addr)
+                .handle(http_handle_clone)
+                .serve(app.into_make_service())
+                .await
+        })
+    };
 
     // Spawn shutdown handler that triggers graceful shutdown with timeout
     tokio::spawn({

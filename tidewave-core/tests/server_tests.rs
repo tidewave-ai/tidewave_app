@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use tidewave_core::config::Config;
-use tidewave_core::server::serve_http_server_with_shutdown;
+use tidewave_core::server::serve_http_server_with_listener;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -26,7 +26,7 @@ async fn start_test_server(allowed_origins: Vec<String>) -> (u16, oneshot::Sende
 
     // Start the server in a background task
     tokio::spawn(async move {
-        serve_http_server_with_shutdown(config, listener, async {
+        serve_http_server_with_listener(config, listener, async {
             shutdown_rx.await.ok();
         })
         .await
