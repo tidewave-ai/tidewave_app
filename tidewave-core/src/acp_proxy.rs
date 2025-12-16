@@ -168,6 +168,37 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // ============================================================================
+// Process Group Kill Helper
+// ============================================================================
+
+/// Kills the process and all its children by killing the process group.
+/// On Unix, we use kill(-pgid, SIGKILL) to kill the entire process group.
+/// On Windows, we fall back to just killing the child process.
+#[cfg(unix)]
+async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
+    if let Some(pid) = child.id() {
+        debug!("Killing process group with PGID: {}", pid);
+        // Kill the entire process group (negative PID means process group)
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if result == 0 {
+            // Wait for the child to be reaped
+            let _ = child.wait().await;
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    } else {
+        // Process already exited
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
+    child.kill().await
+}
+
+// ============================================================================
 // Version
 // ============================================================================
 
@@ -1378,8 +1409,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                     // Received exit signal
                     _ = exit_rx.recv() => {
                         debug!("Exit signal received for process: {}", process_state_exit.key);
-                        // Kill the process
-                        if let Err(e) = child.kill().await {
+                        // Kill the process and all its children
+                        if let Err(e) = kill_process_group(child).await {
                             error!("Failed to kill process {}: {}", process_state_exit.key, e);
                         } else {
                             debug!("Successfully killed process: {}", process_state_exit.key);

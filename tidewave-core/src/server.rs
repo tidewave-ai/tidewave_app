@@ -210,7 +210,7 @@ pub async fn serve_http_server_with_shutdown(
     // Create ACP routes
     let acp_routes = Router::new()
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state);
+        .with_state(acp_state.clone());
 
     // Create the main app without state
     let app = Router::new()
@@ -283,6 +283,19 @@ pub async fn serve_http_server_with_shutdown(
         https_result??;
     }
     http_result??;
+
+    // Kill all ACP processes via their exit channels.
+    // Note: We use the exit_tx channel instead of directly killing, because
+    // the exit monitor task holds the child write lock while waiting.
+    let process_count = acp_state.processes.len();
+    debug!("Found {} processes to clean up", process_count);
+
+    for entry in acp_state.processes.iter() {
+        let process_state = entry.value();
+        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+            let _ = exit_tx.send(());
+        }
+    }
 
     Ok(())
 }
@@ -794,8 +807,8 @@ async fn about() -> Result<Response<Body>, StatusCode> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    let json_body = serde_json::to_string(&response_body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let json_body =
+        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Response::builder()
         .header("Access-Control-Allow-Origin", "*")

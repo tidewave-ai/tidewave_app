@@ -63,12 +63,14 @@ pub fn create_shell_command(
     #[cfg(not(target_os = "windows"))]
     {
         // Unix case: use .current_dir()
+        // Also create a new process group so we can kill all descendants
         let mut command = command_with_limited_env("sh");
         command
             .arg("-c")
             .arg(cmd)
             .envs(env)
-            .current_dir(Path::new(cwd));
+            .current_dir(Path::new(cwd))
+            .process_group(0);
         command
     }
 }
