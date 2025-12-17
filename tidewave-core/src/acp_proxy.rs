@@ -137,7 +137,7 @@ Because of this, we don't use the ACP SDK in the browser, but instead handle raw
 JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
 any requests to the new connection.
 */
-use crate::command::{create_shell_command, kill_process_tree, spawn_command, ChildProcess};
+use crate::command::{create_shell_command, spawn_command, ChildProcess};
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{
@@ -1379,12 +1379,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                     // Received exit signal
                     _ = exit_rx.recv() => {
                         debug!("Exit signal received for process: {}", process_state_exit.key);
-                        // Kill the process and all its children
-                        if let Err(e) = kill_process_tree(process).await {
-                            error!("Failed to kill process {}: {}", process_state_exit.key, e);
-                        } else {
-                            debug!("Successfully killed process: {}", process_state_exit.key);
-                        }
+                        // Take ownership and drop to kill the process tree via ChildProcess::Drop
+                        child_guard.take();
                         ("exit_requested", "ACP process was stopped by exit request".to_string())
                     }
                 }

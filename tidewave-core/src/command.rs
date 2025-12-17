@@ -40,6 +40,35 @@ impl ChildProcess {
     }
 }
 
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        // Only kill if the process is still running
+        if let Some(pid) = self.child.id() {
+            debug!("ChildProcess dropped, killing process tree for PID {}", pid);
+
+            #[cfg(windows)]
+            {
+                // On Windows, terminate the job object synchronously
+                if let Some(ref job) = self.job_handle {
+                    unsafe {
+                        winapi::um::jobapi2::TerminateJobObject(job.0, 1);
+                    }
+                }
+                // Also try to kill the main process
+                let _ = self.child.start_kill();
+            }
+
+            #[cfg(unix)]
+            {
+                // On Unix, kill the process group synchronously
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 fn command_with_limited_env(program: &str) -> Command {
     let mut command = Command::new(program);
     command
@@ -185,50 +214,4 @@ pub fn spawn_command(mut command: Command) -> std::io::Result<ChildProcess> {
 pub fn spawn_command(mut command: Command) -> std::io::Result<ChildProcess> {
     let child = command.spawn()?;
     Ok(ChildProcess { child })
-}
-
-/// Kills the process and all its children.
-/// On Windows with a job object, terminates the entire job.
-/// On Unix, kills the entire process group.
-#[cfg(windows)]
-pub async fn kill_process_tree(process: &mut ChildProcess) -> std::io::Result<()> {
-    use winapi::um::jobapi2::TerminateJobObject;
-
-    let pid = process.child.id();
-    debug!("Killing process tree for PID: {:?}", pid);
-
-    // If we have a job handle, terminate the job (kills all processes in it)
-    if let Some(ref job) = process.job_handle {
-        debug!("Terminating job object");
-        unsafe {
-            TerminateJobObject(job.0, 1);
-        }
-    }
-
-    // Also kill the main process directly to be sure
-    let _ = process.child.kill().await;
-
-    // Wait for the child to be reaped
-    let _ = process.child.wait().await;
-    debug!("Process tree killed");
-    Ok(())
-}
-
-#[cfg(unix)]
-pub async fn kill_process_tree(process: &mut ChildProcess) -> std::io::Result<()> {
-    if let Some(pid) = process.child.id() {
-        debug!("Killing process group with PGID: {}", pid);
-        // Kill the entire process group (negative PID means process group)
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if result == 0 {
-            // Wait for the child to be reaped
-            let _ = process.child.wait().await;
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    } else {
-        // Process already exited
-        Ok(())
-    }
 }

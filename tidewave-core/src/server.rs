@@ -1,4 +1,4 @@
-use crate::command::{create_shell_command, kill_process_tree, spawn_command, ChildProcess};
+use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use axum::{
     body::{Body, Bytes},
@@ -401,26 +401,6 @@ fn shell_error(message: &str) -> (StatusCode, Json<ShellError>) {
     )
 }
 
-/// Guard that kills the shell process when dropped (e.g., on client disconnect)
-struct ShellProcessGuard {
-    child_holder: Arc<std::sync::Mutex<Option<ChildProcess>>>,
-}
-
-impl Drop for ShellProcessGuard {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.child_holder.lock() {
-            if let Some(mut process) = guard.take() {
-                if let Some(pid) = process.id() {
-                    debug!("ShellProcessGuard dropped, killing process {}", pid);
-                }
-                tokio::spawn(async move {
-                    let _ = kill_process_tree(&mut process).await;
-                });
-            }
-        }
-    }
-}
-
 async fn shell_handler(
     Json(payload): Json<ShellParams>,
 ) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
@@ -448,16 +428,14 @@ async fn shell_handler(
             .ok_or_else(|| shell_error("Failed to get process stderr"))?,
     );
 
-    let child_holder = Arc::new(std::sync::Mutex::new(Some(process)));
-
-    // Guard kills the process when dropped (e.g., on client disconnect)
-    let guard = ShellProcessGuard {
-        child_holder: child_holder.clone(),
-    };
+    // Wrap process in Arc<Mutex<Option>> so we can take it out at the end.
+    // If stream is dropped early, the ChildProcess::Drop will kill the process tree.
+    let process_holder = Arc::new(std::sync::Mutex::new(Some(process)));
+    let process_holder_clone = process_holder.clone();
 
     let stream = async_stream::stream! {
-        // Hold the guard in the stream so it lives as long as the stream
-        let _guard = guard;
+        // Hold reference to process_holder so ChildProcess lives as long as stream
+        let _process_holder = process_holder_clone;
 
         let (mut stdout_buf, mut stderr_buf) = (vec![0u8; 4096], vec![0u8; 4096]);
 
@@ -481,9 +459,8 @@ async fn shell_handler(
             }
         }
 
-        // Take the process to wait on it (prevents Drop from killing it)
-        // We must drop the guard before awaiting to satisfy Send bounds
-        let process_opt = child_holder.lock().ok().and_then(|mut g| g.take());
+        // Take the process to wait on it (prevents Drop from killing it since process completed normally)
+        let process_opt = _process_holder.lock().ok().and_then(|mut g| g.take());
         let status = if let Some(mut process) = process_opt {
             match process.wait().await {
                 Ok(status) => Some(status.code().unwrap_or(-1)),
