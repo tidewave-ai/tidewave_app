@@ -462,7 +462,7 @@ async fn shell_handler(
         // Take the process to wait on it (prevents Drop from killing it since process completed normally)
         let process_opt = _process_holder.lock().ok().and_then(|mut g| g.take());
         let status = if let Some(mut process) = process_opt {
-            match process.wait().await {
+            match process.child.wait().await {
                 Ok(status) => Some(status.code().unwrap_or(-1)),
                 Err(e) => {
                     yield Err(e);

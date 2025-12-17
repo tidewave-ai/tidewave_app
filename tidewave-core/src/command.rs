@@ -28,18 +28,6 @@ impl Drop for JobHandle {
     }
 }
 
-impl ChildProcess {
-    /// Get the process ID
-    pub fn id(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    /// Wait for the child process to exit
-    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
-    }
-}
-
 impl Drop for ChildProcess {
     fn drop(&mut self) {
         // Only kill if the process is still running
