@@ -36,7 +36,9 @@ impl Drop for ChildProcess {
 
             #[cfg(windows)]
             {
-                // On Windows, terminate the job object synchronously
+                // Explicitly terminate the job object to kill all child processes.
+                // Note: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE would also kill processes when
+                // JobHandle::Drop calls CloseHandle, but we terminate explicitly for clarity.
                 if let Some(ref job) = self.job_handle {
                     unsafe {
                         winapi::um::jobapi2::TerminateJobObject(job.0, 1);
