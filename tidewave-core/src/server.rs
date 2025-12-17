@@ -1,4 +1,4 @@
-use crate::command::{create_shell_command, kill_process_group};
+use crate::command::{create_shell_command, kill_process_tree, spawn_command, ChildProcess};
 use crate::config::Config;
 use axum::{
     body::{Body, Bytes},
@@ -20,7 +20,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::{io::AsyncReadExt, process::Child};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info};
 use which;
 
@@ -403,18 +403,18 @@ fn shell_error(message: &str) -> (StatusCode, Json<ShellError>) {
 
 /// Guard that kills the shell process when dropped (e.g., on client disconnect)
 struct ShellProcessGuard {
-    child_holder: Arc<std::sync::Mutex<Option<Child>>>,
+    child_holder: Arc<std::sync::Mutex<Option<ChildProcess>>>,
 }
 
 impl Drop for ShellProcessGuard {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.child_holder.lock() {
-            if let Some(mut child) = guard.take() {
-                if let Some(pid) = child.id() {
+            if let Some(mut process) = guard.take() {
+                if let Some(pid) = process.id() {
                     debug!("ShellProcessGuard dropped, killing process {}", pid);
                 }
                 tokio::spawn(async move {
-                    let _ = kill_process_group(&mut child).await;
+                    let _ = kill_process_tree(&mut process).await;
                 });
             }
         }
@@ -430,24 +430,25 @@ async fn shell_handler(
     let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
 
     let mut stdout = Some(
-        child
+        process
+            .child
             .stdout
             .take()
             .ok_or_else(|| shell_error("Failed to get process stdout"))?,
     );
     let mut stderr = Some(
-        child
+        process
+            .child
             .stderr
             .take()
             .ok_or_else(|| shell_error("Failed to get process stderr"))?,
     );
 
-    let child_holder = Arc::new(std::sync::Mutex::new(Some(child)));
+    let child_holder = Arc::new(std::sync::Mutex::new(Some(process)));
 
     // Guard kills the process when dropped (e.g., on client disconnect)
     let guard = ShellProcessGuard {
@@ -480,11 +481,11 @@ async fn shell_handler(
             }
         }
 
-        // Take the child to wait on it (prevents Drop from killing it)
+        // Take the process to wait on it (prevents Drop from killing it)
         // We must drop the guard before awaiting to satisfy Send bounds
-        let child_opt = child_holder.lock().ok().and_then(|mut g| g.take());
-        let status = if let Some(mut child) = child_opt {
-            match child.wait().await {
+        let process_opt = child_holder.lock().ok().and_then(|mut g| g.take());
+        let status = if let Some(mut process) = process_opt {
+            match process.wait().await {
                 Ok(status) => Some(status.code().unwrap_or(-1)),
                 Err(e) => {
                     yield Err(e);
