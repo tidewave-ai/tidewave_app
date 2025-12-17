@@ -232,9 +232,9 @@ pub async fn serve_http_server_with_shutdown(
         .merge(mcp_routes)
         .merge(acp_routes);
 
-    // Add dev mode proxy routes if TIDEWAVE_DEV_MODE=1 and
+    // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
-    if env::var("TIDEWAVE_DEV_MODE").as_deref() == Ok("1") {
+    if env::var("TIDEWAVE_CLIENT_PROXY").as_deref() == Ok("1") {
         if let Ok(client_url) = env::var("TIDEWAVE_CLIENT_URL") {
             for route_path in ["/tidewave", "/tidewave/{*path}"] {
                 let client_url_clone = client_url.clone();
