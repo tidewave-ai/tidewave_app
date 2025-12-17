@@ -232,19 +232,22 @@ pub async fn serve_http_server_with_shutdown(
         .merge(mcp_routes)
         .merge(acp_routes);
 
-    // Add dev mode proxy routes if TIDEWAVE_DEV_MODE is set
-    if let Ok(dev_mode_url) = env::var("TIDEWAVE_DEV_MODE") {
-        for route_path in ["/tidewave", "/tidewave/{*path}"] {
-            let dev_mode_url_clone = dev_mode_url.clone();
-            let client_clone = client.clone();
-            app = app.route(
-                route_path,
-                axum::routing::any(move |req| {
-                    let client = client_clone.clone();
-                    let dev_url = dev_mode_url_clone.clone();
-                    dev_mode_proxy_handler(req, client, dev_url)
-                }),
-            );
+    // Add dev mode proxy routes if TIDEWAVE_DEV_MODE=1 and
+    // TIDEWAVE_CLIENT_URL is set
+    if env::var("TIDEWAVE_DEV_MODE").as_deref() == Ok("1") {
+        if let Ok(client_url) = env::var("TIDEWAVE_CLIENT_URL") {
+            for route_path in ["/tidewave", "/tidewave/{*path}"] {
+                let client_url_clone = client_url.clone();
+                let client_clone = client.clone();
+                app = app.route(
+                    route_path,
+                    axum::routing::any(move |req| {
+                        let client = client_clone.clone();
+                        let dev_url = client_url_clone.clone();
+                        client_proxy_handler(req, client, dev_url)
+                    }),
+                );
+            }
         }
     }
 
@@ -814,10 +817,10 @@ async fn proxy_handler(
     do_proxy(target_url, req, client).await
 }
 
-async fn dev_mode_proxy_handler(
+async fn client_proxy_handler(
     req: Request,
     client: Client,
-    dev_mode_url: String,
+    client_url: String,
 ) -> Result<Response<Body>, StatusCode> {
     let path = req.uri().path();
     let query = req
@@ -825,7 +828,7 @@ async fn dev_mode_proxy_handler(
         .query()
         .map(|q| format!("?{}", q))
         .unwrap_or_default();
-    let target_url = format!("{}{}{}", dev_mode_url, path, query);
+    let target_url = format!("{}{}{}", client_url, path, query);
 
     do_proxy(target_url, req, client).await
 }
@@ -848,7 +851,7 @@ async fn about() -> Result<Response<Body>, StatusCode> {
 
 async fn root(_req: Request) -> Html<String> {
     let client_url =
-        env::var("TIDEWAVE_DEV_MODE").unwrap_or_else(|_| "https://tidewave.ai".to_string());
+        env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
     let html = format!(
         r#"<!DOCTYPE html>
