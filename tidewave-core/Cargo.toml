@@ -29,7 +29,7 @@ anyhow = "1.0"
 which = "8.0"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winbase", "jobapi2", "winnt", "processthreadsapi", "handleapi"] }
+winapi = { version = "0.3", features = ["winbase", "jobapi2", "winnt", "processthreadsapi", "handleapi", "errhandlingapi"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

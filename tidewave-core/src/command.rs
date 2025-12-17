@@ -104,6 +104,7 @@ pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
 pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
     use std::mem;
     use std::ptr;
+    use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::jobapi2::{
         AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
@@ -115,7 +116,7 @@ pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
     };
 
     let Some(pid) = child.id() else {
-        // Process already exited
+        debug!("Process already exited (no PID)");
         return Ok(());
     };
 
@@ -125,9 +126,11 @@ pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
         // Create a job object
         let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
         if job.is_null() {
-            debug!("Failed to create job object, falling back to simple kill");
+            let err = GetLastError();
+            debug!("Failed to create job object (error {}), falling back to simple kill", err);
             return child.kill().await;
         }
+        debug!("Created job object successfully");
 
         // Configure the job to kill all processes when the job is closed
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
@@ -141,40 +144,56 @@ pub async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
         );
 
         if set_result == 0 {
-            debug!("Failed to configure job object, falling back to simple kill");
+            let err = GetLastError();
+            debug!("Failed to configure job object (error {}), falling back to simple kill", err);
             CloseHandle(job);
             return child.kill().await;
         }
+        debug!("Configured job object with KILL_ON_JOB_CLOSE");
 
         // Open a handle to the process
         let process_handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
         if process_handle.is_null() {
-            debug!("Failed to open process handle, falling back to simple kill");
+            let err = GetLastError();
+            debug!("Failed to open process handle (error {}), falling back to simple kill", err);
             CloseHandle(job);
             return child.kill().await;
         }
+        debug!("Opened process handle for PID {}", pid);
 
         // Assign the process to the job
         let assign_result = AssignProcessToJobObject(job, process_handle);
         CloseHandle(process_handle);
 
         if assign_result == 0 {
+            let err = GetLastError();
             // This can fail if the process is already in a job that doesn't allow nesting
             debug!(
-                "Failed to assign process to job object, falling back to simple kill"
+                "Failed to assign process to job object (error {}), falling back to simple kill",
+                err
             );
             CloseHandle(job);
             return child.kill().await;
         }
+        debug!("Assigned process {} to job object", pid);
 
         // Terminate all processes in the job
-        TerminateJobObject(job, 1);
+        let terminate_result = TerminateJobObject(job, 1);
+        if terminate_result == 0 {
+            let err = GetLastError();
+            debug!("TerminateJobObject failed (error {})", err);
+        } else {
+            debug!("TerminateJobObject succeeded");
+        }
 
         // Close the job handle (this also triggers KILL_ON_JOB_CLOSE)
         CloseHandle(job);
+        debug!("Closed job handle");
     }
 
     // Wait for the child to be reaped
+    debug!("Waiting for child process to exit");
     let _ = child.wait().await;
+    debug!("Child process exited");
     Ok(())
 }
