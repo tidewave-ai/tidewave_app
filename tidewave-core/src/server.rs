@@ -213,7 +213,8 @@ pub async fn serve_http_server_with_shutdown(
         .with_state(acp_state);
 
     // Create the main app without state
-    let app = Router::new()
+    let client_for_proxy = client.clone();
+    let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
         .route("/shell", post(shell_handler))
@@ -224,16 +225,36 @@ pub async fn serve_http_server_with_shutdown(
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
-                let client = client.clone();
+                let client = client_for_proxy.clone();
                 proxy_handler(params, req, client)
             }),
         )
         .merge(mcp_routes)
-        .merge(acp_routes)
-        .layer(middleware::from_fn(move |mut req: Request, next| {
-            req.extensions_mut().insert(server_config.clone());
-            verify_origin(req, next)
-        }));
+        .merge(acp_routes);
+
+    // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
+    // TIDEWAVE_CLIENT_URL is set
+    if env::var("TIDEWAVE_CLIENT_PROXY").as_deref() == Ok("1") {
+        if let Ok(client_url) = env::var("TIDEWAVE_CLIENT_URL") {
+            for route_path in ["/tidewave", "/tidewave/{*path}"] {
+                let client_url_clone = client_url.clone();
+                let client_clone = client.clone();
+                app = app.route(
+                    route_path,
+                    axum::routing::any(move |req| {
+                        let client = client_clone.clone();
+                        let dev_url = client_url_clone.clone();
+                        client_proxy_handler(req, client, dev_url)
+                    }),
+                );
+            }
+        }
+    }
+
+    let app = app.layer(middleware::from_fn(move |mut req: Request, next| {
+        req.extensions_mut().insert(server_config.clone());
+        verify_origin(req, next)
+    }));
 
     // Start HTTP server
     let http_task = {
@@ -675,19 +696,11 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn proxy_handler(
-    Query(params): Query<ProxyParams>,
+async fn do_proxy(
+    target_url: String,
     req: Request,
     client: Client,
 ) -> Result<Response<Body>, StatusCode> {
-    let target_url = params.url;
-
-    // Ensure the URL is valid
-    if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
-        debug!("Invalid URL: {}", target_url);
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     debug!("Proxying {} request to: {}", req.method(), target_url);
 
     let method = req.method().clone();
@@ -788,14 +801,46 @@ async fn proxy_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn proxy_handler(
+    Query(params): Query<ProxyParams>,
+    req: Request,
+    client: Client,
+) -> Result<Response<Body>, StatusCode> {
+    let target_url = params.url;
+
+    // Ensure the URL is valid
+    if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
+        debug!("Invalid URL: {}", target_url);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    do_proxy(target_url, req, client).await
+}
+
+async fn client_proxy_handler(
+    req: Request,
+    client: Client,
+    client_url: String,
+) -> Result<Response<Body>, StatusCode> {
+    let path = req.uri().path();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+    let target_url = format!("{}{}{}", client_url, path, query);
+
+    do_proxy(target_url, req, client).await
+}
+
 async fn about() -> Result<Response<Body>, StatusCode> {
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    let json_body = serde_json::to_string(&response_body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let json_body =
+        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Response::builder()
         .header("Access-Control-Allow-Origin", "*")
@@ -804,7 +849,7 @@ async fn about() -> Result<Response<Body>, StatusCode> {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn root() -> Html<String> {
+async fn root(_req: Request) -> Html<String> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 

@@ -206,10 +206,7 @@ allowed_origins = ["https://example.com", "https://app.example.com"]
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.port, 8080);
         assert_eq!(config.allowed_origins.len(), 2);
-        assert_eq!(
-            config.allowed_origins[0],
-            "https://example.com".to_string()
-        );
+        assert_eq!(config.allowed_origins[0], "https://example.com".to_string());
         assert_eq!(
             config.allowed_origins[1],
             "https://app.example.com".to_string()
