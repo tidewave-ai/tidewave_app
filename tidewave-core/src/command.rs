@@ -119,7 +119,6 @@ pub fn create_shell_command(
 #[cfg(windows)]
 pub fn spawn_command(mut command: Command) -> std::io::Result<ChildProcess> {
     use std::mem;
-    use std::os::windows::process::CommandExt;
     use std::ptr;
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::jobapi2::{
