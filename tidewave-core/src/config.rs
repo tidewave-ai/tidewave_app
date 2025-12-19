@@ -28,7 +28,7 @@ pub struct Config {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
-    #[serde(skip)]
+    #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
 
@@ -79,7 +79,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     // Use serde to deserialize the full config
     let config: Config = toml::from_str(&content).map_err(|e| {
         format!(
-            "Failed to parse config: {}\n\nExpected format:\nport = 9832\n# https_port = 9833\n# https_cert_path = \"/path/to/cert.pem\"\n# https_key_path = \"/path/to/key.pem\"\ndebug = false\nallow_remote_access = false\n\n\n[env]\nKEY = \"value\"",
+            "Failed to parse config: {}\n\nExpected format:\nport = 9832\n# https_port = 9833\n# https_cert_path = \"/path/to/cert.pem\"\n# https_key_path = \"/path/to/key.pem\"\ndebug = false\nallow_remote_access = false\n\n[env]\nKEY = \"value\"",
             e
         )
     })?;
@@ -195,5 +195,21 @@ DATABASE_URL = "postgres://localhost"
             ..Default::default()
         };
         assert!(validate_https_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_with_allowed_origins() {
+        let toml_content = r#"
+port = 8080
+allowed_origins = ["https://example.com", "https://app.example.com"]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.allowed_origins.len(), 2);
+        assert_eq!(config.allowed_origins[0], "https://example.com".to_string());
+        assert_eq!(
+            config.allowed_origins[1],
+            "https://app.example.com".to_string()
+        );
     }
 }
