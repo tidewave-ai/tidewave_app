@@ -137,7 +137,7 @@ Because of this, we don't use the ACP SDK in the browser, but instead handle raw
 JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
 any requests to the new connection.
 */
-use crate::command::create_shell_command;
+use crate::command::{create_shell_command, spawn_command, ChildProcess};
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{
@@ -161,7 +161,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Child,
     sync::{mpsc, Mutex, RwLock},
 };
 use tracing::{debug, error, info, trace, warn};
@@ -296,7 +295,7 @@ pub type ProcessIo = (
     Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
     Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
-    Option<Child>,
+    Option<ChildProcess>,
 );
 
 /// Function type for starting a process and returning its I/O streams
@@ -359,7 +358,7 @@ impl AcpProxyState {
 pub struct ProcessState {
     pub key: ProcessKey,
     pub spawn_opts: TidewaveSpawnOptions,
-    pub child: Arc<RwLock<Option<Child>>>,
+    pub child: Arc<RwLock<Option<ChildProcess>>>,
     /// Channel used to forward a message to the ACP process.
     pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     /// Channel used to signal the exit monitor to kill the process.
@@ -1254,19 +1253,21 @@ pub fn real_process_starter() -> ProcessStarterFn {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
+            let mut process =
+                spawn_command(cmd).map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
 
-            let stdin = child
+            let stdin = process
+                .child
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow!("Failed to get stdin"))?;
-            let stdout = child
+            let stdout = process
+                .child
                 .stdout
                 .take()
                 .ok_or_else(|| anyhow!("Failed to get stdout"))?;
-            let stderr = child
+            let stderr = process
+                .child
                 .stderr
                 .take()
                 .ok_or_else(|| anyhow!("Failed to get stderr"))?;
@@ -1275,7 +1276,7 @@ pub fn real_process_starter() -> ProcessStarterFn {
                 Box::new(stdin),
                 Box::new(BufReader::new(stdout)),
                 Box::new(BufReader::new(stderr)),
-                Some(child),
+                Some(process),
             ))
         })
     })
@@ -1369,11 +1370,11 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
     tokio::spawn(async move {
         let exit_reason = {
             let mut child_guard = process_state_exit.child.write().await;
-            if let Some(child) = child_guard.as_mut() {
+            if let Some(process) = child_guard.as_mut() {
                 // Use tokio::select! to wait for either process exit or exit signal
                 tokio::select! {
                     // Process exited naturally
-                    status = child.wait() => {
+                    status = process.child.wait() => {
                         match status {
                             Ok(s) => {
                                 if s.success() {
@@ -1393,12 +1394,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpProxyStat
                     // Received exit signal
                     _ = exit_rx.recv() => {
                         debug!("Exit signal received for process: {}", process_state_exit.key);
-                        // Kill the process
-                        if let Err(e) = child.kill().await {
-                            error!("Failed to kill process {}: {}", process_state_exit.key, e);
-                        } else {
-                            debug!("Successfully killed process: {}", process_state_exit.key);
-                        }
+                        // Take ownership and drop to kill the process tree via ChildProcess::Drop
+                        child_guard.take();
                         ("exit_requested", "ACP process was stopped by exit request".to_string())
                     }
                 }

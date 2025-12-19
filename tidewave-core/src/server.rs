@@ -1,4 +1,4 @@
-use crate::command::create_shell_command;
+use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use axum::{
     body::{Body, Bytes},
@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::UNIX_EPOCH;
-use tokio::{io::AsyncReadExt, net::TcpListener};
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info};
 use which;
 
@@ -130,37 +131,36 @@ struct ServerConfig {
 pub async fn start_http_server(
     config: Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = bind_http_server(config.clone()).await?;
-    serve_http_server(config, listener).await
+    serve_http_server_with_shutdown(config, std::future::pending()).await
 }
 
-fn get_bind_addr(port: u16, allow_remote_access: bool) -> String {
-    if allow_remote_access {
-        format!("0.0.0.0:{}", port)
+fn get_bind_addr(port: u16, allow_remote_access: bool) -> std::net::SocketAddr {
+    let ip = if allow_remote_access {
+        std::net::Ipv4Addr::UNSPECIFIED
     } else {
-        format!("127.0.0.1:{}", port)
-    }
-}
-
-pub async fn bind_http_server(
-    config: Config,
-) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr = get_bind_addr(config.port, config.allow_remote_access);
-    let listener = TcpListener::bind(&bind_addr).await?;
-    info!("HTTP server bound to {}", bind_addr);
-    Ok(listener)
-}
-
-pub async fn serve_http_server(
-    config: Config,
-    listener: TcpListener,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_http_server_with_shutdown(config, listener, std::future::pending()).await
+        std::net::Ipv4Addr::LOCALHOST
+    };
+    std::net::SocketAddr::from((ip, port))
 }
 
 pub async fn serve_http_server_with_shutdown(
     config: Config,
-    listener: TcpListener,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_inner(config, None, shutdown_signal).await
+}
+
+pub async fn serve_http_server_with_listener(
+    config: Config,
+    listener: tokio::net::TcpListener,
+    shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_http_server_inner(config, Some(listener), shutdown_signal).await
+}
+
+async fn serve_http_server_inner(
+    config: Config,
+    listener: Option<tokio::net::TcpListener>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -168,7 +168,11 @@ pub async fn serve_http_server_with_shutdown(
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
         .build()?;
 
-    let port = if config.port == 0 {
+    let http_addr = get_bind_addr(config.port, config.allow_remote_access);
+    let http_handle = axum_server::Handle::new();
+
+    // Determine the port - if listener provided, use its port; otherwise use config
+    let port = if let Some(ref listener) = listener {
         listener.local_addr()?.port()
     } else {
         config.port
@@ -210,17 +214,17 @@ pub async fn serve_http_server_with_shutdown(
     // Create ACP routes
     let acp_routes = Router::new()
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state);
+        .with_state(acp_state.clone());
 
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
-        .route("/shell", post(shell_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
+        .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
         .route(
             "/proxy",
@@ -256,18 +260,8 @@ pub async fn serve_http_server_with_shutdown(
         verify_origin(req, next)
     }));
 
-    // Start HTTP server
-    let http_task = {
-        let app = app.clone();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal)
-                .await
-        })
-    };
-
-    // Optionally start HTTPS server
-    let https_task = if let Some(https_port) = https_port {
+    // Optionally set up HTTPS server
+    let (https_handle, https_task) = if let Some(https_port) = https_port {
         info!("Starting HTTPS server on port {}", https_port);
 
         let cert_path = config
@@ -280,22 +274,58 @@ pub async fn serve_http_server_with_shutdown(
             .expect("https_key_path validated");
         let rustls_config = crate::tls::load_tls_config_from_paths(cert_path, key_path)?;
 
-        // Create HTTPS listener using the same binding logic as HTTP
-        let bind_addr = get_bind_addr(https_port, config.allow_remote_access);
-        let https_addr: std::net::SocketAddr = bind_addr.parse()?;
-
+        let https_addr = get_bind_addr(https_port, config.allow_remote_access);
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
         let https_handle = axum_server::Handle::new();
+        let https_handle_clone = https_handle.clone();
 
-        Some(tokio::spawn(async move {
-            axum_server::bind_rustls(https_addr, tls_config)
-                .handle(https_handle)
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                axum_server::bind_rustls(https_addr, tls_config)
+                    .handle(https_handle_clone)
+                    .serve(app.into_make_service())
+                    .await
+            }
+        });
+
+        (Some(https_handle), Some(task))
+    } else {
+        (None, None)
+    };
+
+    // Start HTTP server
+    let http_handle_clone = http_handle.clone();
+    let http_task = if let Some(listener) = listener {
+        let std_listener = listener.into_std()?;
+        tokio::spawn(async move {
+            axum_server::from_tcp(std_listener)
+                .handle(http_handle_clone)
                 .serve(app.into_make_service())
                 .await
-        }))
+        })
     } else {
-        None
+        tokio::spawn(async move {
+            axum_server::bind(http_addr)
+                .handle(http_handle_clone)
+                .serve(app.into_make_service())
+                .await
+        })
     };
+
+    // Spawn shutdown handler that triggers graceful shutdown with timeout
+    tokio::spawn({
+        let http_handle = http_handle.clone();
+        let https_handle = https_handle.clone();
+        async move {
+            shutdown_signal.await;
+            info!("Shutdown signal received, initiating graceful shutdown with 10s timeout");
+            http_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            if let Some(handle) = https_handle {
+                handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            }
+        }
+    });
 
     // Wait for both servers
     let http_result = http_task.await;
@@ -304,6 +334,19 @@ pub async fn serve_http_server_with_shutdown(
         https_result??;
     }
     http_result??;
+
+    // Kill all ACP processes via their exit channels.
+    // Note: We use the exit_tx channel instead of directly killing, because
+    // the exit monitor task holds the child write lock while waiting.
+    let acp_process_count = acp_state.processes.len();
+    debug!("Found {} ACP processes to clean up", acp_process_count);
+
+    for entry in acp_state.processes.iter() {
+        let process_state = entry.value();
+        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+            let _ = exit_tx.send(());
+        }
+    }
 
     Ok(())
 }
@@ -388,24 +431,33 @@ async fn shell_handler(
     let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
 
     let mut stdout = Some(
-        child
+        process
+            .child
             .stdout
             .take()
             .ok_or_else(|| shell_error("Failed to get process stdout"))?,
     );
     let mut stderr = Some(
-        child
+        process
+            .child
             .stderr
             .take()
             .ok_or_else(|| shell_error("Failed to get process stderr"))?,
     );
 
+    // Wrap process in Arc<Mutex<Option>> so we can take it out at the end.
+    // If stream is dropped early, the ChildProcess::Drop will kill the process tree.
+    let process_holder = Arc::new(std::sync::Mutex::new(Some(process)));
+    let process_holder_clone = process_holder.clone();
+
     let stream = async_stream::stream! {
+        // Hold reference to process_holder so ChildProcess lives as long as stream
+        let _process_holder = process_holder_clone;
+
         let (mut stdout_buf, mut stderr_buf) = (vec![0u8; 4096], vec![0u8; 4096]);
 
         loop {
@@ -428,9 +480,22 @@ async fn shell_handler(
             }
         }
 
-        match child.wait().await {
-            Ok(status) => yield Ok(create_status_chunk(status.code().unwrap_or(-1))),
-            Err(e) => yield Err(e),
+        // Take the process to wait on it (prevents Drop from killing it since process completed normally)
+        let process_opt = _process_holder.lock().ok().and_then(|mut g| g.take());
+        let status = if let Some(mut process) = process_opt {
+            match process.child.wait().await {
+                Ok(status) => Some(status.code().unwrap_or(-1)),
+                Err(e) => {
+                    yield Err(e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(code) = status {
+            yield Ok(create_status_chunk(code));
         }
     };
 
