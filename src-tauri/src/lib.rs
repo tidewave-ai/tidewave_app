@@ -48,7 +48,7 @@ pub fn run() {
                 Ok(config) => config,
                 Err(e) => {
                     error!("Failed to load config: {}", e);
-                    error_dialog(&app.handle(), "Config Error", format!("Failed to load config file: {}", e));
+                    config_error_dialog(&app.handle(), e.to_string());
                     std::process::exit(1);
                 }
             };
@@ -234,7 +234,7 @@ pub fn run() {
                         }
                         Err(e) => {
                             error!("Failed to reload config: {}", e);
-                            error_dialog(app, "Config Error", format!("Failed to reload config file: {}", e));
+                            config_error_dialog(app, e.to_string());
                         }
                     }
                 }
@@ -399,4 +399,30 @@ fn error_dialog(app: &tauri::AppHandle, title: impl Into<String>, message: impl 
         .kind(MessageDialogKind::Error)
         .title(title.into())
         .blocking_show();
+}
+
+fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>) {
+    let config_path = tidewave_core::get_config_path();
+    let path_str = config_path.display().to_string();
+    let error_msg = error_message.into();
+
+    let message = format!("Invalid {}:\n\n{}", path_str, error_msg);
+
+    let app_handle = app.clone();
+    let result = app.dialog()
+        .message(message)
+        .kind(MessageDialogKind::Error)
+        .title("Config Error")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Dismiss".to_string(),
+            "Open app.toml".to_string(),
+        ))
+        .blocking_show();
+
+    if !result {
+        if let Err(e) = open_config_file(&app_handle) {
+            error!("Failed to open config file: {}", e);
+            error_dialog(&app_handle, "Error", format!("Failed to open config file: {}", e));
+        }
+    }
 }

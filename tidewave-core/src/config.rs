@@ -79,7 +79,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     // Use serde to deserialize the full config
     let config: Config = toml::from_str(&content).map_err(|e| {
         format!(
-            "Failed to parse config: {}\n\nExpected format:\nport = 9832\n# https_port = 9833\n# https_cert_path = \"/path/to/cert.pem\"\n# https_key_path = \"/path/to/key.pem\"\ndebug = false\nallow_remote_access = false\n\n\n[env]\nKEY = \"value\"",
+            "Failed to parse config: {}\n\nExpected format:\nport = 9832\n# https_port = 9833\n# https_cert_path = \"/path/to/cert.pem\"\n# https_key_path = \"/path/to/key.pem\"\ndebug = false\nallow_remote_access = false\n\n[env]\nKEY = \"value\"",
             e
         )
     })?;
