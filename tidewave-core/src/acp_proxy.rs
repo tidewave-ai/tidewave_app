@@ -952,7 +952,7 @@ async fn handle_tidewave_session_load(
             state
         }
         None => {
-            send_error_and_bail(
+            send_error_response(
                 state,
                 websocket_id,
                 &request.id,
@@ -961,13 +961,15 @@ async fn handle_tidewave_session_load(
                     message: "Session not found".to_string(),
                     data: None,
                 },
-            )?;
-            unreachable!()
+            );
+            return Ok(());
         }
     };
 
     // Check if there's already an active WebSocket for this session
-    ensure_session_not_active(state, websocket_id, request, &params.session_id)?;
+    if !ensure_session_not_active(state, websocket_id, request, &params.session_id) {
+        return Ok(());
+    }
 
     // Register this WebSocket for the session
     state
@@ -1022,7 +1024,9 @@ async fn handle_acp_session_load(
 
     if let Some(session_id) = session_id {
         // Check if there's already an active WebSocket for this session
-        ensure_session_not_active(state, websocket_id, request, &session_id)?;
+        if !ensure_session_not_active(state, websocket_id, request, &session_id) {
+            return Ok(());
+        }
 
         // Get or create the session state
         let process_key = match state.sessions.get(&session_id) {
@@ -1744,14 +1748,16 @@ fn inject_notification_id(notification: &mut JsonRpcNotification, notif_id: Noti
 // Utility Functions
 // ============================================================================
 
-/// Helper function to send a JSON-RPC error response and return an error for early return.
-/// Use this with the `?` operator to short-circuit handler functions.
-fn send_error_and_bail(
+/// Helper function to send a JSON-RPC error response to the client.
+/// This is used for expected error conditions that should be communicated to the client.
+fn send_error_response(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
     request_id: &Value,
     error: JsonRpcError,
-) -> Result<()> {
+) {
+    debug!("Sending JSON-RPC error to client: {}", error.message);
+
     let response = JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: request_id.clone(),
@@ -1764,20 +1770,18 @@ fn send_error_and_bail(
             response,
         )));
     }
-
-    Err(anyhow!("JSON-RPC error sent: {}", error.message))
 }
 
 /// Helper function to ensure a session is not already active on another websocket.
-/// Returns an error (with response already sent) if the session is active.
+/// Returns false if the session is already active (and sends an error response to the client).
 fn ensure_session_not_active(
     state: &AcpProxyState,
     websocket_id: WebSocketId,
     request: &JsonRpcRequest,
     session_id: &str,
-) -> Result<()> {
+) -> bool {
     if state.session_to_websocket.contains_key(session_id) {
-        send_error_and_bail(
+        send_error_response(
             state,
             websocket_id,
             &request.id,
@@ -1786,9 +1790,10 @@ fn ensure_session_not_active(
                 message: "Session already has an active connection".to_string(),
                 data: None,
             },
-        )?;
+        );
+        return false;
     }
-    Ok(())
+    true
 }
 
 /// Looks up the process for the given websocket ID.
