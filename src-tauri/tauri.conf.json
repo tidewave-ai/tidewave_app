@@ -44,11 +44,11 @@
   },
   "plugins": {
     "cli": {
-      "description": "Tidewave CLI",
+      "description": "Tidewave App/CLI",
       "args": [
         {
           "name": "port",
-          "description": "Specify the port where Tidewave Web will be served.",
+          "description": "Specify the port where Tidewave will be served.",
           "short": "p",
           "takesValue": true
         },
@@ -57,31 +57,6 @@
           "description": "Enable debug logging",
           "short": "d",
           "takesValue": false
-        },
-        {
-          "name": "allow-remote-access",
-          "description": "Allow remote access by binding to 0.0.0.0 instead of 127.0.0.1",
-          "takesValue": false
-        },
-        {
-          "name": "https-port",
-          "description": "Enable HTTPS on the specified port",
-          "takesValue": true
-        },
-        {
-          "name": "https-cert-path",
-          "description": "Path to HTTPS certificate file (PEM format)",
-          "takesValue": true
-        },
-        {
-          "name": "https-key-path",
-          "description": "Path to HTTPS private key file (PEM format)",
-          "takesValue": true
-        },
-        {
-          "name": "allowed-origins",
-          "description": "Additional allowed origins for CORS (comma-separated list)",
-          "takesValue": true
         }
       ]
     },

@@ -53,6 +53,9 @@ pub fn run() {
                 }
             };
 
+            // We only list some of the options here,
+            // as this is mostly for development help.
+            // All other options are read from the config file.
             match app.cli().matches() {
                 Ok(matches) => {
                     if let Some(debug_arg) = matches.args.get("debug") {
@@ -67,46 +70,6 @@ pub fn run() {
                         if let Some(port_str) = port_arg.value.as_str() {
                             if let Ok(p) = port_str.parse::<u16>() {
                                 config.port = p;
-                            }
-                        }
-                    }
-
-                    if let Some(allow_remote_arg) = matches.args.get("allow-remote-access") {
-                        if let Some(value) = allow_remote_arg.value.as_bool() {
-                            if value {
-                                config.allow_remote_access = true;
-                            }
-                        }
-                    }
-
-                    if let Some(https_port_arg) = matches.args.get("https-port") {
-                        if let Some(port_str) = https_port_arg.value.as_str() {
-                            if let Ok(p) = port_str.parse::<u16>() {
-                                config.https_port = Some(p);
-                            }
-                        }
-                    }
-
-                    if let Some(https_cert_arg) = matches.args.get("https-cert-path") {
-                        if let Some(cert_str) = https_cert_arg.value.as_str() {
-                            config.https_cert_path = Some(cert_str.to_string());
-                        }
-                    }
-
-                    if let Some(https_key_arg) = matches.args.get("https-key-path") {
-                        if let Some(key_str) = https_key_arg.value.as_str() {
-                            config.https_key_path = Some(key_str.to_string());
-                        }
-                    }
-
-                    if let Some(allowed_origins_arg) = matches.args.get("allowed-origins") {
-                        if let Some(origins_str) = allowed_origins_arg.value.as_str() {
-                            // Split by comma
-                            for origin in origins_str.split(',') {
-                                let trimmed = origin.trim();
-                                if !trimmed.is_empty() {
-                                    config.allowed_origins.push(trimmed.to_string());
-                                }
                             }
                         }
                     }
@@ -431,7 +394,8 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
     let message = format!("Invalid {}:\n\n{}", path_str, error_msg);
 
     let app_handle = app.clone();
-    let result = app.dialog()
+    let result = app
+        .dialog()
         .message(message)
         .kind(MessageDialogKind::Error)
         .title("Config Error")
@@ -444,7 +408,11 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
     if !result {
         if let Err(e) = open_config_file(&app_handle) {
             error!("Failed to open config file: {}", e);
-            error_dialog(&app_handle, "Error", format!("Failed to open config file: {}", e));
+            error_dialog(
+                &app_handle,
+                "Error",
+                format!("Failed to open config file: {}", e),
+            );
         }
     }
 }

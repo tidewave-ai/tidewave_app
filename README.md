@@ -11,7 +11,7 @@ Tidewave's Desktop app and CLI.
 
 ```bash
 cargo install tauri-cli --version "=2.8.0" --locked
-cargo tauri dev -- -- --debug
+cargo tauri dev -- -- --debug --port 9878
 ```
 
 To run as macOS app bundle (to use Info.plist, etc), run:
@@ -19,6 +19,10 @@ To run as macOS app bundle (to use Info.plist, etc), run:
 ```bash
 ./run_macos.sh
 ```
+
+Note the app will load your Tidewave settings file. The app
+supports only a subset of the CLI flags, as they are only
+used in development, and they override the values in settings.
 
 ### CLI
 
@@ -31,7 +35,6 @@ cargo run -p tidewave-cli [-- --help]
 **Generate a self-signed certificate for development:**
 
 ```bash
-# Generate a self-signed certificate valid for localhost
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -sha256 -days 365 -nodes \
   -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
