@@ -16,6 +16,7 @@ use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use std::error::Error as StdError;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -833,16 +834,33 @@ async fn do_proxy(
     let response = match response {
         Ok(resp) => resp,
         Err(e) => {
-            // Check if this is a certificate error
+            // Check if this is a certificate error and log detailed information
             let error_debug = format!("{:?}", e);
-            let is_cert_error = error_debug.contains("InvalidCertificate");
-            let error_type = if is_cert_error {
+            let error_display = format!("{}", e);
+
+            // Detect specific error types
+            let error_type = if e.is_connect() {
+                "bad-connection"
+            } else if error_debug.contains("NotValidForName") {
+                "not-valid-for-name"
+            } else if error_debug.contains("InvalidCertificate") {
                 "certificate-error"
             } else {
                 "general"
             };
 
-            error!("Proxy request failed ({}): {}", error_type, e);
+            error!("Proxy request failed ({}): {}", error_type, error_display);
+            debug!("Detailed error: {:?}", e);
+
+            // Log source chain to see the underlying TLS error
+            if let Some(source) = e.source() {
+                debug!("Error source: {:?}", source);
+                let mut current = source;
+                while let Some(next_source) = current.source() {
+                    debug!("  Caused by: {:?}", next_source);
+                    current = next_source;
+                }
+            }
 
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
