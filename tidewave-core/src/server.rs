@@ -829,11 +829,28 @@ async fn do_proxy(
         }
     }
 
-    // Unwrap the response or return error
-    let response = response.map_err(|e| {
-        error!("Proxy request failed: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    // Unwrap the response or return error with appropriate header
+    let response = match response {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Check if this is a certificate error
+            let error_debug = format!("{:?}", e);
+            let is_cert_error = error_debug.contains("InvalidCertificate");
+            let error_type = if is_cert_error {
+                "certificate-error"
+            } else {
+                "general"
+            };
+
+            error!("Proxy request failed ({}): {}", error_type, e);
+
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("X-Tidewave-Error", error_type)
+                .body(Body::empty())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     // Get status and headers from the response
     let status = response.status();
