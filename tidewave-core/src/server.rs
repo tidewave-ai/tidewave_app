@@ -839,18 +839,18 @@ async fn do_proxy(
             let error_display = format!("{}", e);
 
             // Detect specific error types
-            let error_type = if e.is_connect() {
-                "bad-connection"
-            } else if error_debug.contains("NotValidForName") {
+            let error_type = if error_debug.contains("NotValidForName") {
                 "not-valid-for-name"
             } else if error_debug.contains("InvalidCertificate") {
                 "certificate-error"
+            } else if error_debug.contains("ConnectionRefused") {
+                "bad-connection"
             } else {
                 "general"
             };
 
             error!("Proxy request failed ({}): {}", error_type, error_display);
-            debug!("Detailed error: {:?}", e);
+            debug!("Detailed error: {}", error_debug);
 
             // Log source chain to see the underlying TLS error
             if let Some(source) = e.source() {
