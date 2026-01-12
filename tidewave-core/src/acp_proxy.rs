@@ -519,9 +519,17 @@ impl SessionState {
         }
     }
 
-    pub async fn get_buffered_messages_after(&self, latest_id: &str) -> Vec<BufferedMessage> {
-        let buffer = self.message_buffer.read().await;
-
+    /// Get buffered messages after a given ID.
+    ///
+    /// **IMPORTANT:** Caller must acquire the lock on `message_buffer` before calling this function.
+    /// This allows the caller to control lock scope for atomicity.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let buffer = session.message_buffer.read().await;
+    /// let messages = SessionState::get_buffered_messages_after(&buffer, "notif_5");
+    /// ```
+    pub fn get_buffered_messages_after(buffer: &[BufferedMessage], latest_id: &str) -> Vec<BufferedMessage> {
         // Find the index of the message with latest_id
         if let Some(index) = buffer.iter().position(|msg| msg.id == latest_id) {
             // Return all messages after this index
@@ -974,29 +982,37 @@ async fn handle_tidewave_session_load(
         return Ok(());
     }
 
-    // Register this WebSocket for the session
-    state
-        .session_to_websocket
-        .insert(params.session_id.clone(), websocket_id);
-
-    // Also map this websocket to the process
-    state
-        .websocket_to_process
-        .insert(websocket_id, session_state.process_key.clone());
-
     // Check if session was cancelled and reset the flag
     let was_cancelled = session_state.cancelled.swap(false, Ordering::SeqCst);
 
-    // Send buffered messages after the latest_id
-    let buffered_messages = session_state
-        .get_buffered_messages_after(&params.latest_id)
-        .await;
-
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        // Stream buffered messages
-        for buffered in buffered_messages {
-            let _ = tx.send(WebSocketMessage::JsonRpc(buffered.message));
-        }
+        // Map websocket to process (needed for any requests during catchup)
+        state
+            .websocket_to_process
+            .insert(websocket_id, session_state.process_key.clone());
+
+        // ATOMIC CATCHUP: Hold the buffer read lock for the entire operation
+        // This prevents new messages from being added while we're catching up,
+        // ensuring we don't miss any messages.
+        {
+            let buffer = session_state.message_buffer.read().await;
+
+            // Get buffered messages after latest_id
+            let buffered_messages = SessionState::get_buffered_messages_after(&buffer, &params.latest_id);
+
+            // Stream buffered messages while holding the lock
+            // This is safe because tx.send() is non-blocking (unbounded channel)
+            for buffered in buffered_messages {
+                let _ = tx.send(WebSocketMessage::JsonRpc(buffered.message));
+            }
+
+            // NOW register the session mapping while still holding the lock
+            // This ensures no messages arrive between catchup and registration
+            state
+                .session_to_websocket
+                .insert(params.session_id.clone(), websocket_id);
+
+        } // Lock released here - new messages can now be buffered AND sent directly
 
         let response_data = TidewaveSessionLoadResponse {
             cancelled: was_cancelled,
@@ -2157,7 +2173,8 @@ mod tests {
         }
 
         // Get messages after notif_2
-        let messages = session.get_buffered_messages_after("notif_2").await;
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_2");
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].id, "notif_3");
@@ -2176,7 +2193,8 @@ mod tests {
         }
 
         // Get messages with unknown ID (should return all messages)
-        let messages = session.get_buffered_messages_after("notif_unknown").await;
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_unknown");
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].id, "notif_1");
@@ -2195,7 +2213,8 @@ mod tests {
         }
 
         // Get messages after the last ID (should return empty)
-        let messages = session.get_buffered_messages_after("notif_3").await;
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_3");
 
         assert_eq!(messages.len(), 0);
     }
@@ -2215,7 +2234,9 @@ mod tests {
         }
 
         // Step 2: Client connects and gets all messages (empty latest_id)
-        let messages = session.get_buffered_messages_after("").await;
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "");
+        drop(buffer);
         assert_eq!(messages.len(), 3);
 
         // Step 3: Client acknowledges up to notif_2
@@ -2234,7 +2255,9 @@ mod tests {
         }
 
         // Step 6: Client reconnects and gets messages after notif_2
-        let messages = session.get_buffered_messages_after("notif_2").await;
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_2");
+        drop(buffer);
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].id, "notif_3");
         assert_eq!(messages[1].id, "notif_4");
