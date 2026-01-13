@@ -49,11 +49,14 @@
 //! # {"status":"done","path":"/path/to/cached/file"}
 //! ```
 //!
-//! ### 3. Download with throttling
+//! ### 3. Test caching
 //! ```bash
-//! curl "http://localhost:9832/download?key=slowfile&url=http://localhost:8000/testfile.bin&throttle=1024"
-//! # Note: throttle parameter adds 1 second delay per chunk (for testing concurrent downloads)
-//! # Progress updates: every 1% if total size known, every 1MB if size unknown
+//! # First download
+//! curl "http://localhost:9832/download?key=cached&url=http://localhost:8000/testfile.bin"
+//!
+//! # Second download (returns immediately with just done message)
+//! curl "http://localhost:9832/download?key=cached&url=http://localhost:8000/testfile.bin"
+//! # Returns: {"status":"done","path":"/path/to/cached/file"}
 //! ```
 //!
 //! ### 4. Test concurrent downloads
@@ -64,28 +67,6 @@
 //! # Terminal 2 (start shortly after)
 //! curl "http://localhost:9832/download?key=shared&url=http://localhost:8000/testfile.bin&throttle=10240"
 //! # Both requests share the same download stream
-//! ```
-//!
-//! ### 5. Test caching
-//! ```bash
-//! # First download
-//! curl "http://localhost:9832/download?key=cached&url=http://localhost:8000/testfile.bin"
-//!
-//! # Second download (returns immediately with just done message)
-//! curl "http://localhost:9832/download?key=cached&url=http://localhost:8000/testfile.bin"
-//! # Returns: {"status":"done","path":"/path/to/cached/file"}
-//! ```
-//!
-//! ### 6. Inspect cached files
-//! ```bash
-//! # Linux
-//! ls -lah ~/.cache/tidewave/downloads/
-//!
-//! # macOS
-//! ls -lah ~/Library/Caches/tidewave/downloads/
-//!
-//! # Windows
-//! dir %LOCALAPPDATA%\tidewave\downloads
 //! ```
 
 use axum::body::{Body, Bytes};
