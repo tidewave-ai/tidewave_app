@@ -1,5 +1,6 @@
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
+use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -16,7 +17,6 @@ use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::error::Error as StdError;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -24,11 +24,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info};
 use which;
-
-#[derive(Deserialize)]
-struct ProxyParams {
-    url: String,
-}
 
 #[derive(Deserialize)]
 struct ShellParams {
@@ -182,6 +177,7 @@ async fn serve_http_server_inner(
     let https_port = config.https_port;
     let mcp_state = crate::mcp_remote::McpRemoteState::new();
     let acp_state = crate::acp_proxy::AcpProxyState::new();
+    let download_state = DownloadState::new();
 
     // Build allowed origins for both HTTP and HTTPS
     let mut allowed_origins = config.allowed_origins.clone();
@@ -217,6 +213,18 @@ async fn serve_http_server_inner(
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state.clone());
 
+    // Create download routes
+    let client_for_download = client.clone();
+    let download_routes = Router::new()
+        .route(
+            "/download",
+            get(move |params, state| {
+                let client = client_for_download.clone();
+                download_handler(params, state, client)
+            }),
+        )
+        .with_state(download_state);
+
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
@@ -235,7 +243,8 @@ async fn serve_http_server_inner(
             }),
         )
         .merge(mcp_routes)
-        .merge(acp_routes);
+        .merge(acp_routes)
+        .merge(download_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -760,177 +769,6 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
         })),
         _ => Ok(Json(WhichResponse { path: None })),
     }
-}
-
-async fn do_proxy(
-    target_url: String,
-    req: Request,
-    client: Client,
-) -> Result<Response<Body>, StatusCode> {
-    debug!("Proxying {} request to: {}", req.method(), target_url);
-
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-
-    // Convert body to bytes
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // Helper closure to build a request with the given URL and optional Host header
-    let build_request = |url: &str, custom_host: Option<&str>| {
-        let mut req_builder = client.request(method.clone(), url);
-
-        // Forward headers (excluding Host, connection-specific headers, and compression headers)
-        for (key, value) in headers.iter() {
-            let key_str = key.as_str();
-            if ![
-                "host",
-                "connection",
-                "transfer-encoding",
-                "upgrade",
-                "accept-encoding",
-                "content-encoding",
-                "origin",
-            ]
-            .contains(&key_str)
-            {
-                req_builder = req_builder.header(key.clone(), value.clone());
-            }
-        }
-
-        // Set custom Host header if provided
-        if let Some(host) = custom_host {
-            req_builder = req_builder.header("Host", host);
-        }
-
-        req_builder.body(body_bytes.clone())
-    };
-
-    // Execute the request
-    let mut response = build_request(&target_url, None).send().await;
-
-    // If connection failed for *.localhost, retry with 127.0.0.1, as in RFC 6761
-    if let Err(e) = &response {
-        if e.is_connect() {
-            if let Ok(mut url) = Url::parse(&target_url) {
-                if let Some(host) = url.host_str() {
-                    if host.ends_with(".localhost") {
-                        let host_string = host.to_string();
-                        info!(
-                            "Connection to {} failed, retrying with 127.0.0.1",
-                            host_string
-                        );
-                        url.set_host(Some("127.0.0.1")).ok();
-
-                        response = build_request(url.as_str(), Some(&host_string)).send().await;
-                    }
-                }
-            }
-        }
-    }
-
-    // Unwrap the response or return error with appropriate header
-    let response = match response {
-        Ok(resp) => resp,
-        Err(e) => {
-            // Check if this is a certificate error and log detailed information
-            let error_debug = format!("{:?}", e);
-            let error_display = format!("{}", e);
-
-            // Detect specific error types
-            let error_type = if error_debug.contains("NotValidForName") {
-                "not-valid-for-name"
-            } else if error_debug.contains("InvalidCertificate") {
-                "certificate-error"
-            } else if error_debug.contains("ConnectionRefused") {
-                "bad-connection"
-            } else {
-                "general"
-            };
-
-            error!("Proxy request failed ({}): {}", error_type, error_display);
-            debug!("Detailed error: {}", error_debug);
-
-            // Log source chain to see the underlying TLS error
-            if let Some(source) = e.source() {
-                debug!("Error source: {:?}", source);
-                let mut current = source;
-                while let Some(next_source) = current.source() {
-                    debug!("  Caused by: {:?}", next_source);
-                    current = next_source;
-                }
-            }
-
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("X-Tidewave-Error", error_type)
-                .body(Body::empty())
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    // Get status and headers from the response
-    let status = response.status();
-    let headers = response.headers().clone();
-
-    // Stream the response body
-    let body_stream = response.bytes_stream();
-    let body = Body::from_stream(body_stream);
-
-    // Build the response
-    let mut resp_builder = Response::builder().status(status.as_u16());
-
-    // Forward response headers (excluding connection and encoding headers since we're not handling compression)
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str();
-        if ![
-            "connection",
-            "transfer-encoding",
-            "content-encoding",
-            "content-length",
-        ]
-        .contains(&key_str)
-        {
-            resp_builder = resp_builder.header(key.clone(), value.clone());
-        }
-    }
-
-    resp_builder
-        .body(body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-async fn proxy_handler(
-    Query(params): Query<ProxyParams>,
-    req: Request,
-    client: Client,
-) -> Result<Response<Body>, StatusCode> {
-    let target_url = params.url;
-
-    // Ensure the URL is valid
-    if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
-        debug!("Invalid URL: {}", target_url);
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    do_proxy(target_url, req, client).await
-}
-
-async fn client_proxy_handler(
-    req: Request,
-    client: Client,
-    client_url: String,
-) -> Result<Response<Body>, StatusCode> {
-    let path = req.uri().path();
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-    let target_url = format!("{}{}{}", client_url, path, query);
-
-    do_proxy(target_url, req, client).await
 }
 
 async fn about() -> Result<Response<Body>, StatusCode> {

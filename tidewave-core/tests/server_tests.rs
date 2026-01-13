@@ -604,3 +604,241 @@ async fn test_stat_file() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ============================================================================
+// Download Tests
+// ============================================================================
+
+/// Parse download chunks from the response
+/// Format: Newline-delimited JSON (NDJSON)
+fn parse_download_chunks(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_download_basic() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a simple test file served by the test server
+    let test_content = "Hello, World! This is test content for download.";
+
+    // Start a simple file server on a different port
+    let file_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let file_port = file_listener.local_addr().unwrap().port();
+
+    let (file_shutdown_tx, file_shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        use axum::{Router, routing::get, body::Body, response::Response};
+
+        let app = Router::new().route("/test.txt", get(move || async move {
+            Response::builder()
+                .header("content-length", test_content.len().to_string())
+                .body(Body::from(test_content))
+                .unwrap()
+        }));
+
+        axum::serve(file_listener, app)
+            .with_graceful_shutdown(async {
+                file_shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+
+    // Give the file server time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+
+    // Download the file
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{}/download?key=test_file&url=http://127.0.0.1:{}/test.txt",
+            port, file_port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Parse the chunks
+    let bytes = response.bytes().await.unwrap();
+    let chunks = parse_download_chunks(&bytes);
+
+    // Should have at least a done chunk
+    assert!(!chunks.is_empty(), "Should receive at least one chunk");
+
+    // Last chunk should be "done"
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "done");
+    assert!(last_chunk["path"].is_string());
+
+    // Verify the file was downloaded
+    let path = last_chunk["path"].as_str().unwrap();
+    let downloaded_content = std::fs::read_to_string(path).unwrap();
+    assert_eq!(downloaded_content, test_content);
+
+    // Request the same file again - should return immediately with done status
+    let response2 = client
+        .get(format!(
+            "http://127.0.0.1:{}/download?key=test_file&url=http://127.0.0.1:{}/test.txt",
+            port, file_port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response2.status(), StatusCode::OK);
+
+    // Parse response - should get done message immediately
+    let bytes2 = response2.bytes().await.unwrap();
+    let chunks2 = parse_download_chunks(&bytes2);
+    assert_eq!(chunks2.len(), 1, "Should receive only done message for cached file");
+    assert_eq!(chunks2[0]["status"], "done");
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_download_concurrent_with_throttle() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a 100KB test file to ensure we get progress updates at 1% increments
+    let test_content = "x".repeat(102400);
+
+    // Use a unique key for this test run to avoid conflicts with cached files
+    let test_key = format!("concurrent_test_{}", uuid::Uuid::new_v4());
+
+    // Start a simple file server
+    let file_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let file_port = file_listener.local_addr().unwrap().port();
+
+    let (file_shutdown_tx, file_shutdown_rx) = oneshot::channel();
+
+    let test_content_clone = test_content.clone();
+    tokio::spawn(async move {
+        use axum::{Router, routing::get, body::Body, response::Response};
+
+        let app = Router::new().route("/large.txt", get(|| async move {
+            Response::builder()
+                .header("content-length", test_content_clone.len().to_string())
+                .body(Body::from(test_content_clone))
+                .unwrap()
+        }));
+
+        axum::serve(file_listener, app)
+            .with_graceful_shutdown(async {
+                file_shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+
+    // Give the file server time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client1 = reqwest::Client::new();
+    let client2 = reqwest::Client::new();
+
+    // Start two concurrent downloads with 10KB/s throttle (should take ~10 seconds for 100KB)
+    // With 1% progress updates, we expect ~100 chunks
+    let port1 = port;
+    let port2 = port;
+    let file_port1 = file_port;
+    let file_port2 = file_port;
+
+    let test_key1 = test_key.clone();
+    let handle1 = tokio::spawn(async move {
+        let response = client1
+            .get(format!(
+                "http://127.0.0.1:{}/download?key={}&url=http://127.0.0.1:{}/large.txt&throttle=10240",
+                port1, test_key1, file_port1
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify chunked transfer encoding is used
+        assert_eq!(
+            response.headers().get("transfer-encoding").map(|v| v.to_str().unwrap()),
+            Some("chunked"),
+            "Should use chunked transfer encoding for streaming"
+        );
+
+        let bytes = response.bytes().await.unwrap();
+        parse_download_chunks(&bytes)
+    });
+
+    // Start the second download immediately (no sleep needed - throttling ensures overlap)
+    let test_key2 = test_key.clone();
+    let handle2 = tokio::spawn(async move {
+        let response = client2
+            .get(format!(
+                "http://127.0.0.1:{}/download?key={}&url=http://127.0.0.1:{}/large.txt&throttle=10240",
+                port2, test_key2, file_port2
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.bytes().await.unwrap();
+        parse_download_chunks(&bytes)
+    });
+
+    let (chunks1, chunks2) = tokio::join!(handle1, handle2);
+    let chunks1 = chunks1.unwrap();
+    let chunks2 = chunks2.unwrap();
+
+    // With throttling, the first client should receive multiple chunks (progress + done)
+    // 100KB file with 10KB/s throttle = ~10 seconds, with 1% updates = ~100 chunks
+    assert!(
+        chunks1.len() > 1,
+        "Client 1 should receive multiple chunks due to throttling. Got: {}",
+        chunks1.len()
+    );
+
+    // Both should end with "done"
+    assert_eq!(chunks1.last().unwrap()["status"], "done");
+    assert_eq!(chunks2.last().unwrap()["status"], "done");
+
+    // Both should have the same final path (proving they shared the download)
+    assert_eq!(
+        chunks1.last().unwrap()["path"],
+        chunks2.last().unwrap()["path"]
+    );
+
+    // Client 1 should have received progress updates (not just "done")
+    let progress_count1 = chunks1.iter().filter(|c| c["status"] == "progress").count();
+    assert!(
+        progress_count1 > 0,
+        "Client 1 should receive progress updates. Got {} progress chunks",
+        progress_count1
+    );
+
+    // Both clients should have received at least one chunk
+    assert!(
+        chunks1.len() >= 1 && chunks2.len() >= 1,
+        "Both clients should receive chunks"
+    );
+
+    // Verify the downloaded file exists and has correct content
+    let path = chunks1.last().unwrap()["path"].as_str().unwrap();
+    let downloaded_content = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        downloaded_content.len(),
+        test_content.len(),
+        "Downloaded file should have correct size"
+    );
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}

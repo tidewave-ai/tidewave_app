@@ -27,6 +27,7 @@ dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
 which = "8.0"
+dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "jobapi2", "winnt", "processthreadsapi", "handleapi", "errhandlingapi"] }
