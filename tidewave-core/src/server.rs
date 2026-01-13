@@ -120,6 +120,7 @@ struct WhichResponse {
 struct AboutResponse {
     name: String,
     version: String,
+    valid_origin: bool,
 }
 
 #[derive(Clone)]
@@ -352,6 +353,53 @@ async fn serve_http_server_inner(
     Ok(())
 }
 
+fn is_valid_origin(req: &Request, config: &ServerConfig) -> bool {
+    let headers = req.headers();
+    let origin_str = headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok());
+
+    // If there is no origin header, it is valid
+    let Some(origin_str) = origin_str else {
+        return true;
+    };
+
+    // Check if origin is in allowed list
+    if config.allowed_origins.contains(&origin_str.to_string()) {
+        return true;
+    }
+
+    // Parse and validate localhost variants
+    if let Ok(origin_url) = Url::parse(origin_str) {
+        if let Some(host) = origin_url.host_str() {
+            let is_localhost_variant =
+                host == "localhost" || host == "127.0.0.1" || host.ends_with(".localhost");
+
+            let scheme = origin_url.scheme();
+            let origin_port = origin_url.port();
+
+            // Check if scheme + port matches our HTTP server
+            if is_localhost_variant
+                && scheme == "http"
+                && origin_port.unwrap_or(80) == config.port
+            {
+                return true;
+            }
+
+            // Check if scheme + port matches our HTTPS server
+            if is_localhost_variant
+                && scheme == "https"
+                && config.https_port.is_some()
+                && origin_port.unwrap_or(443) == config.https_port.unwrap()
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
@@ -361,52 +409,17 @@ async fn verify_origin(
         return Ok(next.run(req).await);
     }
 
-    let headers = req.headers();
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
-            error!("ServerConfig not found in request extensions");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if config.allowed_origins.contains(&origin_str.to_string()) {
-            return Ok(next.run(req).await);
-        }
-
-        if let Ok(origin_url) = Url::parse(origin_str) {
-            if let Some(host) = origin_url.host_str() {
-                let is_localhost_variant =
-                    host == "localhost" || host == "127.0.0.1" || host.ends_with(".localhost");
-
-                let scheme = origin_url.scheme();
-                let origin_port = origin_url.port();
-
-                // Check if scheme + port matches our HTTP server
-                if is_localhost_variant
-                    && scheme == "http"
-                    && origin_port.unwrap_or(80) == config.port
-                {
-                    return Ok(next.run(req).await);
-                }
-
-                // Check if scheme + port matches our HTTPS server
-                if is_localhost_variant
-                    && scheme == "https"
-                    && config.https_port.is_some()
-                    && origin_port.unwrap_or(443) == config.https_port.unwrap()
-                {
-                    return Ok(next.run(req).await);
-                }
-            }
-        }
-
-        debug!("Rejected request with origin: {}", origin_str);
-        return Err(StatusCode::FORBIDDEN);
+    if is_valid_origin(&req, config) {
+        return Ok(next.run(req).await);
     }
 
-    Ok(next.run(req).await)
+    debug!("Rejected request with origin: {:?}", req.headers().get(header::ORIGIN));
+    Err(StatusCode::FORBIDDEN)
 }
 
 #[derive(Serialize)]
@@ -933,10 +946,18 @@ async fn client_proxy_handler(
     do_proxy(target_url, req, client).await
 }
 
-async fn about() -> Result<Response<Body>, StatusCode> {
+async fn about(req: Request) -> Result<Response<Body>, StatusCode> {
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let valid_origin = is_valid_origin(&req, config);
+
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        valid_origin,
     };
 
     let json_body =
