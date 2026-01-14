@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -10,6 +11,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing::{debug, error, info};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::filter::LevelFilter;
 
 struct ServerState {
     handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
@@ -19,6 +22,12 @@ struct ServerState {
 struct PortState {
     port: u16,
     https_port: Option<u16>,
+}
+
+struct LogState {
+    log_path: PathBuf,
+    #[allow(dead_code)]
+    log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 const DEFAULT_CONFIG: &str = r#"# This file is used to configure the Tidewave app.
@@ -77,19 +86,26 @@ pub fn run() {
                 Err(_) => {}
             }
 
-            // Initialize tracing
-            let filter = if config.debug {
-                "debug"
+            // Initialize logging to file and console
+            let log_path_opt = log_path();
+            let log_guard = if let Some(ref lp) = log_path_opt {
+                let _ = ensure_parent_dir(lp);
+                init_tracing(lp, config.debug)
             } else {
-                "info"
+                // Fallback to console-only logging if log path can't be determined
+                let filter = if config.debug { "debug" } else { "info" };
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .try_init();
+                None
             };
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
 
             if config.debug {
                 debug!("Debug logging enabled");
                 debug!("{:?}", config);
+            }
+            if let Some(ref lp) = log_path_opt {
+                println!("Logging to file: {}", lp.display());
             }
 
             // Set environment variables from config before server initialization
@@ -133,6 +149,12 @@ pub fn run() {
                 https_port,
             });
 
+            // Store log state (log_path and guard to keep writer alive)
+            app.manage(LogState {
+                log_path: log_path_opt.unwrap_or_default(),
+                log_guard,
+            });
+
             open_tidewave(&app.handle(), port, https_port);
 
             #[cfg(target_os = "macos")]
@@ -142,11 +164,12 @@ pub fn run() {
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, maybe_hotkey("Command+O"))?;
             let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, maybe_hotkey("Command+,"))?;
+            let view_logs_i = MenuItem::with_id(app, "view_logs", "View Logs", true, maybe_hotkey("Command+L"))?;
             let check_for_updates_i = MenuItem::with_id(app, "check_for_updates", "Check for Updates…", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, maybe_hotkey("Command+Q"))?;
-            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &check_for_updates_i, &restart_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &view_logs_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
             TrayIconBuilder::new()
             .menu(&menu)
@@ -165,6 +188,9 @@ pub fn run() {
                         error!("Failed to open config file: {}", e);
                         error_dialog(app, "Error", format!("Failed to open config file: {}", e));
                     }
+                }
+                "view_logs" => {
+                    open_log_file(app);
                 }
                 "restart" => {
                     match tidewave_core::load_config() {
@@ -379,11 +405,23 @@ async fn check_for_updates_async(app: tauri::AppHandle) -> tauri_plugin_updater:
 }
 
 fn error_dialog(app: &tauri::AppHandle, title: impl Into<String>, message: impl Into<String>) {
-    app.dialog()
-        .message(message.into())
+    let app_handle = app.clone();
+    let message = message.into();
+    error!("{}", message);
+    let result = app
+        .dialog()
+        .message(message)
         .kind(MessageDialogKind::Error)
         .title(title.into())
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Dismiss".to_string(),
+            "View Logs".to_string(),
+        ))
         .blocking_show();
+
+    if !result {
+        open_log_file(&app_handle);
+    }
 }
 
 fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>) {
@@ -414,5 +452,65 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
                 format!("Failed to open config file: {}", e),
             );
         }
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn log_path() -> Option<PathBuf> {
+    let home = home_dir()?;
+    Some(home.join(".local").join("share").join("tidewave").join("logs").join("tidewave.log"))
+}
+
+fn ensure_parent_dir(path: &PathBuf) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn init_tracing(
+    log_path: &PathBuf,
+    debug: bool,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let dir = log_path.parent()?;
+    let file = log_path.file_name()?;
+
+    let file_appender = tracing_appender::rolling::never(dir, file);
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+    let console_filter = if debug {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(console_filter);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_writer)
+        .with_ansi(false)
+        .with_target(false)
+        .with_level(true)
+        .with_filter(LevelFilter::INFO);
+
+    let _ = tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
+        .try_init();
+
+    Some(guard)
+}
+
+fn open_log_file(app: &tauri::AppHandle) {
+    if let Some(log_state) = app.try_state::<LogState>() {
+        let _ = app
+            .opener()
+            .open_path(log_state.log_path.display().to_string(), None::<&str>);
     }
 }
