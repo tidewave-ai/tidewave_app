@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.0 (2026-01-14)
+
+* Allow `allowed_origins` to be set in the toml config file
+* Add support for ACP fork and resume
+* Track spawned processes and terminate them on exit (this uses process groups on Unix-like systems and job objects on Windows)
+* Properly buffer ACP prompt responses while the client is disconnected and fix buffer race condition
+
 ## v0.2.7 (2025-12-10)
 
 * Return CORS headers at /about
