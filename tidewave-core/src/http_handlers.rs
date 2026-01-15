@@ -78,7 +78,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info};
 
 #[derive(Deserialize)]
@@ -356,8 +356,6 @@ async fn perform_download(
     tx: tokio::sync::broadcast::Sender<Result<DownloadProgress, String>>,
     throttle: Option<u64>,
 ) -> Result<String, String> {
-    use tokio::io::AsyncWriteExt;
-
     debug!("Starting download from {} to {:?}", url, file_path);
 
     // Ensure cache directory exists
@@ -377,9 +375,10 @@ async fn perform_download(
 
     debug!("Downloading to temp file: {:?}", temp_path);
 
-    // Make the request (compression handled automatically by reqwest)
+    // Make the request with Accept-Encoding header
     let response = client
         .get(&url)
+        .header("Accept-Encoding", "gzip, br")
         .send()
         .await
         .map_err(|e| format!("Failed to send request: {}", e))?;
@@ -388,7 +387,13 @@ async fn perform_download(
         return Err(format!("HTTP error: {}", response.status()));
     }
 
-    // Get total size if available
+    // Check if response is compressed (clone the value to avoid borrowing)
+    let content_encoding = response.headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Get total size (compressed size if compressed, uncompressed otherwise)
     let total_size = response.content_length().unwrap_or(0);
 
     // Open temp file for writing
@@ -396,7 +401,6 @@ async fn perform_download(
         .await
         .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
-    let mut downloaded: u64 = 0;
     let mut next_progress_threshold: u64 = 0;
 
     // Determine progress reporting strategy:
@@ -408,41 +412,80 @@ async fn perform_download(
         1048576 // 1MB
     };
 
-    let mut stream = response.bytes_stream();
+    let stream = response.bytes_stream();
 
     // Download and write chunks - wrap in a closure for error handling
     let download_result: Result<(), String> = async {
+        use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio_util::io::StreamReader;
+
+        // Create a shared counter for bytes downloaded over the wire
+        let bytes_counter = Arc::new(AtomicU64::new(0));
+        let counter_clone = bytes_counter.clone();
+
+        // Create a stream that tracks bytes
+        let counting_stream = stream.map(move |result| {
+            result.map(|bytes| {
+                counter_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                bytes
+            })
+        });
+
+        let stream_reader = StreamReader::new(counting_stream.map(|result| {
+            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }));
+
+        // Create reader - either with decompression or passthrough
+        let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match content_encoding.as_deref() {
+            Some("br") => {
+                debug!("Using brotli decompression");
+                Box::new(BrotliDecoder::new(tokio::io::BufReader::new(stream_reader)))
+            }
+            Some("gzip") => {
+                debug!("Using gzip decompression");
+                Box::new(GzipDecoder::new(tokio::io::BufReader::new(stream_reader)))
+            }
+            _ => {
+                debug!("No compression");
+                Box::new(tokio::io::BufReader::new(stream_reader))
+            }
+        };
+
+        // Unified read loop for both compressed and uncompressed
+        let mut buffer = vec![0u8; 8192];
         loop {
             // Timeout per chunk: 30 seconds
-            let chunk_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                futures::StreamExt::next(&mut stream)
+            let bytes_read = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)
             )
             .await
-            .map_err(|_| "Chunk read timed out after 30 seconds".to_string())?;
+            .map_err(|_| "Chunk read timed out after 30 seconds".to_string())?
+            .map_err(|e| format!("Failed to read/decompress: {}", e))?;
 
-            let chunk = match chunk_result {
-                Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => return Err(format!("Failed to read chunk: {}", e)),
-                None => break, // Stream ended
-            };
+            if bytes_read == 0 {
+                break;
+            }
 
             // Apply throttling if specified - hardcoded 1 second delay
             if throttle.is_some() {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
 
-            file.write_all(&chunk)
+            file.write_all(&buffer[..bytes_read])
                 .await
                 .map_err(|e| format!("Failed to write to file: {}", e))?;
 
-            downloaded += chunk.len() as u64;
+            // Get bytes downloaded over the wire (compressed or uncompressed)
+            let network_bytes = bytes_counter.load(Ordering::Relaxed);
 
-            // Send progress update when downloaded exceeds next threshold
-            if downloaded >= next_progress_threshold {
-                next_progress_threshold = downloaded + progress_step;
+            // Send progress update based on network bytes
+            if network_bytes >= next_progress_threshold {
+                next_progress_threshold = network_bytes + progress_step;
                 let progress = DownloadProgress::Progress {
-                    size: downloaded,
+                    size: network_bytes,
                     total: if total_size > 0 { Some(total_size) } else { None },
                 };
                 let _ = tx.send(Ok(progress));

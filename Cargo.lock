@@ -3830,7 +3830,6 @@ version = "0.12.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d0946410b9f7b082a427e4ef5c8ff541a88b357bc6c637c40db3a68ac70a36f"
 dependencies = [
- "async-compression",
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
@@ -5189,6 +5188,7 @@ version = "0.2.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "async-compression",
  "async-stream",
  "async-trait",
  "axum",
@@ -5210,6 +5210,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-tungstenite 0.23.1",
+ "tokio-util",
  "toml 0.8.2",
  "tower",
  "tracing",
