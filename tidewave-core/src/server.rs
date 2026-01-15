@@ -169,6 +169,8 @@ async fn serve_http_server_inner(
     // Single client without automatic compression (we handle it manually in download handler)
     let client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
+        .no_gzip()
+        .no_brotli()
         .build()?;
 
     let http_addr = get_bind_addr(config.port, config.allow_remote_access);

@@ -425,7 +425,6 @@ async fn perform_download(
         let bytes_counter = Arc::new(AtomicU64::new(0));
         let counter_clone = bytes_counter.clone();
 
-        // Create a stream that tracks bytes
         let counting_stream = stream.map(move |result| {
             result.map(|bytes| {
                 counter_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -453,7 +452,6 @@ async fn perform_download(
             }
         };
 
-        // Unified read loop for both compressed and uncompressed
         let mut buffer = vec![0u8; 8192];
         loop {
             // Timeout per chunk: 30 seconds
