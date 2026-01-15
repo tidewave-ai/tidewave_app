@@ -529,7 +529,10 @@ impl SessionState {
     /// let buffer = session.message_buffer.read().await;
     /// let messages = SessionState::get_buffered_messages_after(&buffer, "notif_5");
     /// ```
-    pub fn get_buffered_messages_after(buffer: &[BufferedMessage], latest_id: &str) -> Vec<BufferedMessage> {
+    pub fn get_buffered_messages_after(
+        buffer: &[BufferedMessage],
+        latest_id: &str,
+    ) -> Vec<BufferedMessage> {
         // Find the index of the message with latest_id
         if let Some(index) = buffer.iter().position(|msg| msg.id == latest_id) {
             // Return all messages after this index
@@ -998,7 +1001,8 @@ async fn handle_tidewave_session_load(
             let buffer = session_state.message_buffer.read().await;
 
             // Get buffered messages after latest_id
-            let buffered_messages = SessionState::get_buffered_messages_after(&buffer, &params.latest_id);
+            let buffered_messages =
+                SessionState::get_buffered_messages_after(&buffer, &params.latest_id);
 
             // Stream buffered messages while holding the lock
             // This is safe because tx.send() is non-blocking (unbounded channel)
@@ -1011,7 +1015,6 @@ async fn handle_tidewave_session_load(
             state
                 .session_to_websocket
                 .insert(params.session_id.clone(), websocket_id);
-
         } // Lock released here - new messages can now be buffered AND sent directly
 
         let response_data = TidewaveSessionLoadResponse {
@@ -1684,19 +1687,31 @@ async fn handle_disconnected_client_response(
         .map(|entry| entry.value().clone());
 
     if let Some((session_id, client_id)) = session_info {
+        // Create response with original client ID
+        let mut client_response = response.clone();
+        client_response.id = client_id.clone();
+
         // Find the current websocket for this session
         if let Some(current_websocket_id) = state.session_to_websocket.get(&session_id) {
             let current_websocket_id = *current_websocket_id;
-
-            // Create response with original client ID
-            let mut client_response = response.clone();
-            client_response.id = client_id;
 
             // Send to the current websocket for this session
             if let Some(tx) = state.websocket_senders.get(&current_websocket_id) {
                 let _ = tx.send(WebSocketMessage::JsonRpc(JsonRpcMessage::Response(
                     client_response,
                 )));
+            }
+        } else {
+            // Client disconnected, buffer response
+            if let Some(session_state) = state.sessions.get(&session_id) {
+                let session_state = session_state.clone();
+
+                let _ = session_state
+                    .add_to_buffer(
+                        JsonRpcMessage::Response(client_response),
+                        client_id.to_string(),
+                    )
+                    .await;
             }
         }
 

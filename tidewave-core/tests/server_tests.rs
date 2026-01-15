@@ -94,14 +94,16 @@ async fn test_verify_origin_mismatch() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    // Test 2: Evil origin should work on /about
+    // Test 2: Evil origin should work on /check-origin and return valid: false
     let response = client
-        .get(format!("http://127.0.0.1:{}/about", port))
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
         .header("Origin", "http://evil.com")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], false);
 
     shutdown_tx.send(()).ok();
 }
@@ -385,6 +387,79 @@ async fn test_verify_origin_no_origin_header_allowed() {
         .await
         .unwrap();
     assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    // Test that /check-origin returns valid=true when no Origin header
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], true);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_check_origin_endpoint() {
+    let (port, shutdown_tx) = start_test_server(vec!["http://allowed.com".to_string()]).await;
+
+    let client = reqwest::Client::new();
+
+    // Test 1: No origin header should return valid=true
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], true);
+
+    // Test 2: Allowed origin should return valid=true
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .header("Origin", "http://allowed.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], true);
+
+    // Test 3: Localhost with matching port should return valid=true
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .header("Origin", &format!("http://localhost:{}", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], true);
+
+    // Test 4: Evil origin should return valid=false
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .header("Origin", "http://evil.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], false);
+
+    // Test 5: Localhost with wrong port should return valid=false
+    let response = client
+        .post(format!("http://127.0.0.1:{}/check-origin", port))
+        .header("Origin", &format!("http://localhost:{}", port + 1000))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["valid"], false);
 
     shutdown_tx.send(()).ok();
 }

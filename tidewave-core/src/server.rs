@@ -117,6 +117,11 @@ struct AboutResponse {
     version: String,
 }
 
+#[derive(Serialize)]
+struct CheckOriginResponse {
+    valid: bool,
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     allowed_origins: Vec<String>,
@@ -232,6 +237,7 @@ async fn serve_http_server_inner(
     let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
+        .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
@@ -363,61 +369,74 @@ async fn serve_http_server_inner(
     Ok(())
 }
 
+fn is_valid_origin(req: &Request, config: &ServerConfig) -> bool {
+    let headers = req.headers();
+    let origin_str = headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok());
+
+    // If there is no origin header, it is valid
+    let Some(origin_str) = origin_str else {
+        return true;
+    };
+
+    // Check if origin is in allowed list
+    if config.allowed_origins.contains(&origin_str.to_string()) {
+        return true;
+    }
+
+    // Parse and validate localhost variants
+    if let Ok(origin_url) = Url::parse(origin_str) {
+        if let Some(host) = origin_url.host_str() {
+            let is_localhost_variant =
+                host == "localhost" || host == "127.0.0.1" || host.ends_with(".localhost");
+
+            let scheme = origin_url.scheme();
+            let origin_port = origin_url.port();
+
+            // Check if scheme + port matches our HTTP server
+            if is_localhost_variant
+                && scheme == "http"
+                && origin_port.unwrap_or(80) == config.port
+            {
+                return true;
+            }
+
+            // Check if scheme + port matches our HTTPS server
+            if is_localhost_variant
+                && scheme == "https"
+                && config.https_port.is_some()
+                && origin_port.unwrap_or(443) == config.https_port.unwrap()
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // Skip origin verification for /about route
-    if req.uri().path() == "/about" {
+    // Skip origin verification for /about and /check-origin routes
+    let path = req.uri().path();
+    if path == "/about" || path == "/check-origin" {
         return Ok(next.run(req).await);
     }
 
-    let headers = req.headers();
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin_str = origin.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-        let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
-            error!("ServerConfig not found in request extensions");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if config.allowed_origins.contains(&origin_str.to_string()) {
-            return Ok(next.run(req).await);
-        }
-
-        if let Ok(origin_url) = Url::parse(origin_str) {
-            if let Some(host) = origin_url.host_str() {
-                let is_localhost_variant =
-                    host == "localhost" || host == "127.0.0.1" || host.ends_with(".localhost");
-
-                let scheme = origin_url.scheme();
-                let origin_port = origin_url.port();
-
-                // Check if scheme + port matches our HTTP server
-                if is_localhost_variant
-                    && scheme == "http"
-                    && origin_port.unwrap_or(80) == config.port
-                {
-                    return Ok(next.run(req).await);
-                }
-
-                // Check if scheme + port matches our HTTPS server
-                if is_localhost_variant
-                    && scheme == "https"
-                    && config.https_port.is_some()
-                    && origin_port.unwrap_or(443) == config.https_port.unwrap()
-                {
-                    return Ok(next.run(req).await);
-                }
-            }
-        }
-
-        debug!("Rejected request with origin: {}", origin_str);
-        return Err(StatusCode::FORBIDDEN);
+    if is_valid_origin(&req, config) {
+        return Ok(next.run(req).await);
     }
 
-    Ok(next.run(req).await)
+    debug!("Rejected request with origin: {:?}", req.headers().get(header::ORIGIN));
+    Err(StatusCode::FORBIDDEN)
 }
 
 #[derive(Serialize)]
@@ -787,6 +806,17 @@ async fn about() -> Result<Response<Body>, StatusCode> {
         .header("Content-Type", "application/json")
         .body(Body::from(json_body))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>, StatusCode> {
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let valid = is_valid_origin(&req, config);
+
+    Ok(Json(CheckOriginResponse { valid }))
 }
 
 async fn root(_req: Request) -> Html<String> {
