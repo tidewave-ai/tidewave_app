@@ -120,7 +120,11 @@ struct WhichResponse {
 struct AboutResponse {
     name: String,
     version: String,
-    valid_origin: bool,
+}
+
+#[derive(Serialize)]
+struct CheckOriginResponse {
+    valid: bool,
 }
 
 #[derive(Clone)]
@@ -223,6 +227,7 @@ async fn serve_http_server_inner(
     let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
+        .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_file_handler))
@@ -404,8 +409,9 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // Skip origin verification for /about route
-    if req.uri().path() == "/about" {
+    // Skip origin verification for /about and /check-origin routes
+    let path = req.uri().path();
+    if path == "/about" || path == "/check-origin" {
         return Ok(next.run(req).await);
     }
 
@@ -946,18 +952,10 @@ async fn client_proxy_handler(
     do_proxy(target_url, req, client).await
 }
 
-async fn about(req: Request) -> Result<Response<Body>, StatusCode> {
-    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
-        error!("ServerConfig not found in request extensions");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let valid_origin = is_valid_origin(&req, config);
-
+async fn about(_req: Request) -> Result<Response<Body>, StatusCode> {
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        valid_origin,
     };
 
     let json_body =
@@ -968,6 +966,17 @@ async fn about(req: Request) -> Result<Response<Body>, StatusCode> {
         .header("Content-Type", "application/json")
         .body(Body::from(json_body))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>, StatusCode> {
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let valid = is_valid_origin(&req, config);
+
+    Ok(Json(CheckOriginResponse { valid }))
 }
 
 async fn root(_req: Request) -> Html<String> {
