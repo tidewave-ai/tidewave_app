@@ -377,7 +377,7 @@ async fn perform_download(
 
     debug!("Downloading to temp file: {:?}", temp_path);
 
-    // Make the request
+    // Make the request (compression handled automatically by reqwest)
     let response = client
         .get(&url)
         .send()

@@ -160,8 +160,19 @@ async fn serve_http_server_inner(
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let client = Client::builder()
+
+    // Client for proxy - explicitly disable compression to maintain transparency
+    let proxy_client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
+        .no_gzip()
+        .no_brotli()
+        .build()?;
+
+    // Client for downloads - with automatic compression/decompression enabled
+    let download_client = Client::builder()
+        .use_preconfigured_tls(ClientConfig::with_platform_verifier())
+        .gzip(true)
+        .brotli(true)
         .build()?;
 
     let http_addr = get_bind_addr(config.port, config.allow_remote_access);
@@ -214,7 +225,7 @@ async fn serve_http_server_inner(
         .with_state(acp_state.clone());
 
     // Create download routes
-    let client_for_download = client.clone();
+    let client_for_download = download_client.clone();
     let download_routes = Router::new()
         .route(
             "/download",
@@ -226,7 +237,7 @@ async fn serve_http_server_inner(
         .with_state(download_state);
 
     // Create the main app without state
-    let client_for_proxy = client.clone();
+    let client_for_proxy = proxy_client.clone();
     let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
@@ -252,7 +263,7 @@ async fn serve_http_server_inner(
         if let Ok(client_url) = env::var("TIDEWAVE_CLIENT_URL") {
             for route_path in ["/tidewave", "/tidewave/{*path}"] {
                 let client_url_clone = client_url.clone();
-                let client_clone = client.clone();
+                let client_clone = proxy_client.clone();
                 app = app.route(
                     route_path,
                     axum::routing::any(move |req| {
