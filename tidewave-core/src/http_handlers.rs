@@ -92,6 +92,8 @@ pub struct DownloadParams {
     pub url: String,
     #[serde(default)]
     pub throttle: Option<u64>, // Optional bytes per second throttle for testing
+    #[serde(default)]
+    pub executable: Option<bool>, // Optional flag to make the downloaded file executable
 }
 
 #[derive(Serialize, Clone)]
@@ -210,6 +212,7 @@ pub async fn download_handler(
     let key = params.key;
     let url = params.url;
     let throttle = params.throttle;
+    let executable = params.executable;
 
     // Validate key to prevent path traversal attacks
     if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") || key.contains('.') {
@@ -265,7 +268,7 @@ pub async fn download_handler(
             }
 
             // File doesn't exist - perform the download
-            let result = perform_download(client, url, file_path_clone, cache_dir_clone, tx.clone(), throttle).await;
+            let result = perform_download(client, url, file_path_clone, cache_dir_clone, tx.clone(), throttle, executable).await;
 
             match result {
                 Ok(_final_path) => {
@@ -355,6 +358,7 @@ async fn perform_download(
     cache_dir: Arc<std::path::PathBuf>,
     tx: tokio::sync::broadcast::Sender<Result<DownloadProgress, String>>,
     throttle: Option<u64>,
+    executable: Option<bool>,
 ) -> Result<String, String> {
     debug!("Starting download from {} to {:?}", url, file_path);
 
@@ -503,6 +507,27 @@ async fn perform_download(
     if let Err(e) = download_result {
         let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(e);
+    }
+
+    // If executable flag is set, make the temp file executable before moving
+    if executable == Some(true) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = tokio::fs::metadata(&temp_path)
+                .await
+                .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(perms.mode() | 0o111); // Add execute permission for user, group, and others
+            tokio::fs::set_permissions(&temp_path, perms)
+                .await
+                .map_err(|e| format!("Failed to set executable permissions: {}", e))?;
+            debug!("Set executable permissions on temp file: {:?}", temp_path);
+        }
+        #[cfg(not(unix))]
+        {
+            debug!("Executable flag ignored on non-Unix platform");
+        }
     }
 
     // Download succeeded - move temp file to final location

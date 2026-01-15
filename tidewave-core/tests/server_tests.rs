@@ -917,3 +917,101 @@ async fn test_download_concurrent_with_throttle() {
     file_shutdown_tx.send(()).ok();
     shutdown_tx.send(()).ok();
 }
+
+#[tokio::test]
+#[cfg(unix)] // Only run on Unix platforms where we support executable permissions
+async fn test_download_with_executable_flag() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a test script file
+    let test_content = "#!/bin/sh\necho 'Hello from script'";
+
+    // Start a simple file server
+    let file_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let file_port = file_listener.local_addr().unwrap().port();
+
+    let (file_shutdown_tx, file_shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        use axum::{Router, routing::get, body::Body, response::Response};
+
+        let app = Router::new().route("/script.sh", get(move || async move {
+            Response::builder()
+                .header("content-length", test_content.len().to_string())
+                .body(Body::from(test_content))
+                .unwrap()
+        }));
+
+        axum::serve(file_listener, app)
+            .with_graceful_shutdown(async {
+                file_shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+
+    // Give the file server time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+
+    // Download the file with executable=true
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{}/download?key=test_executable&url=http://127.0.0.1:{}/script.sh&executable=true",
+            port, file_port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Parse the chunks
+    let bytes = response.bytes().await.unwrap();
+    let chunks = parse_download_chunks(&bytes);
+
+    // Last chunk should be "done"
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "done");
+
+    let path = last_chunk["path"].as_str().unwrap();
+
+    // Verify the file was downloaded with correct content
+    let downloaded_content = std::fs::read_to_string(path).unwrap();
+    assert_eq!(downloaded_content, test_content);
+
+    // Verify the file is executable
+    let metadata = std::fs::metadata(path).unwrap();
+    let permissions = metadata.permissions();
+    let mode = permissions.mode();
+
+    // Check that at least one executable bit is set (user, group, or other)
+    assert!(
+        mode & 0o111 != 0,
+        "File should have executable permissions. Mode: {:o}",
+        mode
+    );
+
+    // More specifically, check that all three executable bits are set
+    assert!(
+        mode & 0o100 != 0,
+        "File should have user executable permission. Mode: {:o}",
+        mode
+    );
+    assert!(
+        mode & 0o010 != 0,
+        "File should have group executable permission. Mode: {:o}",
+        mode
+    );
+    assert!(
+        mode & 0o001 != 0,
+        "File should have other executable permission. Mode: {:o}",
+        mode
+    );
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
