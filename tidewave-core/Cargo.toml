@@ -12,8 +12,10 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 async-stream = "0.3"
 bytes = "1.10.1"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
 rustls = "0.23"
 rustls-pemfile = "2.2"
 rustls-platform-verifier = "0.5"
@@ -27,6 +29,7 @@ dashmap = "6.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
 which = "8.0"
+dirs = "5.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "jobapi2", "winnt", "processthreadsapi", "handleapi", "errhandlingapi"] }
