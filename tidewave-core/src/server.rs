@@ -112,9 +112,18 @@ struct WhichResponse {
 }
 
 #[derive(Serialize)]
+struct SystemInfo {
+    os: &'static str,
+    arch: &'static str,
+    family: &'static str,
+    target: &'static str,
+}
+
+#[derive(Serialize)]
 struct AboutResponse {
     name: String,
     version: String,
+    system: SystemInfo,
 }
 
 #[derive(Serialize)]
@@ -798,6 +807,12 @@ async fn about() -> Result<Response<Body>, StatusCode> {
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        system: SystemInfo {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            family: std::env::consts::FAMILY,
+            target: env!("TARGET"),
+        },
     };
 
     let json_body =
