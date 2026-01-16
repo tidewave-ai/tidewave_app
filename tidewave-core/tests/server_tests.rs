@@ -464,6 +464,37 @@ async fn test_check_origin_endpoint() {
     shutdown_tx.send(()).ok();
 }
 
+
+#[tokio::test]
+async fn test_about_includes_system_info() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://127.0.0.1:{}/about", port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+
+    assert_eq!(body["name"], "tidewave-cli");
+    assert!(body["version"].is_string());
+
+    // Verify system info is present
+    let system = &body["system"];
+    assert!(system.is_object());
+    assert!(system["os"].is_string());
+    assert!(system["arch"].is_string());
+    assert!(system["family"].is_string());
+    assert!(system["target"].is_string());
+
+    shutdown_tx.send(()).ok();
+}
+
+
 #[tokio::test]
 async fn test_which_finds_common_command() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
