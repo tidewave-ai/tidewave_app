@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.1 (2026-01-21)
+
+* Add /download and /check-origin endpoint
+* Return sytem info on /about
+
 ## v0.3.0 (2026-01-14)
 
 * Allow `allowed_origins` to be set in the toml config file
