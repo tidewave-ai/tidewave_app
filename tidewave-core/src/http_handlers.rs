@@ -68,6 +68,13 @@
 //! curl "http://localhost:9832/download?key=shared&url=http://localhost:8000/testfile.bin&throttle=10240"
 //! # Both requests share the same download stream
 //! ```
+//!
+//! ### 5. Extract a file from an archive
+//! ```bash
+//! # Download an archive and extract a specific file (specify full path inside archive)
+//! curl "http://localhost:9832/download?key=codex&url=https://registry.npmjs.org/@zed-industries/codex-acp-linux-x64/-/codex-acp-linux-x64-0.8.2.tgz&extract=package/bin/codex&executable=true"
+//! # Returns: {"status":"done","path":"/path/to/cached/codex"}
+//! ```
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, Request};
@@ -94,6 +101,8 @@ pub struct DownloadParams {
     pub throttle: Option<u64>, // Optional bytes per second throttle for testing
     #[serde(default)]
     pub executable: Option<bool>, // Optional flag to make the downloaded file executable
+    #[serde(default)]
+    pub extract: Option<String>, // Optional path to extract from archive (for .tar.gz/.tgz files)
 }
 
 #[derive(Serialize, Clone)]
@@ -106,6 +115,9 @@ pub enum DownloadProgress {
     },
     Done {
         path: String,
+    },
+    Error {
+        message: String,
     },
 }
 
@@ -213,6 +225,7 @@ pub async fn download_handler(
     let url = params.url;
     let throttle = params.throttle;
     let executable = params.executable;
+    let extract = params.extract;
 
     // Validate key to prevent path traversal attacks
     if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") || key.contains('.') {
@@ -268,7 +281,7 @@ pub async fn download_handler(
             }
 
             // File doesn't exist - perform the download
-            let result = perform_download(client, url, file_path_clone, cache_dir_clone, tx.clone(), throttle, executable).await;
+            let result = perform_download(client, url, file_path_clone, cache_dir_clone, tx.clone(), throttle, executable, extract).await;
 
             match result {
                 Ok(_final_path) => {
@@ -306,7 +319,14 @@ pub async fn download_handler(
                         }
                         Err(error_msg) => {
                             error!("Download error: {}", error_msg);
-                            break;
+                            let error_progress = DownloadProgress::Error {
+                                message: error_msg,
+                            };
+                            if let Ok(json) = serde_json::to_string(&error_progress) {
+                                let line = format!("{}\n", json);
+                                yield Ok::<_, std::io::Error>(Bytes::from(line));
+                            }
+                            return;
                         }
                     }
                 }
@@ -324,11 +344,13 @@ pub async fn download_handler(
         // Channel closed - file must exist or something went wrong
         // Each subscriber emits their own done chunk, so no worries about duplicates
         if !file_path_for_stream.exists() {
-            error!(
-                "Download completed but file does not exist: {:?}. This indicates a bug in the download logic.",
-                file_path_for_stream
-            );
-            // End the stream - client will see no done message
+            let error_progress = DownloadProgress::Error {
+                message: format!("Download failed: file not found at {:?}", file_path_for_stream),
+            };
+            if let Ok(json) = serde_json::to_string(&error_progress) {
+                let line = format!("{}\n", json);
+                yield Ok::<_, std::io::Error>(Bytes::from(line));
+            }
             return;
         }
 
@@ -359,6 +381,7 @@ async fn perform_download(
     tx: tokio::sync::broadcast::Sender<Result<DownloadProgress, String>>,
     throttle: Option<u64>,
     executable: Option<bool>,
+    extract: Option<String>,
 ) -> Result<String, String> {
     debug!("Starting download from {} to {:?}", url, file_path);
 
@@ -509,20 +532,52 @@ async fn perform_download(
         return Err(e);
     }
 
-    // If executable flag is set, make the temp file executable before moving
+    // If extract parameter is provided, extract the specified file from the archive
+    if let Some(ref extract_path) = extract {
+        debug!("Extracting {} from archive {:?}", extract_path, temp_path);
+
+        let temp_path_clone = temp_path.clone();
+        let extract_path_clone = extract_path.clone();
+        let file_path_clone = file_path.clone();
+
+        // Run extraction in a blocking task since tar/flate2 are synchronous
+        let extract_result = tokio::task::spawn_blocking(move || {
+            extract_from_tarball(&temp_path_clone, &extract_path_clone, &file_path_clone)
+        })
+        .await
+        .map_err(|e| format!("Extraction task failed: {}", e))?;
+
+        // Clean up the archive temp file
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        extract_result?;
+
+        debug!("Extracted {} to {:?}", extract_path, file_path);
+    } else {
+        // No extraction - move temp file to final location (existing behavior)
+        tokio::fs::rename(&temp_path, &file_path)
+            .await
+            .map_err(|e| {
+                // Try to clean up temp file on rename failure
+                let _ = std::fs::remove_file(&temp_path);
+                format!("Failed to move downloaded file to final location: {}", e)
+            })?;
+    }
+
+    // If executable flag is set, make the final file executable
     if executable == Some(true) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = tokio::fs::metadata(&temp_path)
+            let metadata = tokio::fs::metadata(&file_path)
                 .await
                 .map_err(|e| format!("Failed to get file metadata: {}", e))?;
             let mut perms = metadata.permissions();
             perms.set_mode(perms.mode() | 0o111); // Add execute permission for user, group, and others
-            tokio::fs::set_permissions(&temp_path, perms)
+            tokio::fs::set_permissions(&file_path, perms)
                 .await
                 .map_err(|e| format!("Failed to set executable permissions: {}", e))?;
-            debug!("Set executable permissions on temp file: {:?}", temp_path);
+            debug!("Set executable permissions on file: {:?}", file_path);
         }
         #[cfg(not(unix))]
         {
@@ -530,19 +585,82 @@ async fn perform_download(
         }
     }
 
-    // Download succeeded - move temp file to final location
-    tokio::fs::rename(&temp_path, &file_path)
-        .await
-        .map_err(|e| {
-            // Try to clean up temp file on rename failure
-            let _ = std::fs::remove_file(&temp_path);
-            format!("Failed to move downloaded file to final location: {}", e)
-        })?;
-
     let final_path = file_path.display().to_string();
     info!("Download completed: {}", final_path);
 
     Ok(final_path)
+}
+
+/// Extract a specific file from a tar.gz/tgz archive
+fn extract_from_tarball(
+    archive_path: &std::path::Path,
+    extract_path: &str,
+    dest_path: &std::path::Path,
+) -> Result<(), String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("Failed to open archive: {}", e))?;
+
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    // Normalize the extract path (remove leading ./ or /)
+    let extract_path = extract_path
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+
+    let mut found_entries = Vec::new();
+
+    for entry_result in archive
+        .entries()
+        .map_err(|e| format!("Failed to read archive entries: {}", e))?
+    {
+        let mut entry = entry_result.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+
+        let entry_path = entry
+            .path()
+            .map_err(|e| format!("Failed to get entry path: {}", e))?;
+
+        // Normalize entry path the same way
+        let entry_path_str = entry_path
+            .to_string_lossy()
+            .trim_start_matches("./")
+            .to_string();
+
+        if entry_path_str == extract_path {
+            debug!("Found matching entry: {}", entry_path_str);
+
+            // Ensure parent directory exists
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+            }
+
+            // Extract the file
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| format!("Failed to read entry contents: {}", e))?;
+
+            std::fs::write(dest_path, &contents)
+                .map_err(|e| format!("Failed to write extracted file: {}", e))?;
+
+            return Ok(());
+        }
+
+        // Collect entry paths for error message (limit to first 20)
+        if found_entries.len() < 20 {
+            found_entries.push(entry_path_str);
+        }
+    }
+
+    Err(format!(
+        "File '{}' not found in archive. Found entries: {:?}",
+        extract_path, found_entries
+    ))
 }
 
 pub async fn do_proxy(
