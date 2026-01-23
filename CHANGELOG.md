@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.2 (2026-01-23)
+
+* Allow extracting in /download endpoint
+
 ## v0.3.1 (2026-01-21)
 
 * Add /download and /check-origin endpoint
