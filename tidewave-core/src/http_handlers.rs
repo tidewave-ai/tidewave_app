@@ -159,7 +159,13 @@ impl DownloadState {
                         // Delete .part files older than 1 hour
                         if let Ok(modified) = metadata.modified() {
                             if let Ok(elapsed) = modified.elapsed() {
-                                if elapsed.as_secs() > 3600 && entry.path().extension().map(|e| e == "part").unwrap_or(false) {
+                                if elapsed.as_secs() > 3600
+                                    && entry
+                                        .path()
+                                        .extension()
+                                        .map(|e| e == "part")
+                                        .unwrap_or(false)
+                                {
                                     let _ = std::fs::remove_file(entry.path());
                                     debug!("Cleaned up old temp file: {:?}", entry.path());
                                 }
@@ -231,7 +237,14 @@ pub async fn download_handler(
     let is_wsl = params.is_wsl;
 
     // Validate key to prevent path traversal attacks
-    if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") || key.contains('.') {
+    // Allow .exe suffix for Windows executables
+    let key_to_validate = key.strip_suffix(".exe").unwrap_or(&key);
+    if key_to_validate.contains('/')
+        || key_to_validate.contains('\\')
+        || key_to_validate.contains(':')
+        || key_to_validate.contains("..")
+        || key_to_validate.contains('.')
+    {
         debug!("Invalid key (contains forbidden characters): {}", key);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -284,7 +297,17 @@ pub async fn download_handler(
             }
 
             // File doesn't exist - perform the download
-            let result = perform_download(client, url, file_path_clone, cache_dir_clone, tx.clone(), throttle, executable, extract).await;
+            let result = perform_download(
+                client,
+                url,
+                file_path_clone,
+                cache_dir_clone,
+                tx.clone(),
+                throttle,
+                executable,
+                extract,
+            )
+            .await;
 
             match result {
                 Ok(_final_path) => {
@@ -452,7 +475,8 @@ async fn perform_download(
     }
 
     // Check if response is compressed (clone the value to avoid borrowing)
-    let content_encoding = response.headers()
+    let content_encoding = response
+        .headers()
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -496,32 +520,34 @@ async fn perform_download(
             })
         });
 
-        let stream_reader = StreamReader::new(counting_stream.map(|result| {
-            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        }));
+        let stream_reader =
+            StreamReader::new(counting_stream.map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }));
 
         // Create reader - either with decompression or passthrough
-        let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match content_encoding.as_deref() {
-            Some("br") => {
-                debug!("Using brotli decompression");
-                Box::new(BrotliDecoder::new(tokio::io::BufReader::new(stream_reader)))
-            }
-            Some("gzip") => {
-                debug!("Using gzip decompression");
-                Box::new(GzipDecoder::new(tokio::io::BufReader::new(stream_reader)))
-            }
-            _ => {
-                debug!("No compression");
-                Box::new(tokio::io::BufReader::new(stream_reader))
-            }
-        };
+        let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+            match content_encoding.as_deref() {
+                Some("br") => {
+                    debug!("Using brotli decompression");
+                    Box::new(BrotliDecoder::new(tokio::io::BufReader::new(stream_reader)))
+                }
+                Some("gzip") => {
+                    debug!("Using gzip decompression");
+                    Box::new(GzipDecoder::new(tokio::io::BufReader::new(stream_reader)))
+                }
+                _ => {
+                    debug!("No compression");
+                    Box::new(tokio::io::BufReader::new(stream_reader))
+                }
+            };
 
         let mut buffer = vec![0u8; 8192];
         loop {
             // Timeout per chunk: 30 seconds
             let bytes_read = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)
+                tokio::io::AsyncReadExt::read(&mut reader, &mut buffer),
             )
             .await
             .map_err(|_| "Chunk read timed out after 30 seconds".to_string())?
@@ -548,7 +574,11 @@ async fn perform_download(
                 next_progress_threshold = network_bytes + progress_step;
                 let progress = DownloadProgress::Progress {
                     size: network_bytes,
-                    total: if total_size > 0 { Some(total_size) } else { None },
+                    total: if total_size > 0 {
+                        Some(total_size)
+                    } else {
+                        None
+                    },
                 };
                 let _ = tx.send(Ok(progress));
             }
@@ -638,8 +668,8 @@ fn extract_from_tarball(
     use std::io::Read;
     use tar::Archive;
 
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Failed to open archive: {}", e))?;
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
 
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
@@ -717,7 +747,14 @@ pub async fn do_proxy(
 
     // Helper closure to build a request with the given URL and optional Host header
     let build_request = |url: &str, custom_host: Option<&str>| {
-        build_http_request(&client, method.clone(), url, &headers, body_bytes.clone(), custom_host)
+        build_http_request(
+            &client,
+            method.clone(),
+            url,
+            &headers,
+            body_bytes.clone(),
+            custom_host,
+        )
     };
 
     // Execute the request

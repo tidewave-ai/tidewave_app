@@ -77,7 +77,6 @@ struct AboutParams {
     is_wsl: bool,
 }
 
-
 #[derive(Serialize)]
 #[serde(untagged)]
 enum StatFileResponse {
@@ -414,9 +413,7 @@ fn is_valid_origin(req: &Request, config: &ServerConfig) -> bool {
             let origin_port = origin_url.port();
 
             // Check if scheme + port matches our HTTP server
-            if is_localhost_variant
-                && scheme == "http"
-                && origin_port.unwrap_or(80) == config.port
+            if is_localhost_variant && scheme == "http" && origin_port.unwrap_or(80) == config.port
             {
                 return true;
             }
@@ -454,7 +451,10 @@ async fn verify_origin(
         return Ok(next.run(req).await);
     }
 
-    debug!("Rejected request with origin: {:?}", req.headers().get(header::ORIGIN));
+    debug!(
+        "Rejected request with origin: {:?}",
+        req.headers().get(header::ORIGIN)
+    );
     Err(StatusCode::FORBIDDEN)
 }
 
@@ -838,8 +838,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     },
                 };
 
-                let json_body =
-                    serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let json_body = serde_json::to_string(&response_body)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                 return Response::builder()
                     .header("Access-Control-Allow-Origin", "*")
@@ -848,7 +848,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
             };
 
-            return Err(StatusCode::INTERNAL_SERVER_ERROR)
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
 

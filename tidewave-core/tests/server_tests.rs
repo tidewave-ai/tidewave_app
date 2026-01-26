@@ -62,7 +62,9 @@ async fn start_file_server(path: &'static str, data: Vec<u8>) -> (u16, oneshot::
         );
 
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -520,7 +522,6 @@ async fn test_check_origin_endpoint() {
     shutdown_tx.send(()).ok();
 }
 
-
 #[tokio::test]
 async fn test_about_includes_system_info() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
@@ -549,7 +550,6 @@ async fn test_about_includes_system_info() {
 
     shutdown_tx.send(()).ok();
 }
-
 
 #[tokio::test]
 async fn test_which_finds_common_command() {
@@ -815,7 +815,11 @@ async fn test_download_basic() {
         .unwrap();
 
     let chunks2 = parse_download_chunks(&response2.bytes().await.unwrap());
-    assert_eq!(chunks2.len(), 1, "Should receive only done message for cached file");
+    assert_eq!(
+        chunks2.len(),
+        1,
+        "Should receive only done message for cached file"
+    );
     assert_eq!(chunks2[0]["status"], "done");
 
     file_shutdown_tx.send(()).ok();
@@ -843,7 +847,10 @@ async fn test_download_concurrent_with_throttle() {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("transfer-encoding").map(|v| v.to_str().unwrap()),
+            response
+                .headers()
+                .get("transfer-encoding")
+                .map(|v| v.to_str().unwrap()),
             Some("chunked")
         );
         parse_download_chunks(&response.bytes().await.unwrap())
@@ -866,13 +873,24 @@ async fn test_download_concurrent_with_throttle() {
     let chunks1 = chunks1.unwrap();
     let chunks2 = chunks2.unwrap();
 
-    assert!(chunks1.len() > 1, "Client 1 should receive multiple chunks. Got: {}", chunks1.len());
+    assert!(
+        chunks1.len() > 1,
+        "Client 1 should receive multiple chunks. Got: {}",
+        chunks1.len()
+    );
     assert_eq!(chunks1.last().unwrap()["status"], "done");
     assert_eq!(chunks2.last().unwrap()["status"], "done");
-    assert_eq!(chunks1.last().unwrap()["path"], chunks2.last().unwrap()["path"]);
+    assert_eq!(
+        chunks1.last().unwrap()["path"],
+        chunks2.last().unwrap()["path"]
+    );
 
     let progress_count = chunks1.iter().filter(|c| c["status"] == "progress").count();
-    assert!(progress_count > 0, "Should receive progress updates. Got {}", progress_count);
+    assert!(
+        progress_count > 0,
+        "Should receive progress updates. Got {}",
+        progress_count
+    );
 
     let path = chunks1.last().unwrap()["path"].as_str().unwrap();
     assert_eq!(std::fs::read(path).unwrap().len(), test_content.len());
@@ -888,7 +906,8 @@ async fn test_download_with_executable_flag() {
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
     let test_content = b"#!/bin/sh\necho 'Hello from script'";
-    let (file_port, file_shutdown_tx) = start_file_server("/script.sh", test_content.to_vec()).await;
+    let (file_port, file_shutdown_tx) =
+        start_file_server("/script.sh", test_content.to_vec()).await;
 
     let response = reqwest::Client::new()
         .get(format!(
@@ -907,7 +926,11 @@ async fn test_download_with_executable_flag() {
     assert_eq!(std::fs::read(path).unwrap(), test_content);
 
     let mode = std::fs::metadata(path).unwrap().permissions().mode();
-    assert!(mode & 0o111 != 0, "File should have executable permissions. Mode: {:o}", mode);
+    assert!(
+        mode & 0o111 != 0,
+        "File should have executable permissions. Mode: {:o}",
+        mode
+    );
 
     file_shutdown_tx.send(()).ok();
     shutdown_tx.send(()).ok();
@@ -971,7 +994,11 @@ async fn test_download_with_extract_file_not_found() {
 
     let message = last_chunk["message"].as_str().unwrap();
     assert!(message.contains("not found"), "Error: {}", message);
-    assert!(message.contains("other/path/file.txt"), "Error: {}", message);
+    assert!(
+        message.contains("other/path/file.txt"),
+        "Error: {}",
+        message
+    );
 
     file_shutdown_tx.send(()).ok();
     shutdown_tx.send(()).ok();
