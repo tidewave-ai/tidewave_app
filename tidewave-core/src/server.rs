@@ -815,16 +815,22 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
     #[cfg(target_os = "windows")]
     {
         if params.is_wsl {
+            tracing::debug!("about: is_wsl=true, running uname -m");
             let mut command = create_shell_command("uname -m", HashMap::new(), ".", true);
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
             let output = command
                 .output()
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|e| {
+                    tracing::error!("about: failed to run uname -m: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
+            tracing::debug!("about: uname -m exit status: {:?}", output.status);
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                tracing::debug!("about: detected arch: {}", arch);
                 let response_body = AboutResponse {
                     name: "tidewave-cli".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
@@ -838,15 +844,23 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                 };
 
                 let json_body =
-                    serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    serde_json::to_string(&response_body).map_err(|e| {
+                        tracing::error!("about: failed to serialize response: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
 
                 return Response::builder()
                     .header("Access-Control-Allow-Origin", "*")
                     .header("Content-Type", "application/json")
                     .body(Body::from(json_body))
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                    .map_err(|e| {
+                        tracing::error!("about: failed to build response: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    });
             };
 
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!("about: uname -m failed, stderr: {}", stderr);
             return Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
