@@ -839,12 +839,12 @@ async fn about() -> Result<Response<Body>, StatusCode> {
                     let json_body =
                         serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-                    Response::builder()
+                    return Response::builder()
                         .header("Access-Control-Allow-Origin", "*")
                         .header("Content-Type", "application/json")
                         .body(Body::from(json_body))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-                }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                };
 
                 return Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
