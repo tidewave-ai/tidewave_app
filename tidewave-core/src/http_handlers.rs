@@ -237,14 +237,7 @@ pub async fn download_handler(
     let is_wsl = params.is_wsl;
 
     // Validate key to prevent path traversal attacks
-    // Allow .exe suffix for Windows executables
-    let key_to_validate = key.strip_suffix(".exe").unwrap_or(&key);
-    if key_to_validate.contains('/')
-        || key_to_validate.contains('\\')
-        || key_to_validate.contains(':')
-        || key_to_validate.contains("..")
-        || key_to_validate.contains('.')
-    {
+    if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") {
         debug!("Invalid key (contains forbidden characters): {}", key);
         return Err(StatusCode::BAD_REQUEST);
     }
