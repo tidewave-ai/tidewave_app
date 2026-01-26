@@ -230,6 +230,8 @@ pub async fn download_handler(
     let extract = params.extract;
     let is_wsl = params.is_wsl;
 
+    debug!("download_handler: key={}, is_wsl={}", key, is_wsl);
+
     // Validate key to prevent path traversal attacks
     if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") || key.contains('.') {
         debug!("Invalid key (contains forbidden characters): {}", key);
@@ -357,11 +359,13 @@ pub async fn download_handler(
             return;
         }
 
+        debug!("download stream: is_wsl={}, file_path={:?}", is_wsl, file_path_for_stream);
         let final_path = if is_wsl {
             // Convert Windows path to WSL path using wslpath
             #[cfg(target_os = "windows")]
             {
                 let windows_path = file_path_for_stream.display().to_string();
+                debug!("download: converting path {} using wslpath", windows_path);
                 match tokio::process::Command::new("wsl.exe")
                     .arg("wslpath")
                     .arg("-a")
@@ -370,7 +374,9 @@ pub async fn download_handler(
                     .await
                 {
                     Ok(output) if output.status.success() => {
-                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                        let wsl_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        debug!("download: wslpath converted to: {}", wsl_path);
+                        wsl_path
                     }
                     Ok(output) => {
                         debug!("wslpath failed: {}", String::from_utf8_lossy(&output.stderr));
