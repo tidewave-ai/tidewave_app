@@ -816,7 +816,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
     {
         if params.is_wsl {
             tracing::debug!("about: is_wsl=true, running uname -m");
-            let mut command = create_shell_command("uname -m", HashMap::new(), ".", true);
+            let mut command = create_shell_command("uname -m", HashMap::new(), "~", true);
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
             let output = command
@@ -827,7 +827,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            tracing::debug!("about: uname -m exit status: {:?}", output.status);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!("about: uname -m exit status: {:?}, stderr: {}", output.status, stderr);
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 tracing::debug!("about: detected arch: {}", arch);
