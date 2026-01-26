@@ -121,7 +121,7 @@ struct WhichResponse {
 #[derive(Serialize)]
 struct SystemInfo {
     os: &'static str,
-    arch: &'static str,
+    arch: String,
     family: &'static str,
     target: &'static str,
     wsl: bool,
@@ -830,7 +830,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     system: SystemInfo {
                         os: "linux",
-                        arch: &arch,
+                        arch,
                         family: "unix",
                         target: env!("TARGET"),
                         wsl: true,
@@ -858,7 +858,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {
             os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
+            arch: std::env::consts::ARCH.to_string(),
             family: std::env::consts::FAMILY,
             target: env!("TARGET"),
             wsl: false,
