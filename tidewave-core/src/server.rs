@@ -117,6 +117,7 @@ struct SystemInfo {
     arch: &'static str,
     family: &'static str,
     target: &'static str,
+    wsl: bool,
 }
 
 #[derive(Serialize)]
@@ -804,6 +805,52 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
 }
 
 async fn about() -> Result<Response<Body>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    {
+        // Check if we're in WSL context
+        if let Some(env) = &params.env {
+            if env.get("WSL_DISTRO_NAME").is_some() {
+                // Run which command inside WSL
+                let cwd = params.cwd.as_deref().unwrap_or(".");
+                let env_clone = env.clone();
+
+                let mut command = create_shell_command("uname -m".as_str(), env_clone, cwd, params.is_wsl);
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+                let output = command
+                    .output()
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                if output.status.success() {
+                    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let response_body = AboutResponse {
+                        name: "tidewave-cli".to_string(),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        system: SystemInfo {
+                            os: "linux",
+                            arch: arch,
+                            family: "unix",
+                            target: env!("TARGET"),
+                            wsl: true,
+                        },
+                    };
+    
+                    let json_body =
+                        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+                    Response::builder()
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(json_body))
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                }
+
+                return Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    }
+
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -812,6 +859,7 @@ async fn about() -> Result<Response<Body>, StatusCode> {
             arch: std::env::consts::ARCH,
             family: std::env::consts::FAMILY,
             target: env!("TARGET"),
+            wsl: false,
         },
     };
 
