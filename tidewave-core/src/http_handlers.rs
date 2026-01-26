@@ -367,6 +367,7 @@ pub async fn download_handler(
                 let windows_path = file_path_for_stream.display().to_string();
                 debug!("download: converting path {} using wslpath", windows_path);
                 match tokio::process::Command::new("wsl.exe")
+                    .arg("-e")
                     .arg("wslpath")
                     .arg("-a")
                     .arg(&windows_path)
