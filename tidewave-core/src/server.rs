@@ -73,9 +73,7 @@ struct WhichParams {
 
 #[derive(Deserialize)]
 struct AboutParams {
-    env: Option<HashMap<String, String>>,
     #[serde(default)]
-    #[allow(dead_code)]
     is_wsl: bool,
 }
 
@@ -257,7 +255,7 @@ async fn serve_http_server_inner(
     let client_for_proxy = client.clone();
     let mut app = Router::new()
         .route("/", get(root))
-        .route("/about", get(about).post(about))
+        .route("/about", get(about))
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
@@ -813,49 +811,43 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about(params: Option<Json<AboutParams>>) -> Result<Response<Body>, StatusCode> {
+async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
     #[cfg(target_os = "windows")]
     {
-        // Check if we're in WSL context
-        if let Some(env) = params.as_ref().and_then(|p| p.env.as_ref()) {
-            if env.get("WSL_DISTRO_NAME").is_some() {
-                let env_clone = env.clone();
-                let is_wsl = params.as_ref().map(|p| p.is_wsl).unwrap_or(false);
+        if params.is_wsl {
+            let mut command = create_shell_command("uname -m", HashMap::new(), ".", true);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-                let mut command = create_shell_command("uname -m", env_clone, ".", is_wsl);
-                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command
+                .output()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                let output = command
-                    .output()
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                if output.status.success() {
-                    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let response_body = AboutResponse {
-                        name: "tidewave-cli".to_string(),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        system: SystemInfo {
-                            os: "linux",
-                            arch: arch,
-                            family: "unix",
-                            target: env!("TARGET"),
-                            wsl: true,
-                        },
-                    };
-    
-                    let json_body =
-                        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-                    return Response::builder()
-                        .header("Access-Control-Allow-Origin", "*")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(json_body))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            if output.status.success() {
+                let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let response_body = AboutResponse {
+                    name: "tidewave-cli".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    system: SystemInfo {
+                        os: "linux",
+                        arch: &arch,
+                        family: "unix",
+                        target: env!("TARGET"),
+                        wsl: true,
+                    },
                 };
 
-                return Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+                let json_body =
+                    serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                return Response::builder()
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json_body))
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            };
+
+            return Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 
