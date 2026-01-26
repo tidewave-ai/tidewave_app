@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.3 (2026-01-26)
+
+* Handle WSL for /download endpoint
+
 ## v0.3.2 (2026-01-23)
 
 * Allow extracting in /download endpoint
