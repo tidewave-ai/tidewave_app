@@ -71,6 +71,15 @@ struct WhichParams {
     is_wsl: bool,
 }
 
+#[derive(Deserialize)]
+struct AboutParams {
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum StatFileResponse {
@@ -248,7 +257,7 @@ async fn serve_http_server_inner(
     let client_for_proxy = client.clone();
     let mut app = Router::new()
         .route("/", get(root))
-        .route("/about", get(about))
+        .route("/about", get(about).post(about))
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
@@ -804,17 +813,16 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about() -> Result<Response<Body>, StatusCode> {
+async fn about(params: Option<Json<AboutParams>>) -> Result<Response<Body>, StatusCode> {
     #[cfg(target_os = "windows")]
     {
         // Check if we're in WSL context
-        if let Some(env) = &params.env {
+        if let Some(env) = params.as_ref().and_then(|p| p.env.as_ref()) {
             if env.get("WSL_DISTRO_NAME").is_some() {
-                // Run which command inside WSL
-                let cwd = params.cwd.as_deref().unwrap_or(".");
                 let env_clone = env.clone();
+                let is_wsl = params.as_ref().map(|p| p.is_wsl).unwrap_or(false);
 
-                let mut command = create_shell_command("uname -m".as_str(), env_clone, cwd, params.is_wsl);
+                let mut command = create_shell_command("uname -m", env_clone, ".", is_wsl);
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
                 let output = command
@@ -850,6 +858,8 @@ async fn about() -> Result<Response<Body>, StatusCode> {
             }
         }
     }
+
+    _ = params;
 
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
