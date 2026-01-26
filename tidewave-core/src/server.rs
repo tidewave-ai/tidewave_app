@@ -71,6 +71,12 @@ struct WhichParams {
     is_wsl: bool,
 }
 
+#[derive(Deserialize)]
+struct AboutParams {
+    #[serde(default)]
+    is_wsl: bool,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum StatFileResponse {
@@ -114,9 +120,10 @@ struct WhichResponse {
 #[derive(Serialize)]
 struct SystemInfo {
     os: &'static str,
-    arch: &'static str,
+    arch: String,
     family: &'static str,
     target: &'static str,
+    wsl: bool,
 }
 
 #[derive(Serialize)]
@@ -406,9 +413,7 @@ fn is_valid_origin(req: &Request, config: &ServerConfig) -> bool {
             let origin_port = origin_url.port();
 
             // Check if scheme + port matches our HTTP server
-            if is_localhost_variant
-                && scheme == "http"
-                && origin_port.unwrap_or(80) == config.port
+            if is_localhost_variant && scheme == "http" && origin_port.unwrap_or(80) == config.port
             {
                 return true;
             }
@@ -446,7 +451,10 @@ async fn verify_origin(
         return Ok(next.run(req).await);
     }
 
-    debug!("Rejected request with origin: {:?}", req.headers().get(header::ORIGIN));
+    debug!(
+        "Rejected request with origin: {:?}",
+        req.headers().get(header::ORIGIN)
+    );
     Err(StatusCode::FORBIDDEN)
 }
 
@@ -572,6 +580,7 @@ async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
     use tokio::process::Command;
     let mut command = Command::new("wsl.exe");
     command
+        .arg("-e")
         .arg("wslpath")
         .arg("-w")
         .arg(wsl_path)
@@ -803,15 +812,57 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about() -> Result<Response<Body>, StatusCode> {
+async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    {
+        if params.is_wsl {
+            let mut command = create_shell_command("uname -m", HashMap::new(), "~", true);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+            let output = command
+                .output()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            if output.status.success() {
+                let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let response_body = AboutResponse {
+                    name: "tidewave-cli".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    system: SystemInfo {
+                        os: "linux",
+                        arch,
+                        family: "unix",
+                        target: env!("TARGET"),
+                        wsl: true,
+                    },
+                };
+
+                let json_body = serde_json::to_string(&response_body)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                return Response::builder()
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json_body))
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            };
+
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    _ = params;
+
     let response_body = AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {
             os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
+            arch: std::env::consts::ARCH.to_string(),
             family: std::env::consts::FAMILY,
             target: env!("TARGET"),
+            wsl: false,
         },
     };
 
