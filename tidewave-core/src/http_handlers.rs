@@ -103,6 +103,8 @@ pub struct DownloadParams {
     pub executable: Option<bool>, // Optional flag to make the downloaded file executable
     #[serde(default)]
     pub extract: Option<String>, // Optional path to extract from archive (for .tar.gz/.tgz files)
+    #[serde(default)]
+    pub is_wsl: bool, // If true, convert the final path to WSL format using wslpath
 }
 
 #[derive(Serialize, Clone)]
@@ -226,6 +228,7 @@ pub async fn download_handler(
     let throttle = params.throttle;
     let executable = params.executable;
     let extract = params.extract;
+    let is_wsl = params.is_wsl;
 
     // Validate key to prevent path traversal attacks
     if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") || key.contains('.') {
@@ -354,8 +357,41 @@ pub async fn download_handler(
             return;
         }
 
+        let final_path = if is_wsl {
+            // Convert Windows path to WSL path using wslpath
+            #[cfg(target_os = "windows")]
+            {
+                let windows_path = file_path_for_stream.display().to_string();
+                match tokio::process::Command::new("wsl.exe")
+                    .arg("wslpath")
+                    .arg("-a")
+                    .arg(&windows_path)
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    }
+                    Ok(output) => {
+                        debug!("wslpath failed: {}", String::from_utf8_lossy(&output.stderr));
+                        windows_path
+                    }
+                    Err(e) => {
+                        debug!("Failed to run wslpath: {}", e);
+                        windows_path
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                file_path_for_stream.display().to_string()
+            }
+        } else {
+            file_path_for_stream.display().to_string()
+        };
+
         let done_progress = DownloadProgress::Done {
-            path: file_path_for_stream.display().to_string(),
+            path: final_path,
         };
         if let Ok(json) = serde_json::to_string(&done_progress) {
             let line = format!("{}\n", json);
