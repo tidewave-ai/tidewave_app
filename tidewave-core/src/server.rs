@@ -36,7 +36,7 @@ struct ShellParams {
 }
 
 #[derive(Deserialize)]
-struct StatFileParams {
+struct StatParams {
     path: String,
     #[serde(default)]
     #[allow(dead_code)]
@@ -79,9 +79,17 @@ struct AboutParams {
 
 #[derive(Serialize)]
 #[serde(untagged)]
-enum StatFileResponse {
-    StatFileResponseOk { success: bool, mtime: u64 },
-    StatFileResponseErr { success: bool, error: String },
+enum StatResponse {
+    StatResponseOk {
+        success: bool,
+        mtime: u64,
+        #[serde(rename = "type")]
+        path_type: String,
+    },
+    StatResponseErr {
+        success: bool,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -258,7 +266,7 @@ async fn serve_http_server_inner(
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
-        .route("/stat", get(stat_file_handler))
+        .route("/stat", get(stat_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
         .route(
@@ -708,15 +716,15 @@ async fn write_file_handler(
     }
 }
 
-async fn stat_file_handler(
-    Query(query): Query<StatFileParams>,
-) -> Result<Json<StatFileResponse>, StatusCode> {
+async fn stat_handler(
+    Query(query): Query<StatParams>,
+) -> Result<Json<StatResponse>, StatusCode> {
     #[cfg(target_os = "windows")]
     let file_path = if query.is_wsl {
         match wslpath_to_windows(&query.path).await {
             Ok(windows_path) => windows_path,
             Err(error) => {
-                return Ok(Json(StatFileResponse::StatFileResponseErr {
+                return Ok(Json(StatResponse::StatResponseErr {
                     success: false,
                     error,
                 }));
@@ -733,14 +741,15 @@ async fn stat_file_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mtime_op = fetch_mtime(file_path);
+    let result = fetch_stat(&file_path);
 
-    match mtime_op {
-        Ok(mtime) => Ok(Json(StatFileResponse::StatFileResponseOk {
+    match result {
+        Ok((mtime, path_type)) => Ok(Json(StatResponse::StatResponseOk {
             success: true,
             mtime,
+            path_type,
         })),
-        Err(error) => Ok(Json(StatFileResponse::StatFileResponseErr {
+        Err(error) => Ok(Json(StatResponse::StatResponseErr {
             success: false,
             error,
         })),
@@ -755,6 +764,28 @@ fn fetch_mtime(path: String) -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| "system time error".to_string());
+}
+
+fn fetch_stat(path: &str) -> Result<(u64, String), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.kind().to_string())?;
+    let mtime = metadata
+        .modified()
+        .map_err(|e| e.kind().to_string())?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| "system time error".to_string())?;
+
+    let path_type = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else if metadata.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+
+    Ok((mtime, path_type.to_string()))
 }
 
 async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResponse>, StatusCode> {
