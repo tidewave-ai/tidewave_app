@@ -4976,6 +4976,7 @@ dependencies = [
 name = "tidewave-app"
 version = "0.3.3"
 dependencies = [
+ "dirs 5.0.1",
  "serde",
  "serde_json",
  "tauri",

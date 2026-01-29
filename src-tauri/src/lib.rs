@@ -455,15 +455,10 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
-
 fn log_path() -> Option<PathBuf> {
-    let home = home_dir()?;
-    Some(home.join(".local").join("share").join("tidewave").join("logs").join("tidewave.log"))
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::env::temp_dir());
+    Some(data_dir.join("tidewave").join("logs").join("tidewave.log"))
 }
 
 fn ensure_parent_dir(path: &PathBuf) -> std::io::Result<()> {
