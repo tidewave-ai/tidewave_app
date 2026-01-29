@@ -799,6 +799,113 @@ async fn test_stat_directory() {
     shutdown_tx.send(()).ok();
 }
 
+#[tokio::test]
+async fn test_list_dir() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a temp directory with known contents
+    let temp_dir = std::env::temp_dir().join(format!("list_dir_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    // Create test files and directories
+    fs::write(temp_dir.join("file1.txt"), "content1").expect("Failed to write file1");
+    fs::write(temp_dir.join("file2.rs"), "content2").expect("Failed to write file2");
+    fs::create_dir(temp_dir.join("subdir")).expect("Failed to create subdir");
+    fs::create_dir(temp_dir.join("another_dir")).expect("Failed to create another_dir");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{}/list_dir?path={}",
+            port,
+            temp_dir.to_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // Clean up before assertions
+    fs::remove_dir_all(&temp_dir).ok();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["entries"].is_array());
+
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+
+    // Check specific files exist with correct types
+    let file1 = entries
+        .iter()
+        .find(|e| e["name"] == "file1.txt")
+        .expect("file1.txt should exist");
+    assert_eq!(file1["type"], "file");
+
+    let file2 = entries
+        .iter()
+        .find(|e| e["name"] == "file2.rs")
+        .expect("file2.rs should exist");
+    assert_eq!(file2["type"], "file");
+
+    let subdir = entries
+        .iter()
+        .find(|e| e["name"] == "subdir")
+        .expect("subdir should exist");
+    assert_eq!(subdir["type"], "directory");
+
+    let another_dir = entries
+        .iter()
+        .find(|e| e["name"] == "another_dir")
+        .expect("another_dir should exist");
+    assert_eq!(another_dir["type"], "directory");
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_list_dir_requires_absolute_path() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://127.0.0.1:{}/list_dir?path=relative/path", port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_list_dir_nonexistent() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{}/list_dir?path=/nonexistent/path/that/does/not/exist",
+            port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].is_string());
+
+    shutdown_tx.send(()).ok();
+}
+
 // ============================================================================
 // Download Tests
 // ============================================================================
