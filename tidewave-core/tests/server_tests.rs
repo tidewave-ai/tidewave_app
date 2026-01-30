@@ -800,13 +800,13 @@ async fn test_stat_directory() {
 }
 
 #[tokio::test]
-async fn test_list_dir() {
+async fn test_listdir() {
     use std::fs;
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
     // Create a temp directory with known contents
-    let temp_dir = std::env::temp_dir().join(format!("list_dir_test_{}", uuid::Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("listdir_test_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
     // Create test files and directories
@@ -867,7 +867,7 @@ async fn test_list_dir() {
 }
 
 #[tokio::test]
-async fn test_list_dir_requires_absolute_path() {
+async fn test_listdir_requires_absolute_path() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
     let client = reqwest::Client::new();
@@ -884,7 +884,7 @@ async fn test_list_dir_requires_absolute_path() {
 }
 
 #[tokio::test]
-async fn test_list_dir_nonexistent() {
+async fn test_listdir_nonexistent() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
     let client = reqwest::Client::new();

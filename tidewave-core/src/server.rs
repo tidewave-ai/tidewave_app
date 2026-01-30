@@ -310,7 +310,7 @@ async fn serve_http_server_inner(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_handler))
-        .route("/listdir", get(list_dir_handler))
+        .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
@@ -787,7 +787,7 @@ async fn stat_handler(
     }
 }
 
-async fn list_dir_handler(
+async fn listdir_handler(
     Query(query): Query<ListDirParams>,
 ) -> Result<Json<ListDirResponse>, StatusCode> {
     let dir_path = match normalize_path(&query.path, query.is_wsl).await {
