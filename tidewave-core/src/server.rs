@@ -654,26 +654,28 @@ async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
     }
 }
 
+#[allow(unused_variables)]
+async fn normalize_path(path: &str, is_wsl: bool) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    if is_wsl {
+        return wslpath_to_windows(path).await;
+    }
+
+    Ok(path.to_string())
+}
+
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
-    #[cfg(target_os = "windows")]
-    let file_path = if payload.is_wsl {
-        match wslpath_to_windows(&payload.path).await {
-            Ok(windows_path) => windows_path,
-            Err(error) => {
-                return Ok(Json(ReadFileResponse::ReadFileResponseErr {
-                    success: false,
-                    error,
-                }));
-            }
+    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(ReadFileResponse::ReadFileResponseErr {
+                success: false,
+                error,
+            }));
         }
-    } else {
-        payload.path.clone()
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let file_path = payload.path.clone();
 
     if !Path::new(&file_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
@@ -704,23 +706,15 @@ async fn read_file_handler(
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
-    #[cfg(target_os = "windows")]
-    let file_path = if payload.is_wsl {
-        match wslpath_to_windows(&payload.path).await {
-            Ok(windows_path) => windows_path,
-            Err(error) => {
-                return Ok(Json(WriteFileResponse::WriteFileResponseErr {
-                    success: false,
-                    error,
-                }));
-            }
+    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(WriteFileResponse::WriteFileResponseErr {
+                success: false,
+                error,
+            }));
         }
-    } else {
-        payload.path.clone()
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let file_path = payload.path.clone();
 
     if !Path::new(&file_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
@@ -764,23 +758,15 @@ async fn write_file_handler(
 async fn stat_handler(
     Query(query): Query<StatParams>,
 ) -> Result<Json<StatResponse>, StatusCode> {
-    #[cfg(target_os = "windows")]
-    let file_path = if query.is_wsl {
-        match wslpath_to_windows(&query.path).await {
-            Ok(windows_path) => windows_path,
-            Err(error) => {
-                return Ok(Json(StatResponse::StatResponseErr {
-                    success: false,
-                    error,
-                }));
-            }
+    let file_path = match normalize_path(&query.path, query.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(StatResponse::StatResponseErr {
+                success: false,
+                error,
+            }));
         }
-    } else {
-        query.path.clone()
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let file_path = query.path.clone();
 
     if !Path::new(&file_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
@@ -804,23 +790,15 @@ async fn stat_handler(
 async fn list_dir_handler(
     Query(query): Query<ListDirParams>,
 ) -> Result<Json<ListDirResponse>, StatusCode> {
-    #[cfg(target_os = "windows")]
-    let dir_path = if query.is_wsl {
-        match wslpath_to_windows(&query.path).await {
-            Ok(windows_path) => windows_path,
-            Err(error) => {
-                return Ok(Json(ListDirResponse::ListDirResponseErr {
-                    success: false,
-                    error,
-                }));
-            }
+    let dir_path = match normalize_path(&query.path, query.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(ListDirResponse::ListDirResponseErr {
+                success: false,
+                error,
+            }));
         }
-    } else {
-        query.path.clone()
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let dir_path = query.path.clone();
 
     if !Path::new(&dir_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
@@ -843,23 +821,15 @@ async fn list_dir_handler(
 async fn mkdir_handler(
     Json(payload): Json<MkdirParams>,
 ) -> Result<Json<MkdirResponse>, StatusCode> {
-    #[cfg(target_os = "windows")]
-    let dir_path = if payload.is_wsl {
-        match wslpath_to_windows(&payload.path).await {
-            Ok(windows_path) => windows_path,
-            Err(error) => {
-                return Ok(Json(MkdirResponse::MkdirResponseErr {
-                    success: false,
-                    error,
-                }));
-            }
+    let dir_path = match normalize_path(&payload.path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(MkdirResponse::MkdirResponseErr {
+                success: false,
+                error,
+            }));
         }
-    } else {
-        payload.path.clone()
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let dir_path = payload.path.clone();
 
     if !Path::new(&dir_path).is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
