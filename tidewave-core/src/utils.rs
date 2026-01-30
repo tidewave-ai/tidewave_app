@@ -1,3 +1,5 @@
+//! Shared utility functions.
+
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs;
@@ -47,4 +49,43 @@ fn load_tls_config(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
+}
+
+/// Converts a WSL path to a Windows path using wslpath.
+#[cfg(target_os = "windows")]
+async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("-e")
+        .arg("wslpath")
+        .arg("-w")
+        .arg(wsl_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run wslpath: {}", e))?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(path)
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("wslpath failed: {}", error))
+    }
+}
+
+/// Normalizes a path, converting WSL paths to Windows paths if needed.
+#[allow(unused_variables)]
+pub async fn normalize_path(path: &str, is_wsl: bool) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    if is_wsl {
+        return wslpath_to_windows(path).await;
+    }
+
+    Ok(path.to_string())
 }
