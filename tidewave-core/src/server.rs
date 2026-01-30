@@ -77,6 +77,14 @@ struct WriteFileParams {
 }
 
 #[derive(Deserialize)]
+struct DeleteFileParams {
+    path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
 struct WhichParams {
     command: String,
     // Note that cwd is only used in case PATH in env is also set
@@ -161,6 +169,13 @@ enum WriteFileResponse {
         success: bool,
         error: String,
     },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DeleteFileResponse {
+    DeleteFileResponseOk { success: bool },
+    DeleteFileResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -309,6 +324,7 @@ async fn serve_http_server_inner(
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
+        .route("/delete", post(delete_file_handler))
         .route("/stat", get(stat_handler))
         .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
@@ -751,6 +767,34 @@ async fn write_file_handler(
         Err(error) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
             success: false,
             error,
+        })),
+    }
+}
+
+async fn delete_file_handler(
+    Json(payload): Json<DeleteFileParams>,
+) -> Result<Json<DeleteFileResponse>, StatusCode> {
+    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    if !Path::new(&file_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = tokio::fs::remove_file(&file_path).await;
+
+    match result {
+        Ok(()) => Ok(Json(DeleteFileResponse::DeleteFileResponseOk { success: true })),
+        Err(error) => Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
+            success: false,
+            error: error.kind().to_string(),
         })),
     }
 }
