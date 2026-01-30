@@ -119,11 +119,11 @@ async fn test_watch_subscribe_relative_path_error() {
         )))
         .unwrap();
 
-    // Should receive error
-    let event = wait_for_event(&mut ws_out_rx, "error", 1000).await;
-    assert!(event.is_some(), "Expected error event");
+    // Should receive unsubscribed with error
+    let event = wait_for_event(&mut ws_out_rx, "unsubscribed", 1000).await;
+    assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
-    assert!(event["message"]
+    assert!(event["error"]
         .as_str()
         .unwrap()
         .contains("absolute"));
@@ -154,11 +154,11 @@ async fn test_watch_subscribe_nonexistent_path_error() {
         )))
         .unwrap();
 
-    // Should receive error
-    let event = wait_for_event(&mut ws_out_rx, "error", 1000).await;
-    assert!(event.is_some(), "Expected error event");
+    // Should receive unsubscribed with error
+    let event = wait_for_event(&mut ws_out_rx, "unsubscribed", 1000).await;
+    assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
-    assert!(event["message"]
+    assert!(event["error"]
         .as_str()
         .unwrap()
         .contains("does not exist"));
