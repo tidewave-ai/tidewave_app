@@ -12,11 +12,11 @@
 //! ```json
 //! {"event": "subscribed", "ref": "watch1"}
 //! {"event": "unsubscribed", "ref": "watch1"}
+//! {"event": "unsubscribed", "ref": "watch1", "error": "..."}
 //! {"event": "created", "path": "/foo/bar/file.txt", "ref": "watch1"}
 //! {"event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
 //! {"event": "deleted", "path": "/foo/bar/file.txt", "ref": "watch1"}
 //! {"event": "renamed", "from": "/foo/bar/old.txt", "to": "/foo/bar/new.txt", "ref": "watch1"}
-//! {"event": "error", "message": "...", "ref": "watch1"}
 //! {"event": "warning", "message": "...", "ref": "watch1"}
 //! ```
 
@@ -95,11 +95,6 @@ pub enum WatchEvent {
         #[serde(rename = "ref")]
         reference: String,
     },
-    Error {
-        message: String,
-        #[serde(rename = "ref")]
-        reference: String,
-    },
     Warning {
         message: String,
         #[serde(rename = "ref")]
@@ -112,6 +107,8 @@ pub enum WatchEvent {
     Unsubscribed {
         #[serde(rename = "ref")]
         reference: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -136,16 +133,15 @@ impl WatchEvent {
                 to: to.clone(),
                 reference: new_ref,
             },
-            WatchEvent::Error { message, .. } => WatchEvent::Error {
-                message: message.clone(),
-                reference: new_ref,
-            },
             WatchEvent::Warning { message, .. } => WatchEvent::Warning {
                 message: message.clone(),
                 reference: new_ref,
             },
             WatchEvent::Subscribed { .. } => WatchEvent::Subscribed { reference: new_ref },
-            WatchEvent::Unsubscribed { .. } => WatchEvent::Unsubscribed { reference: new_ref },
+            WatchEvent::Unsubscribed { error, .. } => WatchEvent::Unsubscribed {
+                reference: new_ref,
+                error: error.clone(),
+            },
         }
     }
 }
@@ -299,21 +295,21 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
     let normalized_path = match normalize_path(path, is_wsl).await {
         Ok(p) => p,
         Err(e) => {
-            send_error(state, websocket_id, reference, &format!("Failed to normalize path: {}", e));
+            send_unsubscribed_with_error(state, websocket_id, reference, &format!("Failed to normalize path: {}", e));
             return;
         }
     };
 
     // Validate path is absolute
     if !Path::new(&normalized_path).is_absolute() {
-        send_error(state, websocket_id, reference, "Path must be absolute");
+        send_unsubscribed_with_error(state, websocket_id, reference, "Path must be absolute");
         return;
     }
 
     // Check if path exists
     let path_obj = Path::new(&normalized_path);
     if !path_obj.exists() {
-        send_error(state, websocket_id, reference, "Path does not exist");
+        send_unsubscribed_with_error(state, websocket_id, reference, "Path does not exist");
         return;
     }
 
@@ -321,7 +317,7 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
     let canonical_path = match path_obj.canonicalize() {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(e) => {
-            send_error(state, websocket_id, reference, &format!("Failed to canonicalize path: {}", e));
+            send_unsubscribed_with_error(state, websocket_id, reference, &format!("Failed to canonicalize path: {}", e));
             return;
         }
     };
@@ -381,6 +377,7 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                     if let Some(tx) = state_for_forward.websocket_senders.get(&websocket_id) {
                         let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
                             reference: reference_for_forward.clone(),
+                            error: Some("watcher closed".to_string()),
                         }));
                     }
                     break;
@@ -448,12 +445,12 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                             Box::new(w)
                         }
                         Err(poll_err) => {
-                            let _ = tx.send(WatchEvent::Error {
-                                message: format!(
+                            let _ = tx.send(WatchEvent::Unsubscribed {
+                                reference: canonical_path_for_task.clone(),
+                                error: Some(format!(
                                     "Failed to create watcher: {} (poll fallback also failed: {})",
                                     e, poll_err
-                                ),
-                                reference: canonical_path_for_task.clone(),
+                                )),
                             });
                             state_for_task.watchers.remove(&canonical_path_for_task);
                             return;
@@ -465,9 +462,9 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
             if let Err(e) =
                 watcher.watch(Path::new(&canonical_path_for_task), RecursiveMode::Recursive)
             {
-                let _ = tx.send(WatchEvent::Error {
-                    message: format!("Failed to watch path: {}", e),
+                let _ = tx.send(WatchEvent::Unsubscribed {
                     reference: canonical_path_for_task.clone(),
+                    error: Some(format!("Failed to watch path: {}", e)),
                 });
                 state_for_task.watchers.remove(&canonical_path_for_task);
                 return;
@@ -500,10 +497,12 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                                 }
                             }
                             Some(Err(e)) => {
-                                let _ = tx.send(WatchEvent::Error {
-                                    message: format!("Watch error: {}", e),
+                                let _ = tx.send(WatchEvent::Unsubscribed {
                                     reference: canonical_path_for_task.clone(),
+                                    error: Some(format!("Watch error: {}", e)),
                                 });
+                                state_for_task.watchers.remove(&canonical_path_for_task);
+                                return;
                             }
                             None => {
                                 state_for_task.watchers.remove(&canonical_path_for_task);
@@ -542,15 +541,21 @@ async fn handle_unsubscribe(state: &WatchState, websocket_id: WebSocketId, refer
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
         let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
             reference: reference.to_string(),
+            error: None,
         }));
     }
 }
 
-fn send_error(state: &WatchState, websocket_id: WebSocketId, reference: &str, message: &str) {
+fn send_unsubscribed_with_error(
+    state: &WatchState,
+    websocket_id: WebSocketId,
+    reference: &str,
+    message: &str,
+) {
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Error {
-            message: message.to_string(),
+        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
             reference: reference.to_string(),
+            error: Some(message.to_string()),
         }));
     }
 }
@@ -629,6 +634,7 @@ fn convert_notify_event(
                     // Watched directory was removed - send unsubscribed
                     results.push(WatchEvent::Unsubscribed {
                         reference: watched_path.to_string(),
+                        error: Some("watched path was removed".to_string()),
                     });
                 } else {
                     results.push(WatchEvent::Deleted {
