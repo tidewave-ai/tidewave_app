@@ -26,7 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dashmap = "6.0"
-notify = "6.1"
+notify = "8.1"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
 tar = "0.4"
