@@ -819,7 +819,7 @@ async fn test_list_dir() {
 
     let response = client
         .get(format!(
-            "http://127.0.0.1:{}/list_dir?path={}",
+            "http://127.0.0.1:{}/listdir?path={}",
             port,
             temp_dir.to_str().unwrap()
         ))
@@ -873,7 +873,7 @@ async fn test_list_dir_requires_absolute_path() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("http://127.0.0.1:{}/list_dir?path=relative/path", port))
+        .get(format!("http://127.0.0.1:{}/listdir?path=relative/path", port))
         .send()
         .await
         .unwrap();
@@ -891,7 +891,7 @@ async fn test_list_dir_nonexistent() {
 
     let response = client
         .get(format!(
-            "http://127.0.0.1:{}/list_dir?path=/nonexistent/path/that/does/not/exist",
+            "http://127.0.0.1:{}/listdir?path=/nonexistent/path/that/does/not/exist",
             port
         ))
         .send()
@@ -902,6 +902,94 @@ async fn test_list_dir_nonexistent() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["success"], false);
     assert!(body["error"].is_string());
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_mkdir() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("mkdir_test_{}", uuid::Uuid::new_v4()));
+    let nested_dir = temp_dir.join("nested").join("deep").join("directory");
+
+    // Ensure the directory doesn't exist
+    fs::remove_dir_all(&temp_dir).ok();
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/mkdir", port))
+        .json(&serde_json::json!({
+            "path": nested_dir.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    // Verify the directory was created
+    assert!(nested_dir.exists());
+    assert!(nested_dir.is_dir());
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_mkdir_requires_absolute_path() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/mkdir", port))
+        .json(&serde_json::json!({
+            "path": "relative/path"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_mkdir_already_exists() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("mkdir_exists_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let client = reqwest::Client::new();
+
+    // mkdir on an existing directory should succeed (create_dir_all behavior)
+    let response = client
+        .post(format!("http://127.0.0.1:{}/mkdir", port))
+        .json(&serde_json::json!({
+            "path": temp_dir.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
 
     shutdown_tx.send(()).ok();
 }

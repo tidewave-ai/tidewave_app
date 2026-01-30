@@ -52,6 +52,14 @@ struct ListDirParams {
 }
 
 #[derive(Deserialize)]
+struct MkdirParams {
+    path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
 struct ReadFileParams {
     path: String,
     #[serde(default)]
@@ -118,6 +126,13 @@ enum ListDirResponse {
         success: bool,
         error: String,
     },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MkdirResponse {
+    MkdirResponseOk { success: bool },
+    MkdirResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -295,7 +310,8 @@ async fn serve_http_server_inner(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/stat", get(stat_handler))
-        .route("/list_dir", get(list_dir_handler))
+        .route("/listdir", get(list_dir_handler))
+        .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
         .route(
@@ -820,6 +836,42 @@ async fn list_dir_handler(
         Err(error) => Ok(Json(ListDirResponse::ListDirResponseErr {
             success: false,
             error,
+        })),
+    }
+}
+
+async fn mkdir_handler(
+    Json(payload): Json<MkdirParams>,
+) -> Result<Json<MkdirResponse>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    let dir_path = if payload.is_wsl {
+        match wslpath_to_windows(&payload.path).await {
+            Ok(windows_path) => windows_path,
+            Err(error) => {
+                return Ok(Json(MkdirResponse::MkdirResponseErr {
+                    success: false,
+                    error,
+                }));
+            }
+        }
+    } else {
+        payload.path.clone()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let dir_path = payload.path.clone();
+
+    if !Path::new(&dir_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = tokio::fs::create_dir_all(&dir_path).await;
+
+    match result {
+        Ok(()) => Ok(Json(MkdirResponse::MkdirResponseOk { success: true })),
+        Err(error) => Ok(Json(MkdirResponse::MkdirResponseErr {
+            success: false,
+            error: error.kind().to_string(),
         })),
     }
 }
