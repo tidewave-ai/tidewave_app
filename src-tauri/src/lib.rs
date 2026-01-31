@@ -87,26 +87,15 @@ pub fn run() {
             }
 
             // Initialize logging to file and console
-            let log_path_opt = log_path();
-            let log_guard = if let Some(ref lp) = log_path_opt {
-                let _ = ensure_parent_dir(lp);
-                init_tracing(lp, config.debug)
-            } else {
-                // Fallback to console-only logging if log path can't be determined
-                let filter = if config.debug { "debug" } else { "info" };
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .try_init();
-                None
-            };
+            let log_path = log_path();
+            let _ = ensure_parent_dir(&log_path);
+            let log_guard = init_tracing(&log_path, config.debug);
 
             if config.debug {
                 debug!("Debug logging enabled");
                 debug!("{:?}", config);
             }
-            if let Some(ref lp) = log_path_opt {
-                println!("Logging to file: {}", lp.display());
-            }
+            println!("Logging to file: {}", log_path.display());
 
             // Set environment variables from config before server initialization
             for (key, value) in &config.env {
@@ -151,7 +140,7 @@ pub fn run() {
 
             // Store log state (log_path and guard to keep writer alive)
             app.manage(LogState {
-                log_path: log_path_opt.unwrap_or_default(),
+                log_path,
                 log_guard,
             });
 
@@ -455,10 +444,10 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
     }
 }
 
-fn log_path() -> Option<PathBuf> {
+fn log_path() -> PathBuf {
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::env::temp_dir());
-    Some(data_dir.join("tidewave").join("logs").join("tidewave.log"))
+    data_dir.join("tidewave").join("logs").join("tidewave.log")
 }
 
 fn ensure_parent_dir(path: &PathBuf) -> std::io::Result<()> {
