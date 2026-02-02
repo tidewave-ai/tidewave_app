@@ -3,11 +3,28 @@
 //! This module provides a unified WebSocket endpoint (`/ws`) that supports
 //! multiple features over a single connection:
 //! - `watch`: File system watching
+//!
+//! # Protocol
+//!
+//! All messages (except ping/pong) include a `topic` field for routing:
+//!
+//! Client → Server:
+//! ```json
+//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
+//! {"topic": "watch", "action": "unsubscribe", "ref": "watch1"}
+//! ```
+//!
+//! Server → Client:
+//! ```json
+//! {"topic": "watch", "event": "subscribed", "ref": "watch1"}
+//! {"topic": "watch", "event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
+//! ```
 
 pub mod connection;
 pub mod watch;
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
@@ -22,11 +39,30 @@ pub use watch::{WatchClientMessage, WatchEvent, WatchFeatureState};
 
 pub type WebSocketId = Uuid;
 
-/// Outbound message types for WebSocket communication
+/// Inbound message with topic-based routing (client → server)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "topic")]
+pub enum ClientMessage {
+    #[serde(rename = "watch")]
+    Watch {
+        #[serde(flatten)]
+        message: WatchClientMessage,
+    },
+}
+
+/// Outbound message types for WebSocket communication (server → client)
 #[derive(Debug, Clone)]
 pub enum WsOutboundMessage {
     Watch(WatchEvent),
     Pong,
+}
+
+/// Helper struct for serializing outbound messages with topic field
+#[derive(Serialize)]
+struct TopicMessage<'a, T: Serialize> {
+    topic: &'a str,
+    #[serde(flatten)]
+    inner: T,
 }
 
 /// Global WebSocket state
