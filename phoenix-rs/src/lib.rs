@@ -5,6 +5,7 @@ pub mod registry;
 pub mod serializer;
 pub mod socket;
 pub(crate) mod subscription;
+pub mod testing;
 pub mod transport;
 
 pub use channel::{
@@ -15,4 +16,5 @@ pub use error::PhoenixError;
 pub use message::{events, PhxMessage};
 pub use registry::{ChannelRegistry, TopicPattern};
 pub use socket::Socket;
-pub use transport::{phoenix_router, phoenix_router_at, phoenix_state, PhoenixState};
+pub use testing::{JoinedChannel, TestClient};
+pub use transport::{PhoenixState, phoenix_router, phoenix_router_at, phoenix_state};
