@@ -5,6 +5,7 @@ mod http_handlers;
 mod mcp_remote;
 pub mod server;
 pub mod utils;
+pub mod watch_channel;
 pub mod ws;
 
 pub use config::{get_config_path, load_config, Config};
