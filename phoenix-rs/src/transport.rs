@@ -247,7 +247,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for TestChannel {
-        async fn join(&self, topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
             JoinResult::ok(json!({"joined": topic}))
         }
 
@@ -255,7 +255,7 @@ mod tests {
             &self,
             event: &str,
             payload: Value,
-            socket: &SocketRef,
+            socket: &mut SocketRef,
         ) -> HandleResult {
             match event {
                 "ping" => HandleResult::ok(json!({"pong": true})),

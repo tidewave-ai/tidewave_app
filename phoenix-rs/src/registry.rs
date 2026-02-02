@@ -180,7 +180,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for TestRoomChannel {
-        async fn join(&self, _topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, _topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
             JoinResult::ok(json!({"channel": "room"}))
         }
 
@@ -188,7 +188,7 @@ mod tests {
             &self,
             _event: &str,
             _payload: Value,
-            _socket: &SocketRef,
+            _socket: &mut SocketRef,
         ) -> HandleResult {
             HandleResult::no_reply()
         }
@@ -196,7 +196,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for TestChatChannel {
-        async fn join(&self, _topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, _topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
             JoinResult::ok(json!({"channel": "chat"}))
         }
 
@@ -204,7 +204,7 @@ mod tests {
             &self,
             _event: &str,
             _payload: Value,
-            _socket: &SocketRef,
+            _socket: &mut SocketRef,
         ) -> HandleResult {
             HandleResult::no_reply()
         }
@@ -212,7 +212,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for TestLobbyChannel {
-        async fn join(&self, _topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, _topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
             JoinResult::ok(json!({"channel": "lobby"}))
         }
 
@@ -220,7 +220,7 @@ mod tests {
             &self,
             _event: &str,
             _payload: Value,
-            _socket: &SocketRef,
+            _socket: &mut SocketRef,
         ) -> HandleResult {
             HandleResult::no_reply()
         }
@@ -267,7 +267,7 @@ mod tests {
 
         let (sender, _) = mpsc::unbounded_channel();
         let (broadcast_sender, _) = mpsc::unbounded_channel();
-        let socket = SocketRef::new(
+        let mut socket = SocketRef::new(
             "room:lobby".to_string(),
             "1".to_string(),
             sender,
@@ -276,7 +276,7 @@ mod tests {
 
         // Should use the exact match (lobby channel)
         let handler = registry.find("room:lobby").unwrap();
-        let result = handler.join("room:lobby", json!({}), &socket).await;
+        let result = handler.join("room:lobby", json!({}), &mut socket).await;
 
         if let JoinResult::Ok(payload) = result {
             assert_eq!(payload["channel"], "lobby");
@@ -287,7 +287,7 @@ mod tests {
         // Should use wildcard for other room topics
         let (sender, _) = mpsc::unbounded_channel();
         let (broadcast_sender, _) = mpsc::unbounded_channel();
-        let socket = SocketRef::new(
+        let mut socket = SocketRef::new(
             "room:other".to_string(),
             "2".to_string(),
             sender,
@@ -295,7 +295,7 @@ mod tests {
         );
 
         let handler = registry.find("room:other").unwrap();
-        let result = handler.join("room:other", json!({}), &socket).await;
+        let result = handler.join("room:other", json!({}), &mut socket).await;
 
         if let JoinResult::Ok(payload) = result {
             assert_eq!(payload["channel"], "room");

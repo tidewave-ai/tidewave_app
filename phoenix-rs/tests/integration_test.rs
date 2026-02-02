@@ -14,7 +14,7 @@ struct EchoChannel;
 
 #[async_trait]
 impl Channel for EchoChannel {
-    async fn join(&self, topic: &str, payload: Value, _socket: &SocketRef) -> JoinResult {
+    async fn join(&self, topic: &str, payload: Value, _socket: &mut SocketRef) -> JoinResult {
         // Extract user_id from payload if present
         let user_id = payload.get("user_id").and_then(|v| v.as_str());
         JoinResult::ok(json!({
@@ -23,7 +23,7 @@ impl Channel for EchoChannel {
         }))
     }
 
-    async fn handle_in(&self, event: &str, payload: Value, socket: &SocketRef) -> HandleResult {
+    async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
         match event {
             "ping" => HandleResult::ok(json!({"pong": true})),
             "echo" => HandleResult::ok(payload),
@@ -47,7 +47,7 @@ struct RejectChannel;
 
 #[async_trait]
 impl Channel for RejectChannel {
-    async fn join(&self, _topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+    async fn join(&self, _topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
         JoinResult::error(json!({"reason": "unauthorized"}))
     }
 
@@ -55,7 +55,7 @@ impl Channel for RejectChannel {
         &self,
         _event: &str,
         _payload: Value,
-        _socket: &SocketRef,
+        _socket: &mut SocketRef,
     ) -> HandleResult {
         HandleResult::no_reply()
     }
