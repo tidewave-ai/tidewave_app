@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::message::PhxMessage;
 
@@ -230,6 +231,8 @@ pub struct SocketRef {
     assigns: Assigns,
     /// Channel for sending info messages to this subscription's handle_info
     info_sender: Option<mpsc::UnboundedSender<BoxedInfo>>,
+    /// Token that gets cancelled when the subscription terminates
+    shutdown_token: Option<CancellationToken>,
 }
 
 impl SocketRef {
@@ -247,16 +250,18 @@ impl SocketRef {
             broadcast_sender,
             assigns: Assigns::new(),
             info_sender: None,
+            shutdown_token: None,
         }
     }
 
-    /// Create a new SocketRef with info sender (used by subscription loop)
+    /// Create a new SocketRef with info sender and shutdown token (used by subscription loop)
     pub(crate) fn with_info_sender(
         topic: String,
         join_ref: String,
         sender: mpsc::UnboundedSender<PhxMessage>,
         broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
         info_sender: mpsc::UnboundedSender<BoxedInfo>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             topic,
@@ -265,10 +270,11 @@ impl SocketRef {
             broadcast_sender,
             assigns: Assigns::new(),
             info_sender: Some(info_sender),
+            shutdown_token: Some(shutdown_token),
         }
     }
 
-    /// Create a new SocketRef with assigns and info sender (used by subscription loop)
+    /// Create a new SocketRef with assigns, info sender, and shutdown token (used by subscription loop)
     pub(crate) fn with_assigns_and_info_sender(
         topic: String,
         join_ref: String,
@@ -276,6 +282,7 @@ impl SocketRef {
         broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
         assigns: Assigns,
         info_sender: mpsc::UnboundedSender<BoxedInfo>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             topic,
@@ -284,6 +291,7 @@ impl SocketRef {
             broadcast_sender,
             assigns,
             info_sender: Some(info_sender),
+            shutdown_token: Some(shutdown_token),
         }
     }
 
@@ -329,6 +337,37 @@ impl SocketRef {
     /// Returns `None` if info messaging is not enabled (shouldn't happen in normal use).
     pub fn info_sender<M: Send + 'static>(&self) -> Option<InfoSender<M>> {
         self.info_sender.as_ref().map(|s| InfoSender::new(s.clone()))
+    }
+
+    /// Get a cancellation token that is cancelled when the subscription terminates.
+    ///
+    /// Use this in background tasks with `tokio::select!` to stop cleanly when
+    /// the subscription ends (leave or disconnect).
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn join(&self, topic: &str, payload: Value, socket: &mut SocketRef) -> JoinResult {
+    ///     let info_tx = socket.info_sender::<MyEvent>();
+    ///     let shutdown = socket.shutdown_token();
+    ///
+    ///     tokio::spawn(async move {
+    ///         loop {
+    ///             tokio::select! {
+    ///                 _ = shutdown.cancelled() => break,  // Clean exit
+    ///                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
+    ///                     let _ = info_tx.send(MyEvent::Tick);
+    ///                 }
+    ///             }
+    ///         }
+    ///     });
+    ///
+    ///     JoinResult::ok(json!({}))
+    /// }
+    /// ```
+    ///
+    /// Returns `None` if shutdown token is not available (shouldn't happen in normal use).
+    pub fn shutdown_token(&self) -> Option<CancellationToken> {
+        self.shutdown_token.clone()
     }
 
     // ==================== Assigns API ====================

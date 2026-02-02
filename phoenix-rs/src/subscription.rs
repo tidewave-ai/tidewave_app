@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::channel::{Assigns, BoxedInfo, Channel, HandleResult, JoinResult, SocketRef};
@@ -79,13 +80,17 @@ pub(crate) async fn spawn_subscription(
     let (msg_tx, msg_rx) = mpsc::unbounded_channel::<SubscriptionMsg>();
     let (info_tx, info_rx) = mpsc::unbounded_channel::<BoxedInfo>();
 
-    // Create initial socket ref with info sender
+    // Create cancellation token for background tasks
+    let shutdown_token = CancellationToken::new();
+
+    // Create initial socket ref with info sender and shutdown token
     let mut socket_ref = SocketRef::with_info_sender(
         topic.clone(),
         join_ref.clone(),
         client_sender.clone(),
         broadcast_sender.clone(),
         info_tx.clone(),
+        shutdown_token.clone(),
     );
 
     // Call join to see if we should accept
@@ -105,6 +110,7 @@ pub(crate) async fn spawn_subscription(
                 msg_rx,
                 info_rx,
                 info_tx,
+                shutdown_token,
                 client_sender,
                 broadcast_sender,
             ));
@@ -130,6 +136,7 @@ async fn subscription_loop(
     mut msg_rx: mpsc::UnboundedReceiver<SubscriptionMsg>,
     mut info_rx: mpsc::UnboundedReceiver<BoxedInfo>,
     info_tx: mpsc::UnboundedSender<BoxedInfo>,
+    shutdown_token: CancellationToken,
     client_sender: mpsc::UnboundedSender<PhxMessage>,
     broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
 ) -> SubscriptionResult {
@@ -144,6 +151,7 @@ async fn subscription_loop(
             broadcast_sender.clone(),
             std::mem::take(&mut assigns),
             info_tx.clone(),
+            shutdown_token.clone(),
         );
 
         tokio::select! {
@@ -174,6 +182,9 @@ async fn subscription_loop(
                             }
                             HandleResult::NoReply => {}
                             HandleResult::Stop { reason } => {
+                                // Cancel shutdown token to stop background tasks
+                                shutdown_token.cancel();
+
                                 // Send close message
                                 let close_msg = PhxMessage {
                                     join_ref: Some(join_ref.clone()),
@@ -193,6 +204,9 @@ async fn subscription_loop(
                     }
                     SubscriptionMsg::Leave { msg_ref } => {
                         debug!(topic = %topic, "Handling leave");
+
+                        // Cancel shutdown token to stop background tasks
+                        shutdown_token.cancel();
 
                         // Call terminate
                         channel.terminate("leave", &mut socket_ref).await;
@@ -214,6 +228,9 @@ async fn subscription_loop(
                     }
                     SubscriptionMsg::Terminate { reason } => {
                         debug!(topic = %topic, reason = %reason, "Handling terminate");
+
+                        // Cancel shutdown token to stop background tasks
+                        shutdown_token.cancel();
 
                         // Call terminate
                         channel.terminate(&reason, &mut socket_ref).await;

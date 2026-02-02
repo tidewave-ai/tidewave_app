@@ -10,6 +10,7 @@ pub mod transport;
 pub use channel::{
     Assigns, Channel, HandleResult, InfoSendError, InfoSender, JoinResult, ReplyStatus, SocketRef,
 };
+pub use tokio_util::sync::CancellationToken;
 pub use error::PhoenixError;
 pub use message::{events, PhxMessage};
 pub use registry::{ChannelRegistry, TopicPattern};
