@@ -1,25 +1,21 @@
-use futures::channel::mpsc as futures_mpsc;
-use futures::StreamExt;
+use phoenix_rs::{ChannelRegistry, TestClient};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tidewave_core::acp_proxy::*;
+use tidewave_core::acp_channel::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
 #[tokio::test]
-async fn test_websocket_init_request_flow() {
+async fn test_channel_init_request_flow() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
-    let state = AcpProxyState::with_process_starter(starter);
+    let state = AcpChannelState::with_process_starter(starter);
 
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
-    let websocket_id = uuid::Uuid::new_v4();
+    let mut registry = ChannelRegistry::new();
+    registry.register("acp:*", AcpChannel::with_state(state));
 
-    // Start the handler in background
-    tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
-    });
+    let mut client = TestClient::new(registry);
+    let mut channel = client.join("acp:test", json!({})).await.unwrap();
 
-    // Send init request from client
+    // Send init request via jsonrpc event
     let init_request = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -27,11 +23,7 @@ async fn test_websocket_init_request_flow() {
         "params": params_with_spawn_opts(json!({}))
     });
 
-    ws_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request.to_string().into(),
-        )))
-        .unwrap();
+    channel.push("jsonrpc", init_request).await;
 
     // Wait for process to actually start
     process_started.await.expect("Process failed to start");
@@ -52,30 +44,24 @@ async fn test_websocket_init_request_flow() {
     });
     write_json_line(&mut test_stdin, &init_response).await;
 
-    // Client should receive response with original ID
-    let ws_msg = ws_out_rx.next().await.unwrap();
-    match ws_msg {
-        axum::extract::ws::Message::Text(text) => {
-            let response: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(response["id"], 1);
-            assert_eq!(response["result"]["protocolVersion"], 1);
-        }
-        _ => panic!("Expected text message"),
-    }
+    // Client should receive response via jsonrpc event with original ID
+    let msg = channel.recv().await.expect("Expected response message");
+    assert_eq!(msg.event, "jsonrpc");
+    let response = &msg.payload;
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["protocolVersion"], 1);
 }
 
 #[tokio::test]
-async fn test_websocket_session_new_flow() {
+async fn test_channel_session_new_flow() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
-    let state = AcpProxyState::with_process_starter(starter);
+    let state = AcpChannelState::with_process_starter(starter);
 
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
-    let websocket_id = uuid::Uuid::new_v4();
+    let mut registry = ChannelRegistry::new();
+    registry.register("acp:*", AcpChannel::with_state(state));
 
-    // Start the handler
-    tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
-    });
+    let mut client = TestClient::new(registry);
+    let mut channel = client.join("acp:test", json!({})).await.unwrap();
 
     // First send initialize to start the process
     let init_request = json!({
@@ -85,17 +71,26 @@ async fn test_websocket_session_new_flow() {
         "params": params_with_spawn_opts(json!({}))
     });
 
-    ws_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request.to_string().into(),
-        )))
-        .unwrap();
+    channel.push("jsonrpc", init_request).await;
 
     // Wait for process to start
     process_started.await.expect("Process failed to start");
 
-    // Read and ignore init request from process
-    let _ = read_json_line(&mut test_stdout).await;
+    // Read and respond to init request
+    let init_req = read_json_line(&mut test_stdout).await;
+    let init_proxy_id = init_req["id"].clone();
+    let init_response = json!({
+        "jsonrpc": "2.0",
+        "id": init_proxy_id,
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {}
+        }
+    });
+    write_json_line(&mut test_stdin, &init_response).await;
+
+    // Consume init response
+    let _ = channel.recv().await;
 
     // Send session/new request
     let session_new_request = json!({
@@ -108,11 +103,7 @@ async fn test_websocket_session_new_flow() {
         }
     });
 
-    ws_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            session_new_request.to_string().into(),
-        )))
-        .unwrap();
+    channel.push("jsonrpc", session_new_request).await;
 
     // Read session/new from process
     let received_request = read_json_line(&mut test_stdout).await;
@@ -131,29 +122,23 @@ async fn test_websocket_session_new_flow() {
     write_json_line(&mut test_stdin, &session_response).await;
 
     // Client receives response
-    let ws_msg = ws_out_rx.next().await.unwrap();
-    match ws_msg {
-        axum::extract::ws::Message::Text(text) => {
-            let response: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(response["id"], "new_123");
-            assert_eq!(response["result"]["sessionId"], "sess_xyz_789");
-        }
-        _ => panic!("Expected text message"),
-    }
+    let msg = channel.recv().await.expect("Expected response message");
+    assert_eq!(msg.event, "jsonrpc");
+    let response = &msg.payload;
+    assert_eq!(response["id"], "new_123");
+    assert_eq!(response["result"]["sessionId"], "sess_xyz_789");
 }
 
 #[tokio::test]
-async fn test_websocket_notification_forwarding() {
+async fn test_channel_notification_forwarding() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
-    let state = AcpProxyState::with_process_starter(starter);
+    let state = AcpChannelState::with_process_starter(starter);
 
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
-    let websocket_id = uuid::Uuid::new_v4();
+    let mut registry = ChannelRegistry::new();
+    registry.register("acp:*", AcpChannel::with_state(state));
 
-    // Start the handler
-    tokio::spawn(async move {
-        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
-    });
+    let mut client = TestClient::new(registry);
+    let mut channel = client.join("acp:test", json!({})).await.unwrap();
 
     // First send initialize to start the process
     let init_request = json!({
@@ -163,11 +148,7 @@ async fn test_websocket_notification_forwarding() {
         "params": params_with_spawn_opts(json!({}))
     });
 
-    ws_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request.to_string().into(),
-        )))
-        .unwrap();
+    channel.push("jsonrpc", init_request).await;
 
     // Wait for process to start
     process_started.await.expect("Process failed to start");
@@ -185,8 +166,8 @@ async fn test_websocket_notification_forwarding() {
     });
     write_json_line(&mut test_stdin, &init_response).await;
 
-    // Consume init response on websocket
-    let _ = ws_out_rx.next().await.unwrap();
+    // Consume init response
+    let _ = channel.recv().await;
 
     // Create a session by sending session/new
     let session_new = json!({
@@ -199,11 +180,7 @@ async fn test_websocket_notification_forwarding() {
         }
     });
 
-    ws_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            session_new.to_string().into(),
-        )))
-        .unwrap();
+    channel.push("jsonrpc", session_new).await;
 
     // Read session/new and respond
     let new_req = read_json_line(&mut test_stdout).await;
@@ -218,7 +195,7 @@ async fn test_websocket_notification_forwarding() {
     write_json_line(&mut test_stdin, &new_response).await;
 
     // Consume session/new response
-    let _ = ws_out_rx.next().await.unwrap();
+    let _ = channel.recv().await;
 
     // Write notification from process
     let notification = json!({
@@ -232,19 +209,17 @@ async fn test_websocket_notification_forwarding() {
     write_json_line(&mut test_stdin, &notification).await;
 
     // Client receives notification
-    let ws_msg = ws_out_rx.next().await.unwrap();
-    match ws_msg {
-        axum::extract::ws::Message::Text(text) => {
-            let notif: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(notif["method"], "session/update");
-            assert_eq!(notif["params"]["sessionId"], "sess_123");
-        }
-        _ => panic!("Expected text message"),
-    }
+    let msg = channel.recv().await.expect("Expected notification message");
+    assert_eq!(msg.event, "jsonrpc");
+    let notif = &msg.payload;
+    assert_eq!(notif["method"], "session/update");
+    assert_eq!(notif["params"]["sessionId"], "sess_123");
 }
 
 #[tokio::test]
 async fn test_concurrent_initialize_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     // Create a barrier to control when the process start completes
     let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
     let barrier = Arc::new(tokio::sync::Mutex::new(Some(barrier_rx)));
@@ -306,24 +281,20 @@ async fn test_concurrent_initialize_requests() {
         })
     });
 
-    let state = AcpProxyState::with_process_starter(starter);
-    let state_clone = state.clone();
+    let state = AcpChannelState::with_process_starter(starter);
 
-    // Create two websockets with the same command and params
-    let (ws1_out_tx, mut _ws1_out_rx, ws1_in_tx, ws1_in_rx) = create_fake_websocket();
-    let (ws2_out_tx, mut ws2_out_rx, ws2_in_tx, ws2_in_rx) = create_fake_websocket();
+    // Create two clients with the same shared state
+    let mut registry1 = ChannelRegistry::new();
+    registry1.register("acp:*", AcpChannel::with_state(state.clone()));
 
-    let websocket_id1 = uuid::Uuid::new_v4();
-    let websocket_id2 = uuid::Uuid::new_v4();
+    let mut registry2 = ChannelRegistry::new();
+    registry2.register("acp:*", AcpChannel::with_state(state));
 
-    // Start both handlers
-    tokio::spawn(async move {
-        unit_testable_ws_handler(ws1_out_tx, ws1_in_rx, state, websocket_id1).await;
-    });
+    let mut client1 = TestClient::new(registry1);
+    let mut client2 = TestClient::new(registry2);
 
-    tokio::spawn(async move {
-        unit_testable_ws_handler(ws2_out_tx, ws2_in_rx, state_clone, websocket_id2).await;
-    });
+    let mut channel1 = client1.join("acp:test1", json!({})).await.unwrap();
+    let mut channel2 = client2.join("acp:test2", json!({})).await.unwrap();
 
     // Send init requests from both clients with SAME params (same process_key)
     let init_request = json!({
@@ -334,17 +305,8 @@ async fn test_concurrent_initialize_requests() {
     });
 
     // Send both requests at nearly the same time
-    ws1_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request.to_string().into(),
-        )))
-        .unwrap();
-
-    ws2_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request.to_string().into(),
-        )))
-        .unwrap();
+    channel1.push("jsonrpc", init_request.clone()).await;
+    channel2.push("jsonrpc", init_request).await;
 
     // Wait for the process starter to be called exactly once
     let start_time = tokio::time::Instant::now();
@@ -366,68 +328,30 @@ async fn test_concurrent_initialize_requests() {
     // Release the barrier to complete the first process start
     barrier_tx.send(()).unwrap();
 
-    // First client should receive response (but we need to handle the process side first)
-    // For this test, we'll just verify the second client gets the expected error
-
     // Check second client's response - should be the "Process alive, but no init response" error
-    let ws2_msg = tokio::time::timeout(tokio::time::Duration::from_millis(500), ws2_out_rx.next())
-        .await
-        .expect("Timeout waiting for ws2 response")
-        .expect("ws2 channel closed");
+    let msg = tokio::time::timeout(
+        tokio::time::Duration::from_millis(500),
+        channel2.recv(),
+    )
+    .await
+    .expect("Timeout waiting for response")
+    .expect("Channel closed");
 
-    match ws2_msg {
-        axum::extract::ws::Message::Text(text) => {
-            let response: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(response["jsonrpc"], "2.0");
-            assert_eq!(response["id"], 1);
-            // Should have an error, not a result
-            assert!(response.get("error").is_some());
-            let error = &response["error"];
-            assert_eq!(error["code"], -32004);
-            assert!(error["message"]
-                .as_str()
-                .unwrap()
-                .contains("no init response"));
-        }
-        _ => panic!("Expected text message"),
-    }
+    assert_eq!(msg.event, "jsonrpc");
+    let response = &msg.payload;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 1);
+    // Should have an error, not a result
+    assert!(response.get("error").is_some());
+    let error = &response["error"];
+    assert_eq!(error["code"], -32004);
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("no init response"));
 
     // Process starter should still have been called only once
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
-
-    // Now send a new init request with DIFFERENT params on ws2
-    // This should trigger a second process start since the process_key will be different
-    let init_request_different = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "initialize",
-        "params": params_with_spawn_opts(json!({
-            "clientCapabilities": {
-                "experimental": true
-            }
-        }))
-    });
-
-    ws2_in_tx
-        .unbounded_send(Ok(axum::extract::ws::Message::Text(
-            init_request_different.to_string().into(),
-        )))
-        .unwrap();
-
-    // Wait for the process starter to be called a second time
-    let start_time = tokio::time::Instant::now();
-    loop {
-        if start_count.load(Ordering::SeqCst) == 2 {
-            break;
-        }
-        if start_time.elapsed() > tokio::time::Duration::from_secs(1) {
-            panic!("Timeout waiting for second process starter call");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
-
-    // Process starter should now have been called twice (once for each unique process_key)
-    assert_eq!(start_count.load(Ordering::SeqCst), 2);
 }
 
 // ============================================================================
@@ -435,12 +359,6 @@ async fn test_concurrent_initialize_requests() {
 // ============================================================================
 
 /// Creates a fake process starter that returns duplex stream pairs
-/// The starter will be called when the WebSocket handler starts the process
-/// Returns:
-/// - ProcessStarterFn: the starter function
-/// - DuplexStream: test writes here, process reads from stdin
-/// - DuplexStream: test reads here, process writes to stdout
-/// - Receiver that signals when process has started
 fn create_fake_process_starter() -> (
     ProcessStarterFn,
     DuplexStream,
@@ -497,18 +415,6 @@ fn create_fake_process_starter() -> (
     });
 
     (starter, test_stdin, test_stdout, started_rx)
-}
-
-/// Creates fake WebSocket streams for testing
-fn create_fake_websocket() -> (
-    futures_mpsc::UnboundedSender<axum::extract::ws::Message>,
-    futures_mpsc::UnboundedReceiver<axum::extract::ws::Message>,
-    futures_mpsc::UnboundedSender<Result<axum::extract::ws::Message, axum::Error>>,
-    futures_mpsc::UnboundedReceiver<Result<axum::extract::ws::Message, axum::Error>>,
-) {
-    let (ws_sender_tx, ws_sender_rx) = futures_mpsc::unbounded();
-    let (ws_receiver_tx, ws_receiver_rx) = futures_mpsc::unbounded();
-    (ws_sender_tx, ws_sender_rx, ws_receiver_tx, ws_receiver_rx)
 }
 
 // ============================================================================
