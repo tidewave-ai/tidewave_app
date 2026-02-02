@@ -1,7 +1,9 @@
+pub mod acp_channel;
 pub mod acp_proxy;
 mod command;
 pub mod config;
 mod http_handlers;
+pub mod mcp_channel;
 mod mcp_remote;
 pub mod server;
 pub mod utils;
