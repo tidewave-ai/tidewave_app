@@ -4,9 +4,12 @@ pub mod message;
 pub mod registry;
 pub mod serializer;
 pub mod socket;
+pub(crate) mod subscription;
 pub mod transport;
 
-pub use channel::{Assigns, Channel, HandleResult, JoinResult, ReplyStatus, SocketRef};
+pub use channel::{
+    Assigns, Channel, HandleResult, InfoSendError, InfoSender, JoinResult, ReplyStatus, SocketRef,
+};
 pub use error::PhoenixError;
 pub use message::{events, PhxMessage};
 pub use registry::{ChannelRegistry, TopicPattern};

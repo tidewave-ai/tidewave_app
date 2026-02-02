@@ -1,13 +1,22 @@
+use std::any::Any;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use axum::{response::Html, routing::get, Router};
 use phoenix_rs::{
     channel::{Channel, HandleResult, JoinResult, SocketRef},
-    phoenix_router, ChannelRegistry,
+    phoenix_router, ChannelRegistry, InfoSender,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-/// A simple chat room channel
+/// Info messages sent from background tasks to the channel
+enum ChatInfo {
+    /// Periodic tick with current count
+    Tick(u32),
+}
+
+/// A simple chat room channel with background counter
 struct ChatChannel;
 
 #[async_trait]
@@ -24,6 +33,12 @@ impl Channel for ChatChannel {
         // Store username in assigns for later use
         socket.assign("username", username.clone());
         socket.assign("message_count", 0u32);
+
+        // Get a typed info sender for background tasks
+        if let Some(info_sender) = socket.info_sender::<ChatInfo>() {
+            // Spawn a background task that sends periodic tick messages
+            tokio::spawn(counter_task(info_sender));
+        }
 
         JoinResult::ok(json!({
             "status": "joined",
@@ -65,12 +80,39 @@ impl Channel for ChatChannel {
         }
     }
 
+    async fn handle_info(&self, message: Box<dyn Any + Send>, socket: &mut SocketRef) {
+        // Downcast the message to our expected type
+        if let Ok(info) = message.downcast::<ChatInfo>() {
+            match *info {
+                ChatInfo::Tick(count) => {
+                    // Push the counter update to the client
+                    socket.push("tick", json!({ "count": count }));
+                }
+            }
+        }
+    }
+
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
         let username = socket.get_assign::<String>("username")
             .map(|s| s.as_str())
             .unwrap_or("unknown");
         let message_count = socket.get_assign::<u32>("message_count").copied().unwrap_or(0);
         println!("User '{}' left ({}), sent {} messages", username, reason, message_count);
+    }
+}
+
+/// Background task that sends periodic tick messages via InfoSender
+async fn counter_task(info_sender: InfoSender<ChatInfo>) {
+    let mut count = 0u32;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        count += 1;
+
+        // Send tick to the channel's handle_info
+        if info_sender.send(ChatInfo::Tick(count)).is_err() {
+            // Channel closed, stop the task
+            break;
+        }
     }
 }
 
@@ -157,6 +199,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body>
     <h1>Phoenix-RS Chat</h1>
     <div id="status" class="disconnected">Disconnected</div>
+    <div id="counter" style="font-size: 12px; color: #666; margin-bottom: 10px;">Session time: 0s</div>
 
     <div id="username-form">
         <input type="text" id="username" placeholder="Enter your username" value="">
@@ -241,6 +284,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     typingUsers.delete(payload.username);
                     updateTypingIndicator();
                 }, 2000);
+            });
+
+            // Handle tick counter from background task (demonstrates handle_info)
+            channel.on("tick", (payload) => {
+                document.getElementById('counter').textContent = `Session time: ${payload.count}s`;
             });
 
             // Handle join
