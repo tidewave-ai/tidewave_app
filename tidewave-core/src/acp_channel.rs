@@ -1,16 +1,143 @@
 /**
 Phoenix channel implementation for ACP (Agent Client Protocol).
 
-This is a port of acp_proxy.rs to use Phoenix channels instead of raw WebSockets.
-The channel topic format is `acp:{acp_id}` where acp_id identifies the agent.
+The idea behind the ACP Proxy is similar to our MCP Proxy
+(https://github.com/tidewave-ai/mcp_proxy_rust):
+We keep the ACP session alive for the agent side, and allow the
+client (the browser) to reconnect when necessary.
 
-The key differences from the WebSocket implementation:
-- Uses Phoenix channel join/leave instead of WebSocket connect/disconnect
-- Uses `jsonrpc` event for bidirectional JSON-RPC messages
-- Uses `agent_exit` event for process exit notifications
-- Phoenix handles heartbeat automatically (no manual ping/pong)
+We do this by handling the minimal subset of ACP messages we need to
+handle (init, new sessions) to keep track of active sessions and
+add our own custom messages using the protocol extensibility features
+(https://agentclientprotocol.com/protocol/extensibility)
+to support a "_tidewave.ai/session/load" request for loading chats that
+are still active on the agent side.
 
-See acp_proxy.rs for detailed documentation on the ACP protocol extensions.
+To start an agent, we hijack init requests and dynamically start a new
+ACP process in case there's no existing one running.
+
+An overview of our protocol extensions:
+
+1. Custom load session request
+
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "_tidewave.ai/session/load",
+      "params": {
+        "sessionId": "sess_123456",
+        "latestId": "foo",
+      }
+    }
+
+    The client needs to pass the sessionId, as well as the "latestId", which
+    is the most recent ID it successfully processed.
+
+    In case the session cannot be loaded, we respond with a JSON-RPC error, reason
+    "Session not found".
+
+    {
+      "jsonrpc": "2.0",
+      "id": "1",
+      "result": {}
+    }
+
+2. Custom agentCapabilities
+
+    We inject a `tidewave.ai` meta key into the agent capabilities:
+
+    {
+      "jsonrpc": "2.0",
+      "id": 0,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "_meta": {
+            "tidewave.ai": {
+              "session/load": true
+            }
+          }
+        }
+      }
+    }
+
+3. tidewave.ai/notificationId injection
+
+    We inject a custom `tidewave.ai/notificationId` meta property into notifications.
+    This ID is used for acknowledgements/pruning below.
+
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "sess_abc123def456",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "I'll analyze your code for potential issues. Let me examine it..."
+          }
+        },
+        "_meta": {
+          "tidewave.ai/notificationId": "notif_12"
+        }
+      }
+    }
+
+4. Client acknowledgements
+
+    A client can acknowledge messages (so we can prune the buffer):
+
+    {
+      "jsonrpc": "2.0",
+      "method": "_tidewave.ai/ack",
+      "params": {
+        "latestId": "notif_12"
+      }
+    }
+
+5. Exit notifications
+
+    To tell a client when an ACP process dies, we send a custom `_tidewave.ai/exit` notification:
+
+    {
+      "jsonrpc": "2.0",
+      "method": "_tidewave.ai/exit",
+      "params": {
+        "error": "process_exit",
+        "message": "ACP process exited with code 137"
+      }
+    }
+
+6. Exit request
+
+    To allow a client to stop an ACP process (for example in order to restart
+    after logging in in Claude Code), we add a `_tidewave.ai/exit` request.
+
+    This will stop the ACP process for that WebSocket and send exit notifications to all
+    connected clients. When they reconnect, a new process will be started.
+
+    {
+      "jsonrpc": "2.0",
+      "id": ...,
+      "method": "_tidewave.ai/exit",
+      "params": {}
+    }
+
+The proxy keeps a mapping of sessionId to the active socket connection.
+There is a bit of nuance on how to do this. Imagine the following situation:
+
+1. A client connects to the socket and starts an ACP session.
+2. The client starts a prompt (JSON-RPC request with - let's assume - ID 1)
+3. The client reconnects (browser reload).
+4. The client load the session and receives buffered notifications.
+5. The agent finishes and sends the response to the initial request with ID 1.
+
+Now, we have an issue, because the browser did not send that original request.
+Because of this, we don't use the ACP SDK in the browser, but instead handle raw
+JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forward
+any requests to the new connection.
 */
 use crate::command::{create_shell_command, spawn_command, ChildProcess};
 use anyhow::{anyhow, Result};
