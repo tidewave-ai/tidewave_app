@@ -2,9 +2,70 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use tokio::sync::mpsc;
 
 use crate::message::PhxMessage;
+
+/// Error returned when sending an info message fails (subscription closed)
+#[derive(Debug, Clone)]
+pub struct InfoSendError;
+
+impl std::fmt::Display for InfoSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to send info message: subscription closed")
+    }
+}
+
+impl std::error::Error for InfoSendError {}
+
+/// Type-erased info message for internal use
+pub(crate) type BoxedInfo = Box<dyn Any + Send>;
+
+/// Handle for sending typed info messages to a channel subscription.
+///
+/// This can be used by background tasks (like file watchers) to send events
+/// to the channel's `handle_info` callback. Get this during `join()` via
+/// `socket.info_sender::<MyMessageType>()` and pass it to spawned tasks.
+///
+/// The message type `M` is boxed internally and the channel's `handle_info`
+/// will receive it as `Box<dyn Any + Send>` to downcast.
+#[derive(Debug)]
+pub struct InfoSender<M: Send + 'static> {
+    sender: mpsc::UnboundedSender<BoxedInfo>,
+    _phantom: PhantomData<M>,
+}
+
+impl<M: Send + 'static> InfoSender<M> {
+    /// Create a new typed InfoSender wrapping an untyped channel
+    pub(crate) fn new(sender: mpsc::UnboundedSender<BoxedInfo>) -> Self {
+        Self {
+            sender,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Send an info message to the channel's handle_info callback
+    pub fn send(&self, message: M) -> Result<(), InfoSendError> {
+        self.sender
+            .send(Box::new(message))
+            .map_err(|_| InfoSendError)
+    }
+
+    /// Check if the sender is still connected
+    pub fn is_connected(&self) -> bool {
+        !self.sender.is_closed()
+    }
+}
+
+impl<M: Send + 'static> Clone for InfoSender<M> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
 
 /// Per-subscription state storage using type-erased values.
 ///
@@ -167,6 +228,8 @@ pub struct SocketRef {
     broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
     /// Per-subscription state
     assigns: Assigns,
+    /// Channel for sending info messages to this subscription's handle_info
+    info_sender: Option<mpsc::UnboundedSender<BoxedInfo>>,
 }
 
 impl SocketRef {
@@ -183,16 +246,36 @@ impl SocketRef {
             sender,
             broadcast_sender,
             assigns: Assigns::new(),
+            info_sender: None,
         }
     }
 
-    /// Create a new SocketRef with existing assigns (used internally)
-    pub(crate) fn with_assigns(
+    /// Create a new SocketRef with info sender (used by subscription loop)
+    pub(crate) fn with_info_sender(
+        topic: String,
+        join_ref: String,
+        sender: mpsc::UnboundedSender<PhxMessage>,
+        broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
+        info_sender: mpsc::UnboundedSender<BoxedInfo>,
+    ) -> Self {
+        Self {
+            topic,
+            join_ref,
+            sender,
+            broadcast_sender,
+            assigns: Assigns::new(),
+            info_sender: Some(info_sender),
+        }
+    }
+
+    /// Create a new SocketRef with assigns and info sender (used by subscription loop)
+    pub(crate) fn with_assigns_and_info_sender(
         topic: String,
         join_ref: String,
         sender: mpsc::UnboundedSender<PhxMessage>,
         broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
         assigns: Assigns,
+        info_sender: mpsc::UnboundedSender<BoxedInfo>,
     ) -> Self {
         Self {
             topic,
@@ -200,6 +283,7 @@ impl SocketRef {
             sender,
             broadcast_sender,
             assigns,
+            info_sender: Some(info_sender),
         }
     }
 
@@ -221,6 +305,30 @@ impl SocketRef {
         let mut msg = PhxMessage::new(self.topic.clone(), event, payload);
         msg.join_ref = Some(format!("__exclude:{}", self.join_ref));
         let _ = self.broadcast_sender.send((self.topic.clone(), msg));
+    }
+
+    /// Get a typed info sender for sending messages to this subscription's `handle_info`.
+    ///
+    /// Use this during `join()` to get a sender that background tasks can use
+    /// to send typed messages back to the channel.
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn join(&self, topic: &str, payload: Value, socket: &mut SocketRef) -> JoinResult {
+    ///     let info_tx = socket.info_sender::<WatchEvent>();
+    ///
+    ///     // Spawn a background task with the sender
+    ///     tokio::spawn(async move {
+    ///         info_tx.send(WatchEvent::FileChanged(path)).ok();
+    ///     });
+    ///
+    ///     JoinResult::ok(json!({}))
+    /// }
+    /// ```
+    ///
+    /// Returns `None` if info messaging is not enabled (shouldn't happen in normal use).
+    pub fn info_sender<M: Send + 'static>(&self) -> Option<InfoSender<M>> {
+        self.info_sender.as_ref().map(|s| InfoSender::new(s.clone()))
     }
 
     // ==================== Assigns API ====================
@@ -321,6 +429,31 @@ pub trait Channel: Send + Sync + 'static {
     /// * `HandleResult::NoReply` - No reply needed
     /// * `HandleResult::Stop { reason }` - Close the channel
     async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult;
+
+    /// Called when an info message is received from a background task or another channel.
+    ///
+    /// Use `socket.info_sender::<MyType>()` during `join()` to get a sender that
+    /// background tasks can use to send typed messages here.
+    ///
+    /// # Arguments
+    /// * `message` - The boxed message, downcast to your expected type
+    /// * `socket` - Mutable reference to the socket for sending messages and accessing state
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn handle_info(&self, message: Box<dyn Any + Send>, socket: &mut SocketRef) {
+    ///     if let Ok(event) = message.downcast::<WatchEvent>() {
+    ///         match *event {
+    ///             WatchEvent::FileChanged(path) => {
+    ///                 socket.push("file_changed", json!({"path": path.display().to_string()}));
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    async fn handle_info(&self, _message: Box<dyn Any + Send>, _socket: &mut SocketRef) {
+        // Default implementation does nothing
+    }
 
     /// Called when a client leaves the channel or disconnects.
     ///
