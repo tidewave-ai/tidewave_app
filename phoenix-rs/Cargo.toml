@@ -1,0 +1,25 @@
+[package]
+name = "phoenix-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust implementation of Phoenix channels protocol"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full", "sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6.0"
+uuid = { version = "1.11", features = ["v4"] }
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio-tungstenite = "0.26"
+http-body-util = "0.1"
+tower = "0.5"
+tracing-subscriber = "0.3"
