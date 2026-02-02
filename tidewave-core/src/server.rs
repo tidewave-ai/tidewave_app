@@ -319,11 +319,11 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create watch routes (WebSocket)
-    let watch_state = crate::watch::WatchState::new();
-    let watch_routes = Router::new()
-        .route("/watch", get(crate::watch::watch_ws_handler))
-        .with_state(watch_state.clone());
+    // Create WebSocket routes
+    let ws_state = crate::ws::WsState::new();
+    let ws_routes = Router::new()
+        .route("/ws", get(crate::ws::ws_handler))
+        .with_state(ws_state.clone());
 
     // Create the main app without state
     let client_for_proxy = client.clone();
@@ -349,7 +349,7 @@ async fn serve_http_server_inner(
         .merge(mcp_routes)
         .merge(acp_routes)
         .merge(download_routes)
-        .merge(watch_routes);
+        .merge(ws_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -463,10 +463,8 @@ async fn serve_http_server_inner(
         }
     }
 
-    // Clear all file watchers
-    let watch_count = watch_state.watchers.len();
-    debug!("Found {} file watchers to clean up", watch_count);
-    watch_state.watchers.clear();
+    // Clear all WebSocket state
+    ws_state.clear();
 
     Ok(())
 }

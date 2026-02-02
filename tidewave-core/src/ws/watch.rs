@@ -1,4 +1,4 @@
-//! File system watch handler using WebSocket for bidirectional communication.
+//! File system watch feature for WebSocket.
 //!
 //! # Protocol
 //!
@@ -20,16 +20,7 @@
 //! {"event": "warning", "message": "...", "ref": "watch1"}
 //! ```
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    http::StatusCode,
-    response::IntoResponse,
-};
 use dashmap::DashMap;
-use futures::{Sink, SinkExt, Stream, StreamExt};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -41,17 +32,16 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::utils::normalize_path;
-use uuid::Uuid;
+
+use super::{WebSocketId, WsOutboundMessage, WsState};
 
 // ============================================================================
 // Types
 // ============================================================================
-
-pub type WebSocketId = Uuid;
 
 /// Client message (client → server)
 #[derive(Debug, Clone, Deserialize)]
@@ -146,13 +136,6 @@ impl WatchEvent {
     }
 }
 
-/// Internal message for WebSocket communication
-#[derive(Debug, Clone)]
-pub enum WatchWebSocketMessage {
-    Event(WatchEvent),
-    Pong,
-}
-
 /// Active watcher for a directory
 pub struct ActiveWatch {
     pub tx: broadcast::Sender<WatchEvent>,
@@ -160,128 +143,39 @@ pub struct ActiveWatch {
     pub started: AtomicBool,
 }
 
-/// Global watch state
+/// Watch feature state
 #[derive(Clone, Default)]
-pub struct WatchState {
+pub struct WatchFeatureState {
     /// Active watchers (canonical_path → active_watch)
     pub watchers: Arc<DashMap<String, Arc<ActiveWatch>>>,
-    /// WebSocket connections (websocket_id → sender)
-    pub websocket_senders: Arc<DashMap<WebSocketId, mpsc::UnboundedSender<WatchWebSocketMessage>>>,
     /// Subscriptions per WebSocket (websocket_id → (ref → canonical_path))
     pub subscriptions: Arc<DashMap<WebSocketId, HashMap<String, String>>>,
 }
 
-impl WatchState {
+impl WatchFeatureState {
     pub fn new() -> Self {
         Self {
             watchers: Arc::new(DashMap::new()),
-            websocket_senders: Arc::new(DashMap::new()),
             subscriptions: Arc::new(DashMap::new()),
         }
     }
 }
 
 // ============================================================================
-// WebSocket Handler
+// Message Handler
 // ============================================================================
 
-pub async fn watch_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<WatchState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let websocket_id = Uuid::new_v4();
-    debug!("New watch WebSocket connection: {}", websocket_id);
-
-    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, websocket_id)))
-}
-
-async fn handle_websocket(socket: WebSocket, state: WatchState, websocket_id: WebSocketId) {
-    let (ws_sender, ws_receiver) = socket.split();
-    unit_testable_ws_handler(ws_sender, ws_receiver, state, websocket_id).await;
-}
-
-pub async fn unit_testable_ws_handler<W, R>(
-    mut ws_sender: W,
-    mut ws_receiver: R,
-    state: WatchState,
-    websocket_id: WebSocketId,
-) where
-    W: Sink<Message> + Unpin + Send + 'static,
-    R: Stream<Item = Result<Message, axum::Error>> + Unpin + Send + 'static,
-{
-    // Create channel for sending messages to this WebSocket
-    let (tx, mut rx) = mpsc::unbounded_channel::<WatchWebSocketMessage>();
-
-    // Register WebSocket sender and initialize empty subscriptions
-    state.websocket_senders.insert(websocket_id, tx.clone());
-    state.subscriptions.insert(websocket_id, HashMap::new());
-
-    // Task to handle outgoing messages (server → client)
-    let websocket_id_tx = websocket_id;
-    let tx_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            let ws_message = match message {
-                WatchWebSocketMessage::Event(event) => match serde_json::to_string(&event) {
-                    Ok(json_str) => Message::Text(format!("{}\n", json_str).into()),
-                    Err(_) => continue,
-                },
-                WatchWebSocketMessage::Pong => Message::Text("pong".into()),
-            };
-
-            if ws_sender.send(ws_message).await.is_err() {
-                debug!("WebSocket send failed for: {}", websocket_id_tx);
-                break;
-            }
-        }
-    });
-
-    // Task to handle incoming messages (client → server)
-    let state_rx = state.clone();
-    let rx_task = tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if text.trim() == "ping" {
-                        if let Some(tx) = state_rx.websocket_senders.get(&websocket_id) {
-                            let _ = tx.send(WatchWebSocketMessage::Pong);
-                        }
-                    } else if let Ok(client_msg) =
-                        serde_json::from_str::<WatchClientMessage>(&text)
-                    {
-                        handle_client_message(&state_rx, websocket_id, client_msg).await;
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    debug!("Watch WebSocket closed for: {}", websocket_id);
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    debug!("Watch WebSocket error for {}: {}", websocket_id, e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wait for either task to complete
-    tokio::select! {
-        _ = tx_task => {},
-        _ = rx_task => {},
-    }
-
-    // Cleanup on disconnect
-    state.websocket_senders.remove(&websocket_id);
-    state.subscriptions.remove(&websocket_id);
-}
-
-async fn handle_client_message(
-    state: &WatchState,
+pub async fn handle_watch_message(
+    state: &WsState,
     websocket_id: WebSocketId,
     message: WatchClientMessage,
 ) {
     match message {
-        WatchClientMessage::Subscribe { path, reference, is_wsl } => {
+        WatchClientMessage::Subscribe {
+            path,
+            reference,
+            is_wsl,
+        } => {
             handle_subscribe(state, websocket_id, &path, &reference, is_wsl).await;
         }
         WatchClientMessage::Unsubscribe { reference } => {
@@ -290,12 +184,23 @@ async fn handle_client_message(
     }
 }
 
-async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &str, reference: &str, is_wsl: bool) {
+async fn handle_subscribe(
+    state: &WsState,
+    websocket_id: WebSocketId,
+    path: &str,
+    reference: &str,
+    is_wsl: bool,
+) {
     // Normalize path (handles WSL path conversion on Windows)
     let normalized_path = match normalize_path(path, is_wsl).await {
         Ok(p) => p,
         Err(e) => {
-            send_unsubscribed_with_error(state, websocket_id, reference, &format!("Failed to normalize path: {}", e));
+            send_unsubscribed_with_error(
+                state,
+                websocket_id,
+                reference,
+                &format!("Failed to normalize path: {}", e),
+            );
             return;
         }
     };
@@ -317,18 +222,24 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
     let canonical_path = match path_obj.canonicalize() {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(e) => {
-            send_unsubscribed_with_error(state, websocket_id, reference, &format!("Failed to canonicalize path: {}", e));
+            send_unsubscribed_with_error(
+                state,
+                websocket_id,
+                reference,
+                &format!("Failed to canonicalize path: {}", e),
+            );
             return;
         }
     };
 
     // Add to this websocket's subscriptions (ref -> canonical_path)
-    if let Some(mut subs) = state.subscriptions.get_mut(&websocket_id) {
+    if let Some(mut subs) = state.watch.subscriptions.get_mut(&websocket_id) {
         subs.insert(reference.to_string(), canonical_path.clone());
     }
 
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
+        .watch
         .watchers
         .entry(canonical_path.clone())
         .or_insert_with(|| {
@@ -355,16 +266,19 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
 
                     // Check if this websocket is still subscribed with this ref
                     let still_subscribed = state_for_forward
+                        .watch
                         .subscriptions
                         .get(&websocket_id)
-                        .map(|subs| subs.get(&reference_for_forward) == Some(&canonical_path_for_forward))
+                        .map(|subs| {
+                            subs.get(&reference_for_forward) == Some(&canonical_path_for_forward)
+                        })
                         .unwrap_or(false);
 
                     if still_subscribed {
                         // Transform event to use client's ref instead of canonical path
                         let client_event = event.with_reference(reference_for_forward.clone());
                         if let Some(tx) = state_for_forward.websocket_senders.get(&websocket_id) {
-                            let _ = tx.send(WatchWebSocketMessage::Event(client_event));
+                            let _ = tx.send(WsOutboundMessage::Watch(client_event));
                         }
                     }
 
@@ -375,7 +289,7 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                 Err(broadcast::error::RecvError::Closed) => {
                     // Watcher died - notify client so they can resubscribe if needed
                     if let Some(tx) = state_for_forward.websocket_senders.get(&websocket_id) {
-                        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
+                        let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Unsubscribed {
                             reference: reference_for_forward.clone(),
                             error: Some("watcher closed".to_string()),
                         }));
@@ -423,8 +337,8 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                     );
 
                     let notify_tx_poll = notify_tx.clone();
-                    let poll_config = notify::Config::default()
-                        .with_poll_interval(Duration::from_secs(2));
+                    let poll_config =
+                        notify::Config::default().with_poll_interval(Duration::from_secs(2));
 
                     match PollWatcher::new(
                         move |res| {
@@ -452,7 +366,10 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                                     e, poll_err
                                 )),
                             });
-                            state_for_task.watchers.remove(&canonical_path_for_task);
+                            state_for_task
+                                .watch
+                                .watchers
+                                .remove(&canonical_path_for_task);
                             return;
                         }
                     }
@@ -466,7 +383,10 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                     reference: canonical_path_for_task.clone(),
                     error: Some(format!("Failed to watch path: {}", e)),
                 });
-                state_for_task.watchers.remove(&canonical_path_for_task);
+                state_for_task
+                    .watch
+                    .watchers
+                    .remove(&canonical_path_for_task);
                 return;
             }
 
@@ -491,7 +411,7 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                                     let _ = tx.send(watch_event);
 
                                     if is_unsubscribed {
-                                        state_for_task.watchers.remove(&canonical_path_for_task);
+                                        state_for_task.watch.watchers.remove(&canonical_path_for_task);
                                         return;
                                     }
                                 }
@@ -501,11 +421,11 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                                     reference: canonical_path_for_task.clone(),
                                     error: Some(format!("Watch error: {}", e)),
                                 });
-                                state_for_task.watchers.remove(&canonical_path_for_task);
+                                state_for_task.watch.watchers.remove(&canonical_path_for_task);
                                 return;
                             }
                             None => {
-                                state_for_task.watchers.remove(&canonical_path_for_task);
+                                state_for_task.watch.watchers.remove(&canonical_path_for_task);
                                 return;
                             }
                         }
@@ -514,7 +434,7 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
                     _ = tokio::time::sleep(cleanup_check_interval) => {
                         if tx.receiver_count() == 0 {
                             debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path_for_task);
-                            state_for_task.watchers.remove(&canonical_path_for_task);
+                            state_for_task.watch.watchers.remove(&canonical_path_for_task);
                             return;
                         }
                     }
@@ -525,21 +445,21 @@ async fn handle_subscribe(state: &WatchState, websocket_id: WebSocketId, path: &
 
     // Send subscribed confirmation
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Subscribed {
+        let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Subscribed {
             reference: reference.to_string(),
         }));
     }
 }
 
-async fn handle_unsubscribe(state: &WatchState, websocket_id: WebSocketId, reference: &str) {
+async fn handle_unsubscribe(state: &WsState, websocket_id: WebSocketId, reference: &str) {
     // Remove from this websocket's subscriptions
-    if let Some(mut subs) = state.subscriptions.get_mut(&websocket_id) {
+    if let Some(mut subs) = state.watch.subscriptions.get_mut(&websocket_id) {
         subs.remove(reference);
     }
 
     // Send unsubscribed confirmation
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
+        let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Unsubscribed {
             reference: reference.to_string(),
             error: None,
         }));
@@ -547,13 +467,13 @@ async fn handle_unsubscribe(state: &WatchState, websocket_id: WebSocketId, refer
 }
 
 fn send_unsubscribed_with_error(
-    state: &WatchState,
+    state: &WsState,
     websocket_id: WebSocketId,
     reference: &str,
     message: &str,
 ) {
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-        let _ = tx.send(WatchWebSocketMessage::Event(WatchEvent::Unsubscribed {
+        let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Unsubscribed {
             reference: reference.to_string(),
             error: Some(message.to_string()),
         }));

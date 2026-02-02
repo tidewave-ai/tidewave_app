@@ -2,7 +2,8 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::time::Duration;
-use tidewave_core::watch::*;
+use tidewave_core::ws::connection::unit_testable_ws_handler;
+use tidewave_core::ws::WsState;
 
 // ============================================================================
 // Test Helpers
@@ -62,7 +63,7 @@ async fn wait_for_event(
 
 #[tokio::test]
 async fn test_watch_subscribe_success() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -97,7 +98,7 @@ async fn test_watch_subscribe_success() {
 
 #[tokio::test]
 async fn test_watch_subscribe_relative_path_error() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -132,7 +133,7 @@ async fn test_watch_subscribe_relative_path_error() {
 
 #[tokio::test]
 async fn test_watch_subscribe_nonexistent_path_error() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -167,7 +168,7 @@ async fn test_watch_subscribe_nonexistent_path_error() {
 
 #[tokio::test]
 async fn test_watch_file_created() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -216,7 +217,7 @@ async fn test_watch_file_created() {
 
 #[tokio::test]
 async fn test_watch_file_modified() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -267,7 +268,7 @@ async fn test_watch_file_modified() {
 
 #[tokio::test]
 async fn test_watch_file_deleted() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -318,7 +319,7 @@ async fn test_watch_file_deleted() {
 
 #[tokio::test]
 async fn test_watch_unsubscribe() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -368,7 +369,7 @@ async fn test_watch_unsubscribe() {
 
 #[tokio::test]
 async fn test_watch_ping_pong() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
@@ -398,7 +399,7 @@ async fn test_watch_ping_pong() {
 
 #[tokio::test]
 async fn test_watch_concurrent_subscribers() {
-    let state = WatchState::new();
+    let state = WsState::new();
 
     // Create a temp directory
     let temp_dir = tempfile::tempdir().unwrap();
@@ -475,7 +476,7 @@ async fn test_watch_concurrent_subscribers() {
 
 #[tokio::test]
 async fn test_watch_subdirectory_events() {
-    let state = WatchState::new();
+    let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
     let websocket_id = uuid::Uuid::new_v4();
 
