@@ -271,8 +271,6 @@ async fn serve_http_server_inner(
     };
 
     let https_port = config.https_port;
-    let mcp_state = crate::mcp_remote::McpRemoteState::new();
-    let acp_state = crate::acp_proxy::AcpProxyState::new();
     let download_state = DownloadState::new();
 
     // Phoenix channels state
@@ -296,23 +294,6 @@ async fn serve_http_server_inner(
         https_port,
     };
 
-    // Create the MCP routes that need state
-    let mcp_routes = Router::new()
-        .route(
-            "/acp/mcp-remote",
-            get(crate::mcp_remote::mcp_remote_ws_handler),
-        )
-        .route(
-            "/acp/mcp-remote-client",
-            post(crate::mcp_remote::mcp_remote_client_handler),
-        )
-        .with_state(mcp_state);
-
-    // Create ACP routes
-    let acp_routes = Router::new()
-        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state.clone());
-
     // Create download routes
     let client_for_download = client.clone();
     let download_routes = Router::new()
@@ -333,13 +314,13 @@ async fn serve_http_server_inner(
 
     // Create Phoenix channel routes
     let mut channel_registry = phoenix_rs::ChannelRegistry::new();
-    channel_registry.register("acp:*", AcpChannel::with_state(acp_channel_state));
+    channel_registry.register("acp:*", AcpChannel::with_state(acp_channel_state.clone()));
     channel_registry.register("mcp:*", McpChannel::with_state(mcp_channel_state.clone()));
     let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
 
     // Create MCP channel client route (HTTP endpoint for agent requests)
     let mcp_channel_routes = Router::new()
-        .route("/socket/mcp-client", post(mcp_channel_client_handler))
+        .route("/acp/mcp-remote-client", post(mcp_channel_client_handler))
         .with_state(mcp_channel_state);
 
     // Create the main app without state
@@ -363,8 +344,6 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
-        .merge(mcp_routes)
-        .merge(acp_routes)
         .merge(download_routes)
         .merge(ws_routes)
         .merge(phoenix_routes)
@@ -472,10 +451,10 @@ async fn serve_http_server_inner(
     // Kill all ACP processes via their exit channels.
     // Note: We use the exit_tx channel instead of directly killing, because
     // the exit monitor task holds the child write lock while waiting.
-    let acp_process_count = acp_state.processes.len();
+    let acp_process_count = acp_channel_state.processes.len();
     debug!("Found {} ACP processes to clean up", acp_process_count);
 
-    for entry in acp_state.processes.iter() {
+    for entry in acp_channel_state.processes.iter() {
         let process_state = entry.value();
         if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
             let _ = exit_tx.send(());
