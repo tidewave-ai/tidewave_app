@@ -153,7 +153,12 @@ impl Channel for McpChannel {
         }))
     }
 
-    async fn handle_in(&self, event: &str, payload: Value, _socket: &mut SocketRef) -> HandleResult {
+    async fn handle_in(
+        &self,
+        event: &str,
+        payload: Value,
+        _socket: &mut SocketRef,
+    ) -> HandleResult {
         match event {
             "mcp_message" => {
                 // Parse the MCP message from the browser

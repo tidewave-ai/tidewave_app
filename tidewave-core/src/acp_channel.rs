@@ -467,7 +467,11 @@ impl Channel for AcpChannel {
                     }
                 };
 
-                trace!("Received jsonrpc from channel {}: {:?}", channel_id, message);
+                trace!(
+                    "Received jsonrpc from channel {}: {:?}",
+                    channel_id,
+                    message
+                );
 
                 // Handle the message
                 if let Err(e) = self
@@ -622,7 +626,10 @@ impl AcpChannel {
                     .await
             }
             "_tidewave.ai/exit" => self.handle_exit_request(state, channel_id).await,
-            _ => self.handle_regular_request(state, channel_id, request).await,
+            _ => {
+                self.handle_regular_request(state, channel_id, request)
+                    .await
+            }
         }
     }
 
@@ -661,13 +668,7 @@ impl AcpChannel {
         let guard = lock.lock().await;
 
         let result = self
-            .handle_initialize_request_locked(
-                state,
-                channel_id,
-                spawn_opts,
-                request,
-                &process_key,
-            )
+            .handle_initialize_request_locked(state, channel_id, spawn_opts, request, &process_key)
             .await;
 
         drop(guard);
@@ -721,7 +722,8 @@ impl AcpChannel {
                 return Ok(());
             }
             None => {
-                let new_process = Arc::new(ProcessState::new(process_key.clone(), spawn_opts.clone()));
+                let new_process =
+                    Arc::new(ProcessState::new(process_key.clone(), spawn_opts.clone()));
 
                 match self
                     .start_acp_process(new_process.clone(), state.clone())
@@ -882,7 +884,9 @@ impl AcpChannel {
                                 "session/load: no process mapping found for channel {}",
                                 channel_id
                             );
-                            return self.handle_regular_request(state, channel_id, request).await;
+                            return self
+                                .handle_regular_request(state, channel_id, request)
+                                .await;
                         }
                     };
 
@@ -963,8 +967,11 @@ impl AcpChannel {
         let process_state = self.ensure_process_for_channel(state, channel_id)?;
 
         let session_id = extract_session_id_from_request(request);
-        let proxy_id =
-            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id.clone());
+        let proxy_id = process_state.map_client_id_to_proxy(
+            channel_id,
+            request.id.clone(),
+            session_id.clone(),
+        );
         let mut proxy_request = request.clone();
         proxy_request.id = proxy_id.clone();
 
@@ -1013,7 +1020,10 @@ impl AcpChannel {
                 self.handle_ack_notification(state, channel_id, notification)
                     .await
             }
-            _ => self.forward_notification_to_process(state, channel_id, notification).await,
+            _ => {
+                self.forward_notification_to_process(state, channel_id, notification)
+                    .await
+            }
         }
     }
 
@@ -1279,7 +1289,12 @@ impl AcpChannel {
     // Helper Methods
     // ============================================================================
 
-    fn send_to_channel(&self, state: &AcpChannelState, channel_id: ChannelId, message: JsonRpcMessage) {
+    fn send_to_channel(
+        &self,
+        state: &AcpChannelState,
+        channel_id: ChannelId,
+        message: JsonRpcMessage,
+    ) {
         if let Some(sender) = state.channel_senders.get(&channel_id) {
             let _ = sender.send(AcpChannelInfo::JsonRpc(message));
         }
@@ -1424,8 +1439,14 @@ async fn handle_process_response(
         client_response.id = client_id;
 
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        maybe_handle_session_load_resume(process_state, state, channel_id, response, &client_response)
-            .await?;
+        maybe_handle_session_load_resume(
+            process_state,
+            state,
+            channel_id,
+            response,
+            &client_response,
+        )
+        .await?;
         maybe_handle_session_new_response(
             process_state,
             state,
