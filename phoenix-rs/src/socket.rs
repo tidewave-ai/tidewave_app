@@ -5,10 +5,16 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::channel::{HandleResult, JoinResult, SocketRef};
+use crate::channel::{Assigns, HandleResult, JoinResult, SocketRef};
 use crate::error::PhoenixError;
 use crate::message::{events, PhxMessage};
 use crate::registry::ChannelRegistry;
+
+/// Per-subscription data including join_ref and assigns
+struct Subscription {
+    join_ref: String,
+    assigns: Assigns,
+}
 
 /// Represents a single WebSocket connection
 pub struct Socket {
@@ -18,8 +24,8 @@ pub struct Socket {
     sender: mpsc::UnboundedSender<PhxMessage>,
     /// Receiver for broadcast messages
     broadcast_sender: mpsc::UnboundedSender<(String, PhxMessage)>,
-    /// Active channel subscriptions: topic -> join_ref
-    subscriptions: HashMap<String, String>,
+    /// Active channel subscriptions: topic -> subscription data
+    subscriptions: HashMap<String, Subscription>,
     /// Reference to the channel registry
     registry: Arc<ChannelRegistry>,
     /// Reference to all sockets for broadcast
@@ -113,8 +119,8 @@ impl Socket {
             }
         };
 
-        // Create socket reference for the channel
-        let socket_ref = SocketRef::new(
+        // Create socket reference for the channel (with fresh assigns)
+        let mut socket_ref = SocketRef::new(
             topic.clone(),
             join_ref.clone(),
             self.sender.clone(),
@@ -122,12 +128,23 @@ impl Socket {
         );
 
         // Call channel's join handler
-        let result = channel.join(topic, msg.payload.clone(), &socket_ref).await;
+        let result = channel
+            .join(topic, msg.payload.clone(), &mut socket_ref)
+            .await;
 
         match result {
             JoinResult::Ok(response) => {
-                // Add subscription
-                self.subscriptions.insert(topic.clone(), join_ref.clone());
+                // Take the assigns from socket_ref and store them
+                let assigns = socket_ref.take_assigns();
+
+                // Add subscription with assigns
+                self.subscriptions.insert(
+                    topic.clone(),
+                    Subscription {
+                        join_ref: join_ref.clone(),
+                        assigns,
+                    },
+                );
 
                 // Add to topic subscribers
                 self.topic_subscribers
@@ -159,21 +176,28 @@ impl Socket {
     async fn handle_leave(&mut self, msg: PhxMessage) -> Result<(), PhoenixError> {
         let topic = &msg.topic;
 
-        // Check if joined
-        if let Some(join_ref) = self.subscriptions.remove(topic) {
+        // Check if joined and remove subscription
+        if let Some(subscription) = self.subscriptions.remove(topic) {
             // Remove from topic subscribers
             if let Some(subscribers) = self.topic_subscribers.get(topic) {
                 subscribers.remove(&self.id);
             }
 
-            // Find channel handler and call terminate
+            // Find channel handler and call terminate with socket_ref
             if let Some(channel) = self.registry.find(topic) {
-                channel.terminate("leave").await;
+                let mut socket_ref = SocketRef::with_assigns(
+                    topic.clone(),
+                    subscription.join_ref.clone(),
+                    self.sender.clone(),
+                    self.broadcast_sender.clone(),
+                    subscription.assigns,
+                );
+                channel.terminate("leave", &mut socket_ref).await;
             }
 
             // Send success reply
             let reply = PhxMessage {
-                join_ref: Some(join_ref),
+                join_ref: Some(subscription.join_ref),
                 ref_: msg.ref_.clone(),
                 topic: topic.clone(),
                 event: events::PHX_REPLY.to_string(),
@@ -184,23 +208,26 @@ impl Socket {
             };
             self.send(reply)
         } else {
-            let reply = PhxMessage::reply(&msg, "error", serde_json::json!({"reason": "not joined"}));
+            let reply =
+                PhxMessage::reply(&msg, "error", serde_json::json!({"reason": "not joined"}));
             self.send(reply)
         }
     }
 
     /// Handle regular channel messages
-    async fn handle_channel_message(&self, msg: PhxMessage) -> Result<(), PhoenixError> {
+    async fn handle_channel_message(&mut self, msg: PhxMessage) -> Result<(), PhoenixError> {
         let topic = &msg.topic;
 
-        // Check if joined
-        let join_ref = match self.subscriptions.get(topic) {
-            Some(jr) => jr.clone(),
+        // Check if joined and get subscription
+        let subscription = match self.subscriptions.get_mut(topic) {
+            Some(sub) => sub,
             None => {
                 warn!(topic = %topic, "Received message for unjoined topic");
                 return Err(PhoenixError::NotJoined(topic.clone()));
             }
         };
+
+        let join_ref = subscription.join_ref.clone();
 
         // Find channel handler
         let channel = match self.registry.find(topic) {
@@ -210,18 +237,26 @@ impl Socket {
             }
         };
 
-        // Create socket reference
-        let socket_ref = SocketRef::new(
+        // Create socket reference with the subscription's assigns
+        // We need to temporarily take assigns out, use them, then put them back
+        let assigns = std::mem::take(&mut subscription.assigns);
+        let mut socket_ref = SocketRef::with_assigns(
             topic.clone(),
             join_ref.clone(),
             self.sender.clone(),
             self.broadcast_sender.clone(),
+            assigns,
         );
 
         // Call channel's handle_in
         let result = channel
-            .handle_in(&msg.event, msg.payload.clone(), &socket_ref)
+            .handle_in(&msg.event, msg.payload.clone(), &mut socket_ref)
             .await;
+
+        // Put the (possibly modified) assigns back
+        if let Some(sub) = self.subscriptions.get_mut(topic) {
+            sub.assigns = socket_ref.take_assigns();
+        }
 
         match result {
             HandleResult::Reply { status, response } => {
@@ -249,7 +284,12 @@ impl Socket {
                 };
                 self.send(close_msg)?;
 
-                // Note: actual cleanup happens when socket handles the stop
+                // Remove subscription
+                self.subscriptions.remove(topic);
+                if let Some(subscribers) = self.topic_subscribers.get(topic) {
+                    subscribers.remove(&self.id);
+                }
+
                 Ok(())
             }
         }
@@ -264,15 +304,22 @@ impl Socket {
 
     /// Clean up when socket disconnects
     pub async fn cleanup(&mut self) {
-        // Remove from all topic subscriptions
-        for (topic, _join_ref) in self.subscriptions.drain() {
+        // Remove from all topic subscriptions and call terminate
+        for (topic, subscription) in self.subscriptions.drain() {
             if let Some(subscribers) = self.topic_subscribers.get(&topic) {
                 subscribers.remove(&self.id);
             }
 
-            // Call terminate on channel
+            // Call terminate on channel with the socket_ref
             if let Some(channel) = self.registry.find(&topic) {
-                channel.terminate("disconnect").await;
+                let mut socket_ref = SocketRef::with_assigns(
+                    topic.clone(),
+                    subscription.join_ref,
+                    self.sender.clone(),
+                    self.broadcast_sender.clone(),
+                    subscription.assigns,
+                );
+                channel.terminate("disconnect", &mut socket_ref).await;
             }
         }
 
@@ -286,8 +333,8 @@ impl Socket {
             for socket_id in subscribers.iter() {
                 // Skip if this is the sender (for broadcast_from)
                 if let Some(exclude) = exclude_join_ref {
-                    if let Some(jr) = self.subscriptions.get(topic) {
-                        if socket_id.as_str() == self.id && jr == exclude {
+                    if let Some(sub) = self.subscriptions.get(topic) {
+                        if socket_id.as_str() == self.id && sub.join_ref == exclude {
                             continue;
                         }
                     }
@@ -307,7 +354,7 @@ impl Socket {
 
     /// Get the join_ref for a topic subscription
     pub fn get_join_ref(&self, topic: &str) -> Option<&String> {
-        self.subscriptions.get(topic)
+        self.subscriptions.get(topic).map(|s| &s.join_ref)
     }
 }
 
@@ -322,7 +369,10 @@ mod tests {
 
     #[async_trait]
     impl Channel for EchoChannel {
-        async fn join(&self, topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, topic: &str, _payload: Value, socket: &mut SocketRef) -> JoinResult {
+            // Store some state on join
+            socket.assign("topic", topic.to_string());
+            socket.assign("message_count", 0u32);
             JoinResult::ok(json!({"joined": topic}))
         }
 
@@ -330,7 +380,7 @@ mod tests {
             &self,
             event: &str,
             payload: Value,
-            socket: &SocketRef,
+            socket: &mut SocketRef,
         ) -> HandleResult {
             match event {
                 "echo" => HandleResult::ok(payload),
@@ -339,8 +389,25 @@ mod tests {
                     HandleResult::ok(json!({}))
                 }
                 "error" => HandleResult::error(json!({"reason": "test error"})),
+                "get_count" => {
+                    let count = socket.get_assign::<u32>("message_count").unwrap_or(&0);
+                    HandleResult::ok(json!({"count": *count}))
+                }
+                "increment" => {
+                    if let Some(count) = socket.get_assign_mut::<u32>("message_count") {
+                        *count += 1;
+                        HandleResult::ok(json!({"count": *count}))
+                    } else {
+                        HandleResult::error(json!({"reason": "no count"}))
+                    }
+                }
                 _ => HandleResult::no_reply(),
             }
+        }
+
+        async fn terminate(&self, _reason: &str, socket: &mut SocketRef) {
+            // Can access assigns during terminate
+            let _topic = socket.get_assign::<String>("topic");
         }
     }
 
@@ -348,7 +415,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for RejectChannel {
-        async fn join(&self, _topic: &str, _payload: Value, _socket: &SocketRef) -> JoinResult {
+        async fn join(&self, _topic: &str, _payload: Value, _socket: &mut SocketRef) -> JoinResult {
             JoinResult::error(json!({"reason": "unauthorized"}))
         }
 
@@ -356,13 +423,15 @@ mod tests {
             &self,
             _event: &str,
             _payload: Value,
-            _socket: &SocketRef,
+            _socket: &mut SocketRef,
         ) -> HandleResult {
             HandleResult::no_reply()
         }
     }
 
-    fn create_test_socket(registry: ChannelRegistry) -> (Socket, mpsc::UnboundedReceiver<PhxMessage>) {
+    fn create_test_socket(
+        registry: ChannelRegistry,
+    ) -> (Socket, mpsc::UnboundedReceiver<PhxMessage>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let (broadcast_sender, _broadcast_receiver) = mpsc::unbounded_channel();
         let all_sockets = Arc::new(DashMap::new());
@@ -458,14 +527,12 @@ mod tests {
         let (mut socket, mut receiver) = create_test_socket(registry);
 
         // First join
-        let join_msg =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
         socket.handle_message(join_msg).await.unwrap();
         let _ = receiver.try_recv().unwrap(); // consume first reply
 
         // Second join attempt
-        let join_msg2 =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("2");
+        let join_msg2 = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("2");
         socket.handle_message(join_msg2).await.unwrap();
 
         let reply = receiver.try_recv().unwrap();
@@ -480,16 +547,14 @@ mod tests {
         let (mut socket, mut receiver) = create_test_socket(registry);
 
         // Join first
-        let join_msg =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
         socket.handle_message(join_msg).await.unwrap();
         let _ = receiver.try_recv().unwrap();
 
         assert!(socket.is_subscribed("room:lobby"));
 
         // Leave
-        let leave_msg =
-            PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("2");
+        let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("2");
         socket.handle_message(leave_msg).await.unwrap();
 
         let reply = receiver.try_recv().unwrap();
@@ -504,8 +569,7 @@ mod tests {
         registry.register("room:*", EchoChannel);
         let (mut socket, mut receiver) = create_test_socket(registry);
 
-        let leave_msg =
-            PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
+        let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
         socket.handle_message(leave_msg).await.unwrap();
 
         let reply = receiver.try_recv().unwrap();
@@ -520,8 +584,7 @@ mod tests {
         let (mut socket, mut receiver) = create_test_socket(registry);
 
         // Join first
-        let join_msg =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
         socket.handle_message(join_msg).await.unwrap();
         let _ = receiver.try_recv().unwrap();
 
@@ -557,8 +620,7 @@ mod tests {
         let (mut socket, mut receiver) = create_test_socket(registry);
 
         // Join first
-        let join_msg =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
         socket.handle_message(join_msg).await.unwrap();
         let _ = receiver.try_recv().unwrap();
 
@@ -578,8 +640,7 @@ mod tests {
         let (mut socket, mut receiver) = create_test_socket(registry);
 
         // Join
-        let join_msg =
-            PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
         socket.handle_message(join_msg).await.unwrap();
         let _ = receiver.try_recv().unwrap();
 
@@ -589,5 +650,82 @@ mod tests {
         socket.cleanup().await;
 
         assert!(!socket.is_subscribed("room:lobby"));
+    }
+
+    #[tokio::test]
+    async fn test_assigns_persist_across_messages() {
+        let mut registry = ChannelRegistry::new();
+        registry.register("room:*", EchoChannel);
+        let (mut socket, mut receiver) = create_test_socket(registry);
+
+        // Join (sets message_count to 0)
+        let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        socket.handle_message(join_msg).await.unwrap();
+        let _ = receiver.try_recv().unwrap();
+
+        // Get initial count
+        let get_msg = PhxMessage::new("room:lobby", "get_count", json!({})).with_ref("2");
+        socket.handle_message(get_msg).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 0);
+
+        // Increment
+        let inc_msg = PhxMessage::new("room:lobby", "increment", json!({})).with_ref("3");
+        socket.handle_message(inc_msg).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 1);
+
+        // Increment again
+        let inc_msg2 = PhxMessage::new("room:lobby", "increment", json!({})).with_ref("4");
+        socket.handle_message(inc_msg2).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 2);
+
+        // Get final count
+        let get_msg2 = PhxMessage::new("room:lobby", "get_count", json!({})).with_ref("5");
+        socket.handle_message(get_msg2).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_assigns_isolated_between_topics() {
+        let mut registry = ChannelRegistry::new();
+        registry.register("room:*", EchoChannel);
+        let (mut socket, mut receiver) = create_test_socket(registry);
+
+        // Join first room
+        let join1 = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+        socket.handle_message(join1).await.unwrap();
+        let _ = receiver.try_recv().unwrap();
+
+        // Join second room
+        let join2 = PhxMessage::new("room:game", events::PHX_JOIN, json!({})).with_ref("2");
+        socket.handle_message(join2).await.unwrap();
+        let _ = receiver.try_recv().unwrap();
+
+        // Increment in first room
+        let inc1 = PhxMessage::new("room:lobby", "increment", json!({})).with_ref("3");
+        socket.handle_message(inc1).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 1);
+
+        // Check second room still at 0
+        let get2 = PhxMessage::new("room:game", "get_count", json!({})).with_ref("4");
+        socket.handle_message(get2).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 0);
+
+        // Increment first room again
+        let inc1b = PhxMessage::new("room:lobby", "increment", json!({})).with_ref("5");
+        socket.handle_message(inc1b).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 2);
+
+        // Second room still at 0
+        let get2b = PhxMessage::new("room:game", "get_count", json!({})).with_ref("6");
+        socket.handle_message(get2b).await.unwrap();
+        let reply = receiver.try_recv().unwrap();
+        assert_eq!(reply.payload["response"]["count"], 0);
     }
 }

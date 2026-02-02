@@ -12,13 +12,18 @@ struct ChatChannel;
 
 #[async_trait]
 impl Channel for ChatChannel {
-    async fn join(&self, topic: &str, payload: Value, _socket: &SocketRef) -> JoinResult {
+    async fn join(&self, topic: &str, payload: Value, socket: &mut SocketRef) -> JoinResult {
         let username = payload
             .get("username")
             .and_then(|v| v.as_str())
-            .unwrap_or("anonymous");
+            .unwrap_or("anonymous")
+            .to_string();
 
         println!("User '{}' joined {}", username, topic);
+
+        // Store username in assigns for later use
+        socket.assign("username", username.clone());
+        socket.assign("message_count", 0u32);
 
         JoinResult::ok(json!({
             "status": "joined",
@@ -27,9 +32,19 @@ impl Channel for ChatChannel {
         }))
     }
 
-    async fn handle_in(&self, event: &str, payload: Value, socket: &SocketRef) -> HandleResult {
+    async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
         match event {
             "shout" => {
+                // Get values from assigns first (before mutable borrow)
+                let username = socket.get_assign::<String>("username")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Increment message count using assigns
+                if let Some(count) = socket.get_assign_mut::<u32>("message_count") {
+                    *count += 1;
+                    println!("User '{}' sent message #{}", username, count);
+                }
                 socket.broadcast("shout", payload.clone());
                 HandleResult::ok(json!({}))
             }
@@ -41,8 +56,12 @@ impl Channel for ChatChannel {
         }
     }
 
-    async fn terminate(&self, reason: &str) {
-        println!("Channel terminated: {}", reason);
+    async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
+        let username = socket.get_assign::<String>("username")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let message_count = socket.get_assign::<u32>("message_count").copied().unwrap_or(0);
+        println!("User '{}' left ({}), sent {} messages", username, reason, message_count);
     }
 }
 
