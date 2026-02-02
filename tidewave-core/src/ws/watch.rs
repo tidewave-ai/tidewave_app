@@ -4,20 +4,20 @@
 //!
 //! Client → Server:
 //! ```json
-//! {"action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
-//! {"action": "unsubscribe", "ref": "watch1"}
+//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
+//! {"topic": "watch", "action": "unsubscribe", "ref": "watch1"}
 //! ```
 //!
 //! Server → Client:
 //! ```json
-//! {"event": "subscribed", "ref": "watch1"}
-//! {"event": "unsubscribed", "ref": "watch1"}
-//! {"event": "unsubscribed", "ref": "watch1", "error": "..."}
-//! {"event": "created", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"event": "deleted", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"event": "renamed", "from": "/foo/bar/old.txt", "to": "/foo/bar/new.txt", "ref": "watch1"}
-//! {"event": "warning", "message": "...", "ref": "watch1"}
+//! {"topic": "watch", "event": "subscribed", "ref": "watch1"}
+//! {"topic": "watch", "event": "unsubscribed", "ref": "watch1"}
+//! {"topic": "watch", "event": "unsubscribed", "ref": "watch1", "error": "..."}
+//! {"topic": "watch", "event": "created", "path": "/foo/bar/file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "deleted", "path": "/foo/bar/file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "renamed", "from": "/foo/bar/old.txt", "to": "/foo/bar/new.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "warning", "message": "...", "ref": "watch1"}
 //! ```
 
 use dashmap::DashMap;

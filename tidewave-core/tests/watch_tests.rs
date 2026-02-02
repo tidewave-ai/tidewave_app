@@ -78,6 +78,7 @@ async fn test_watch_subscribe_success() {
 
     // Send subscribe request
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": watch_path,
         "ref": "watch1"
@@ -93,6 +94,7 @@ async fn test_watch_subscribe_success() {
     let event = wait_for_event(&mut ws_out_rx, "subscribed", 1000).await;
     assert!(event.is_some(), "Expected subscribed event");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("watch1"));
 }
 
@@ -109,6 +111,7 @@ async fn test_watch_subscribe_relative_path_error() {
 
     // Send subscribe request with relative path
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": "relative/path",
         "ref": "watch1"
@@ -124,6 +127,7 @@ async fn test_watch_subscribe_relative_path_error() {
     let event = wait_for_event(&mut ws_out_rx, "unsubscribed", 1000).await;
     assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["error"]
         .as_str()
         .unwrap()
@@ -144,6 +148,7 @@ async fn test_watch_subscribe_nonexistent_path_error() {
 
     // Send subscribe request with non-existent path
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": "/nonexistent/path/that/does/not/exist",
         "ref": "watch1"
@@ -159,6 +164,7 @@ async fn test_watch_subscribe_nonexistent_path_error() {
     let event = wait_for_event(&mut ws_out_rx, "unsubscribed", 1000).await;
     assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["error"]
         .as_str()
         .unwrap()
@@ -183,6 +189,7 @@ async fn test_watch_file_created() {
 
     // Subscribe to the directory
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": watch_path,
         "ref": "mywatch"
@@ -208,6 +215,7 @@ async fn test_watch_file_created() {
     let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["path"]
         .as_str()
         .unwrap()
@@ -235,6 +243,7 @@ async fn test_watch_file_modified() {
 
     // Subscribe to the directory
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": watch_path,
         "ref": "modwatch"
@@ -259,6 +268,7 @@ async fn test_watch_file_modified() {
     let event = wait_for_event(&mut ws_out_rx, "modified", 2000).await;
     assert!(event.is_some(), "Expected modified event");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["path"]
         .as_str()
         .unwrap()
@@ -286,6 +296,7 @@ async fn test_watch_file_deleted() {
 
     // Subscribe to the directory
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": watch_path,
         "ref": "delwatch"
@@ -310,6 +321,7 @@ async fn test_watch_file_deleted() {
     let event = wait_for_event(&mut ws_out_rx, "deleted", 2000).await;
     assert!(event.is_some(), "Expected deleted event");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["path"]
         .as_str()
         .unwrap()
@@ -334,6 +346,7 @@ async fn test_watch_unsubscribe() {
 
     // Subscribe
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": &watch_path,
         "ref": "unsub_test"
@@ -350,6 +363,7 @@ async fn test_watch_unsubscribe() {
 
     // Unsubscribe using ref
     let unsubscribe_msg = json!({
+        "topic": "watch",
         "action": "unsubscribe",
         "ref": "unsub_test"
     });
@@ -364,6 +378,7 @@ async fn test_watch_unsubscribe() {
     let event = wait_for_event(&mut ws_out_rx, "unsubscribed", 1000).await;
     assert!(event.is_some(), "Expected unsubscribed event");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("unsub_test"));
 }
 
@@ -426,12 +441,14 @@ async fn test_watch_concurrent_subscribers() {
 
     // Both subscribe to the same path with different refs
     let subscribe_msg1 = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": &watch_path,
         "ref": "client1_watch"
     });
 
     let subscribe_msg2 = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": &watch_path,
         "ref": "client2_watch"
@@ -494,6 +511,7 @@ async fn test_watch_subdirectory_events() {
 
     // Subscribe to the parent directory
     let subscribe_msg = json!({
+        "topic": "watch",
         "action": "subscribe",
         "path": watch_path,
         "ref": "recursive_watch"
@@ -519,6 +537,7 @@ async fn test_watch_subdirectory_events() {
     let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event for nested file");
     let event = event.unwrap();
+    assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     assert!(event["path"]
         .as_str()
         .unwrap()

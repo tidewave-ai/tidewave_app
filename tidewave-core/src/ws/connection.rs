@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{WatchClientMessage, WebSocketId, WsOutboundMessage, WsState};
+use super::{ClientMessage, TopicMessage, WebSocketId, WsOutboundMessage, WsState};
 
 // ============================================================================
 // WebSocket Handler
@@ -102,7 +102,7 @@ pub async fn unit_testable_ws_handler<W, R>(
 }
 
 async fn handle_incoming_message(state: &WsState, websocket_id: WebSocketId, text: &str) {
-    // Handle ping first
+    // Handle ping first (not namespaced)
     if text.trim() == "ping" {
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
             let _ = tx.send(WsOutboundMessage::Pong);
@@ -110,21 +110,29 @@ async fn handle_incoming_message(state: &WsState, websocket_id: WebSocketId, tex
         return;
     }
 
-    // Try to deserialize as WatchClientMessage
-    if let Ok(watch_msg) = serde_json::from_str::<WatchClientMessage>(text) {
-        super::watch::handle_watch_message(state, websocket_id, watch_msg).await;
-        return;
+    // Route based on topic
+    match serde_json::from_str::<ClientMessage>(text) {
+        Ok(ClientMessage::Watch { message }) => {
+            super::watch::handle_watch_message(state, websocket_id, message).await;
+        }
+        Err(_) => {
+            // Unknown message format - ignore
+        }
     }
-
-    // Future: try other message types (Terminal, etc.)
 }
 
 fn serialize_outbound(message: WsOutboundMessage) -> Option<Message> {
     match message {
-        WsOutboundMessage::Watch(event) => match serde_json::to_string(&event) {
-            Ok(json_str) => Some(Message::Text(format!("{}\n", json_str).into())),
-            Err(_) => None,
-        },
+        WsOutboundMessage::Watch(event) => {
+            let msg = TopicMessage {
+                topic: "watch",
+                inner: event,
+            };
+            match serde_json::to_string(&msg) {
+                Ok(json_str) => Some(Message::Text(format!("{}\n", json_str).into())),
+                Err(_) => None,
+            }
+        }
         WsOutboundMessage::Pong => Some(Message::Text("pong".into())),
     }
 }
