@@ -263,6 +263,8 @@ pub struct TidewaveExitParams {
 // Regular ACP Message Types
 // ============================================================================
 
+// we also have a type for the session response, which we try to parse
+// to see if we need to track a new session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSessionResponse {
     #[serde(rename = "sessionId")]
@@ -273,6 +275,8 @@ pub struct NewSessionResponse {
 // Process Starter Abstraction
 // ============================================================================
 
+/// Type alias for process I/O streams
+/// Returns (stdin_writer, stdout_reader, stderr_reader, optional_child_process)
 pub type ProcessIo = (
     Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     Box<dyn tokio::io::AsyncBufRead + Unpin + Send>,
@@ -280,6 +284,7 @@ pub type ProcessIo = (
     Option<ChildProcess>,
 );
 
+/// Function type for starting a process and returning its I/O streams
 pub type ProcessStarterFn = Arc<
     dyn Fn(
             TidewaveSpawnOptions,
@@ -305,7 +310,7 @@ pub enum AcpChannelInfo {
 // ============================================================================
 
 pub type ChannelId = Uuid;
-pub type ProcessKey = String;
+pub type ProcessKey = String; // command + init params
 pub type SessionId = String;
 pub type NotificationId = String;
 
@@ -318,8 +323,10 @@ pub struct AcpChannelState {
     /// Sessions (session_id -> session_state)
     pub sessions: Arc<DashMap<SessionId, Arc<SessionState>>>,
     /// Session to Channel mapping (session_id -> channel_id)
+    /// Used when we need to forward an ACP message to the correct channel.
     pub session_to_channel: Arc<DashMap<SessionId, ChannelId>>,
     /// Channel to Process mapping (channel_id -> process_key)
+    /// Used when we need to forward a channel message to the ACP process.
     pub channel_to_process: Arc<DashMap<ChannelId, ProcessKey>>,
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
@@ -355,15 +362,29 @@ pub struct ProcessState {
     pub key: ProcessKey,
     pub spawn_opts: TidewaveSpawnOptions,
     pub child: Arc<RwLock<Option<ChildProcess>>>,
+    /// Channel used to forward a message to the ACP process.
     pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    /// Channel used to signal the exit monitor to kill the process.
     pub exit_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     pub next_proxy_id: Arc<AtomicU64>,
+
+    // ID mapping for multiplexed connections
     pub client_to_proxy_ids: Arc<DashMap<(ChannelId, Value), Value>>,
     pub proxy_to_client_ids: Arc<DashMap<Value, (ChannelId, Value)>>,
+    /// In case the client disconnected, the original client for a request ID
+    /// does not exist any more, so we also store the a mapping to the session ID.
     pub proxy_to_session_ids: Arc<DashMap<Value, (SessionId, Value)>>,
+
+    /// The cached init response we resend when a client reconnects.
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
+
+    /// Buffers for stdout/stderr output before init completes.
+    /// Used to provide detailed error messages when process exits before init.
     pub stdout_buffer: Arc<RwLock<Vec<String>>>,
     pub stderr_buffer: Arc<RwLock<Vec<String>>>,
+
+    // We store the request ID of init, session/new and session/load
+    // because we need to handle their responses in a special way.
     pub init_request_id: Arc<RwLock<Option<Value>>>,
     pub new_request_ids: Arc<DashSet<Value>>,
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
@@ -419,6 +440,7 @@ impl ProcessState {
     }
 
     pub fn generate_proxy_id(&self) -> Value {
+        // Claude decided to use this ordering, we could also use UUIDs instead
         let id = self.next_proxy_id.fetch_add(1, Ordering::SeqCst);
         Value::Number(serde_json::Number::from(id))
     }
@@ -434,6 +456,8 @@ impl ProcessState {
             .insert((channel_id, client_id.clone()), proxy_id.clone());
         self.proxy_to_client_ids
             .insert(proxy_id.clone(), (channel_id, client_id.clone()));
+
+        // If this request has a session_id, also store the session mapping
         if let Some(session_id) = session_id {
             self.proxy_to_session_ids
                 .insert(proxy_id.clone(), (session_id, client_id));
@@ -487,18 +511,33 @@ impl SessionState {
 
     pub async fn prune_buffer(&self, latest_id: &str) {
         let mut buffer = self.message_buffer.write().await;
+
+        // Find the index of the message with latest_id and remove all messages up to and including it
         if let Some(index) = buffer.iter().position(|msg| msg.id == latest_id) {
             buffer.drain(0..=index);
         }
     }
 
+    /// Get buffered messages after a given ID.
+    ///
+    /// **IMPORTANT:** Caller must acquire the lock on `message_buffer` before calling this function.
+    /// This allows the caller to control lock scope for atomicity.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let buffer = session.message_buffer.read().await;
+    /// let messages = SessionState::get_buffered_messages_after(&buffer, "notif_5");
+    /// ```
     pub fn get_buffered_messages_after(
         buffer: &[BufferedMessage],
         latest_id: &str,
     ) -> Vec<BufferedMessage> {
+        // Find the index of the message with latest_id
         if let Some(index) = buffer.iter().position(|msg| msg.id == latest_id) {
+            // Return all messages after this index
             buffer.iter().skip(index + 1).cloned().collect()
         } else {
+            // If latest_id not found, return all messages (empty latest_id case)
             buffer.iter().cloned().collect()
         }
     }
@@ -535,7 +574,7 @@ impl Default for AcpChannel {
 impl Channel for AcpChannel {
     async fn join(&self, topic: &str, _payload: Value, socket: &mut SocketRef) -> JoinResult {
         // Extract acp_id from topic "acp:{acp_id}"
-        let _acp_id = match topic.strip_prefix("acp:") {
+        let acp_id = match topic.strip_prefix("acp:") {
             Some(id) => id.to_string(),
             None => {
                 return JoinResult::error(json!({
@@ -547,7 +586,7 @@ impl Channel for AcpChannel {
         let channel_id = Uuid::new_v4();
         socket.assign("channel_id", channel_id);
 
-        debug!("ACP channel join: channel_id={}", channel_id);
+        debug!("ACP channel join: acp_id={}, channel_id={}", acp_id, channel_id);
 
         // Get info sender for forwarding messages from the ACP process
         let info_sender = match socket.info_sender::<AcpChannelInfo>() {
@@ -740,19 +779,26 @@ impl AcpChannel {
         socket: &mut SocketRef,
     ) -> Result<()> {
         match request.method.as_str() {
+            // We handle init because we need to
+            //   1. Start a new process in case there's no running one for the given parameters.
+            //   2. In case we start, store the request ID to store the response later on.
             "initialize" => {
                 self.handle_initialize_request(state, channel_id, request, socket)
                     .await
             }
+            // Our custom session load handler
             "_tidewave.ai/session/load" => {
                 self.handle_tidewave_session_load(state, channel_id, request)
                     .await
             }
+            // ACP session load. We need to intercept it because we need to update the session mapping.
             "session/load" => {
                 self.handle_acp_session_load(state, channel_id, request)
                     .await
             }
+            // Exit request
             "_tidewave.ai/exit" => self.handle_exit_request(state, channel_id).await,
+            // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
             _ => {
                 self.handle_regular_request(state, channel_id, request)
                     .await
@@ -945,23 +991,33 @@ impl AcpChannel {
         let was_cancelled = session_state.cancelled.swap(false, Ordering::SeqCst);
 
         if let Some(sender) = state.channel_senders.get(&channel_id) {
+            // Map channel to process (needed for any requests during catchup)
             state
                 .channel_to_process
                 .insert(channel_id, session_state.process_key.clone());
 
+            // ATOMIC CATCHUP: Hold the buffer read lock for the entire operation
+            // This prevents new messages from being added while we're catching up,
+            // ensuring we don't miss any messages.
             {
                 let buffer = session_state.message_buffer.read().await;
+
+                // Get buffered messages after latest_id
                 let buffered_messages =
                     SessionState::get_buffered_messages_after(&buffer, &params.latest_id);
 
+                // Stream buffered messages while holding the lock
+                // This is safe because sender.send() is non-blocking (unbounded channel)
                 for buffered in buffered_messages {
                     let _ = sender.send(AcpChannelInfo::JsonRpc(buffered.message));
                 }
 
+                // NOW register the session mapping while still holding the lock
+                // This ensures no messages arrive between catchup and registration
                 state
                     .session_to_channel
                     .insert(params.session_id.clone(), channel_id);
-            }
+            } // Lock released here - new messages can now be buffered AND sent directly
 
             let response_data = TidewaveSessionLoadResponse {
                 cancelled: was_cancelled,
@@ -1093,6 +1149,7 @@ impl AcpChannel {
     ) -> Result<()> {
         let process_state = self.ensure_process_for_channel(state, channel_id)?;
 
+        // Map client ID to proxy ID
         let session_id = extract_session_id_from_request(request);
         let proxy_id = process_state.map_client_id_to_proxy(
             channel_id,
@@ -1103,9 +1160,12 @@ impl AcpChannel {
         proxy_request.id = proxy_id.clone();
 
         match request.method.as_str() {
+            // We intercept new sessions to map the sessionId to the channel
             "session/new" => {
                 process_state.new_request_ids.insert(proxy_id.clone());
             }
+            // We intercept load requests since we need to handle the unsuccessful case
+            // and clear the session mapping.
             "session/load" => {
                 if let Some(session_id) = session_id {
                     process_state
@@ -1113,6 +1173,7 @@ impl AcpChannel {
                         .insert(proxy_id.clone(), session_id);
                 }
             }
+            // We intercept resume / fork sessions to map the sessionId to the channel
             "session/resume" => {
                 if let Some(session_id) = session_id {
                     process_state
@@ -1126,6 +1187,7 @@ impl AcpChannel {
             _ => (),
         }
 
+        // Forward to process
         if let Err(e) = process_state
             .send_to_process(JsonRpcMessage::Request(proxy_request))
             .await
@@ -1427,6 +1489,8 @@ impl AcpChannel {
         }
     }
 
+    /// Helper function to send a JSON-RPC error response to the client.
+    /// This is used for expected error conditions that should be communicated to the client.
     fn send_error_response(
         &self,
         state: &AcpChannelState,
@@ -1476,6 +1540,8 @@ impl AcpChannel {
         );
     }
 
+    /// Helper function to ensure a session is not already active on another channel.
+    /// Returns false if the session is already active (and sends an error response to the client).
     fn ensure_session_not_active(
         &self,
         state: &AcpChannelState,
@@ -1499,6 +1565,7 @@ impl AcpChannel {
         true
     }
 
+    /// Looks up the process for the given channel ID.
     fn ensure_process_for_channel(
         &self,
         state: &AcpChannelState,
@@ -1556,12 +1623,15 @@ async fn handle_process_message(
     }
 }
 
+/// Handle response from process - map proxy ID back to client ID and route
 async fn handle_process_response(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     response: &JsonRpcResponse,
 ) -> Result<()> {
+    // Handle responses - map proxy ID back to client ID
     if let Some((channel_id, client_id)) = process_state.resolve_proxy_id_to_client(&response.id) {
+        // Create response with original client ID
         let mut client_response = response.clone();
         client_response.id = client_id;
 
@@ -1597,6 +1667,7 @@ async fn handle_process_response(
     Ok(())
 }
 
+/// Handle initialize response - inject version and cache
 async fn maybe_handle_init_response(
     process_state: &Arc<ProcessState>,
     response: &JsonRpcResponse,
@@ -1604,15 +1675,18 @@ async fn maybe_handle_init_response(
 ) {
     let init_request_id = process_state.init_request_id.read().await;
     if init_request_id.as_ref() == Some(&response.id) {
-        drop(init_request_id);
+        drop(init_request_id); // Release read lock
         inject_tidewave_version(client_response, version());
         inject_proxy_capabilities(client_response);
+        // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
+        // Clear buffers
         *process_state.stderr_buffer.write().await = Vec::new();
         *process_state.stdout_buffer.write().await = Vec::new();
     }
 }
 
+/// Handle load/resume response - check if successful and kill session
 async fn maybe_handle_session_load_resume(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
@@ -1646,6 +1720,7 @@ async fn maybe_handle_session_load_resume(
     Ok(())
 }
 
+/// Handle session/new response - create new session
 async fn maybe_handle_session_new_response(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
@@ -1693,12 +1768,14 @@ async fn map_session_id_to_channel(
     }
 }
 
+/// Handle response for disconnected client - forward to new channel or buffer
 async fn handle_disconnected_client_response(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     response: &JsonRpcResponse,
 ) {
     debug!("Missing original channel for request {}", response.id);
+    // Fallback: Client disconnected, try to find session and forward to new channel
     let session_info = process_state
         .proxy_to_session_ids
         .get(&response.id)
@@ -1735,6 +1812,7 @@ async fn handle_process_notification_or_request(
     state: &AcpChannelState,
     message: JsonRpcMessage,
 ) -> Result<()> {
+    // Handle requests/notifications from process - route by sessionId
     let session_id = extract_session_id_from_message(&message);
 
     if let Some(session_id) = session_id {
@@ -1780,12 +1858,16 @@ async fn handle_process_notification_or_request(
 // Utility Functions
 // ============================================================================
 
+// String key of command + cwd + init params (from initialize request) for process deduplication
+// We exclude _meta.tidewave.ai/spawn from the params since command and cwd are already
+// explicitly part of the key
 pub fn generate_process_key(command: &str, cwd: &str, init_params: &Value) -> ProcessKey {
     let mut params_without_spawn_meta = init_params.clone();
     if let Some(obj) = params_without_spawn_meta.as_object_mut() {
         if let Some(meta) = obj.get_mut("_meta") {
             if let Some(meta_obj) = meta.as_object_mut() {
                 meta_obj.remove("tidewave.ai/spawn");
+                // If _meta is now empty, remove it entirely
                 if meta_obj.is_empty() {
                     obj.remove("_meta");
                 }
@@ -1804,6 +1886,7 @@ pub fn generate_process_key(command: &str, cwd: &str, init_params: &Value) -> Pr
 fn inject_tidewave_version(response: &mut JsonRpcResponse, version: &str) {
     if let Some(result) = &mut response.result {
         if let Some(result_obj) = result.as_object_mut() {
+            // Add top-level _meta with version
             let mut meta_obj = result_obj
                 .get("_meta")
                 .and_then(|v| v.as_object())
@@ -1824,6 +1907,7 @@ fn inject_proxy_capabilities(response: &mut JsonRpcResponse) {
         if let Some(result_obj) = result.as_object_mut() {
             if let Some(agent_caps) = result_obj.get_mut("agentCapabilities") {
                 if let Some(caps_obj) = agent_caps.as_object_mut() {
+                    // Add our custom _meta capabilities within agentCapabilities
                     let mut meta_obj = caps_obj
                         .get("_meta")
                         .and_then(|v| v.as_object())
@@ -1842,6 +1926,7 @@ fn inject_proxy_capabilities(response: &mut JsonRpcResponse) {
 }
 
 fn inject_notification_id(notification: &mut JsonRpcNotification, notif_id: NotificationId) {
+    // Add _meta.tidewave.ai/notificationId to params
     if let Some(params) = &mut notification.params {
         if let Some(params_obj) = params.as_object_mut() {
             let mut meta_obj = params_obj
@@ -1857,6 +1942,7 @@ fn inject_notification_id(notification: &mut JsonRpcNotification, notif_id: Noti
             params_obj.insert("_meta".to_string(), Value::Object(meta_obj));
         }
     } else {
+        // Create params with just _meta if params is None
         let mut params_obj = Map::new();
         let mut meta_obj = Map::new();
         meta_obj.insert(
