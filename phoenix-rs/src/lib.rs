@@ -6,7 +6,7 @@ pub mod serializer;
 pub mod socket;
 pub mod transport;
 
-pub use channel::{Channel, HandleResult, JoinResult, ReplyStatus, SocketRef};
+pub use channel::{Assigns, Channel, HandleResult, JoinResult, ReplyStatus, SocketRef};
 pub use error::PhoenixError;
 pub use message::{events, PhxMessage};
 pub use registry::{ChannelRegistry, TopicPattern};
