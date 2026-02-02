@@ -338,6 +338,7 @@ async fn serve_http_server_inner(
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
+        .route("/watch-demo", get(crate::watch_demo::watch_demo_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
