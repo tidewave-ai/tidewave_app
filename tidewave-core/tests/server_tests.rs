@@ -738,6 +738,170 @@ async fn test_read_file_requires_absolute_path() {
 }
 
 #[tokio::test]
+async fn test_delete_file() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a temp file to delete
+    let temp_dir = std::env::temp_dir().join(format!("delete_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("file_to_delete.txt");
+    fs::write(&file_path, "content to delete").expect("Failed to write file");
+
+    // Verify the file exists
+    assert!(file_path.exists());
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/delete", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    // Verify the file was deleted
+    assert!(!file_path.exists());
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_delete_file_requires_absolute_path() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/delete", port))
+        .json(&serde_json::json!({
+            "path": "relative/path.txt"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_delete_file_nonexistent() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/delete", port))
+        .json(&serde_json::json!({
+            "path": "/nonexistent/path/that/does/not/exist.txt"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].is_string());
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_delete_file_cannot_delete_directory() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a temp directory
+    let temp_dir = std::env::temp_dir().join(format!("delete_dir_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/delete", port))
+        .json(&serde_json::json!({
+            "path": temp_dir.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].is_string());
+
+    // Verify the directory still exists
+    assert!(temp_dir.exists());
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_delete_symlink_removes_link_not_target() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a temp directory with a file and a symlink to it
+    let temp_dir = std::env::temp_dir().join(format!("delete_symlink_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let target_file = temp_dir.join("target.txt");
+    fs::write(&target_file, "target content").expect("Failed to write target file");
+
+    let symlink_path = temp_dir.join("symlink.txt");
+    symlink(&target_file, &symlink_path).expect("Failed to create symlink");
+
+    // Verify both exist
+    assert!(target_file.exists());
+    assert!(symlink_path.exists());
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/delete", port))
+        .json(&serde_json::json!({
+            "path": symlink_path.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    // Verify the symlink was deleted but the target still exists
+    assert!(!symlink_path.exists());
+    assert!(target_file.exists());
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
 async fn test_stat_file() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
