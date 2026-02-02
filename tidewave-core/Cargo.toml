@@ -29,6 +29,8 @@ dashmap = "6.0"
 notify = "8.1"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 anyhow = "1.0"
+phoenix-rs = { path = "../phoenix-rs" }
+async-trait = "0.1"
 tar = "0.4"
 flate2 = "1.0"
 which = "8.0"

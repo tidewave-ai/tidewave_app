@@ -3294,7 +3294,7 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-test",
  "tokio-tungstenite 0.26.2",
@@ -5073,7 +5073,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-app"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-cli"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "clap",
  "tidewave-core",
@@ -5106,7 +5106,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -5125,6 +5125,7 @@ dependencies = [
  "hyper",
  "libc",
  "notify",
+ "phoenix-rs",
  "reqwest",
  "rustls",
  "rustls-pemfile",
@@ -5597,7 +5598,7 @@ dependencies = [
  "log",
  "rand 0.9.2",
  "sha1",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "utf-8",
 ]
 

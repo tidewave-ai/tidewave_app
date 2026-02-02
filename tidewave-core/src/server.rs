@@ -1,7 +1,9 @@
+use crate::acp_channel::{AcpChannel, AcpChannelState};
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use crate::utils::{load_tls_config_from_paths, normalize_path};
+use crate::mcp_channel::{mcp_channel_client_handler, McpChannel, McpChannelState};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -273,6 +275,10 @@ async fn serve_http_server_inner(
     let acp_state = crate::acp_proxy::AcpProxyState::new();
     let download_state = DownloadState::new();
 
+    // Phoenix channels state
+    let acp_channel_state = AcpChannelState::new();
+    let mcp_channel_state = McpChannelState::new();
+
     // Build allowed origins for both HTTP and HTTPS
     let mut allowed_origins = config.allowed_origins.clone();
 
@@ -325,6 +331,17 @@ async fn serve_http_server_inner(
         .route("/ws", get(crate::ws::ws_handler))
         .with_state(ws_state.clone());
 
+    // Create Phoenix channel routes
+    let mut channel_registry = phoenix_rs::ChannelRegistry::new();
+    channel_registry.register("acp:*", AcpChannel::with_state(acp_channel_state));
+    channel_registry.register("mcp:*", McpChannel::with_state(mcp_channel_state.clone()));
+    let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
+
+    // Create MCP channel client route (HTTP endpoint for agent requests)
+    let mcp_channel_routes = Router::new()
+        .route("/socket/mcp-client", post(mcp_channel_client_handler))
+        .with_state(mcp_channel_state);
+
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
@@ -349,7 +366,9 @@ async fn serve_http_server_inner(
         .merge(mcp_routes)
         .merge(acp_routes)
         .merge(download_routes)
-        .merge(ws_routes);
+        .merge(ws_routes)
+        .merge(phoenix_routes)
+        .merge(mcp_channel_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
