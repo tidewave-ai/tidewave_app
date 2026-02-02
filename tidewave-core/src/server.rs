@@ -72,6 +72,8 @@ struct WriteFileParams {
     path: String,
     content: String,
     #[serde(default)]
+    exclusive: bool,
+    #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
 }
@@ -737,24 +739,39 @@ async fn write_file_handler(
     }
 
     let content = payload.content.clone();
+    let exclusive = payload.exclusive;
     let bytes_written = content.len();
 
     let result = async {
         let path = Path::new(&file_path);
 
-        let parent_path = path.parent().unwrap_or_else(|| &path);
+        let parent_path = path.parent().unwrap_or(path);
         if !parent_path.exists() {
             tokio::fs::create_dir_all(parent_path)
                 .await
-                .map_err(|e| e.kind().to_string())?;
+                .map_err(|e| (false, e.kind().to_string()))?;
         }
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| e.kind().to_string())?;
+        if exclusive {
+            // Atomic exclusive write using O_CREAT | O_EXCL semantics
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+                .map_err(|e| (e.kind() == std::io::ErrorKind::AlreadyExists, e.kind().to_string()))?;
+            file.write_all(content.as_bytes())
+                .await
+                .map_err(|e| (false, e.kind().to_string()))?;
+        } else {
+            tokio::fs::write(&path, content)
+                .await
+                .map_err(|e| (false, e.kind().to_string()))?;
+        }
 
-        let mtime = fetch_mtime(file_path)?;
-        Ok::<_, String>(mtime)
+        let mtime = fetch_mtime(file_path).map_err(|e| (false, e))?;
+        Ok::<_, (bool, String)>(mtime)
     }
     .await;
 
@@ -764,7 +781,8 @@ async fn write_file_handler(
             bytes_written,
             mtime,
         })),
-        Err(error) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
+        Err((true, _)) => Err(StatusCode::CONFLICT),
+        Err((false, error)) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
             success: false,
             error,
         })),

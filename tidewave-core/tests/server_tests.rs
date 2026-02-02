@@ -688,6 +688,84 @@ async fn test_shell_echo_command() {
 }
 
 #[tokio::test]
+async fn test_write_file_exclusive_succeeds_if_not_exists() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("new_file.txt");
+
+    let client = reqwest::Client::new();
+
+    // Write with exclusive=true to a new file - should succeed
+    let response = client
+        .post(format!("http://127.0.0.1:{}/write", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new content",
+            "exclusive": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["mtime"].is_number());
+    assert_eq!(body["bytes_written"], 11);
+
+    // Verify the file was created with correct content
+    let content = fs::read_to_string(&file_path).expect("Failed to read file");
+    assert_eq!(content, "new content");
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_write_file_exclusive_fails_if_exists() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    // Create a temp file that already exists
+    let temp_dir = std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("existing_file.txt");
+    fs::write(&file_path, "original content").expect("Failed to write file");
+
+    let client = reqwest::Client::new();
+
+    // Try to write with exclusive=true - should fail atomically
+    let response = client
+        .post(format!("http://127.0.0.1:{}/write", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new content",
+            "exclusive": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    // Verify the original content is unchanged
+    let content = fs::read_to_string(&file_path).expect("Failed to read file");
+    assert_eq!(content, "original content");
+
+    // Clean up
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
 async fn test_read_file() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
