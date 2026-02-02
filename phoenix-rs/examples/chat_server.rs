@@ -33,23 +33,32 @@ impl Channel for ChatChannel {
     }
 
     async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
+        // Get username from assigns (stored during join)
+        let username = socket.get_assign::<String>("username")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
         match event {
             "shout" => {
-                // Get values from assigns first (before mutable borrow)
-                let username = socket.get_assign::<String>("username")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                // Increment message count using assigns
+                // Increment message count
                 if let Some(count) = socket.get_assign_mut::<u32>("message_count") {
                     *count += 1;
                     println!("User '{}' sent message #{}", username, count);
                 }
-                socket.broadcast("shout", payload.clone());
+
+                // Broadcast with username injected from assigns
+                let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                socket.broadcast("shout", json!({
+                    "username": username,
+                    "body": body
+                }));
                 HandleResult::ok(json!({}))
             }
             "typing" => {
-                socket.broadcast_from("typing", payload.clone());
+                // Broadcast typing indicator with username from assigns
+                socket.broadcast_from("typing", json!({
+                    "username": username
+                }));
                 HandleResult::no_reply()
             }
             _ => HandleResult::no_reply(),
@@ -254,7 +263,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             const body = input.value.trim();
             if (!body || !channel) return;
 
-            channel.push("shout", { username: username, body: body })
+            channel.push("shout", { body: body })
                 .receive("ok", () => {
                     input.value = '';
                 })
@@ -267,7 +276,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             if (!channel) return;
             // Throttle typing events
             if (!typingTimeout) {
-                channel.push("typing", { username: username });
+                channel.push("typing", {});
                 typingTimeout = setTimeout(() => { typingTimeout = null; }, 1000);
             }
         }
