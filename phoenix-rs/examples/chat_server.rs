@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use axum::{response::Html, routing::get, Router};
 use phoenix_rs::{
     channel::{Channel, HandleResult, JoinResult, SocketRef},
-    phoenix_router, ChannelRegistry, InfoSender,
+    phoenix_router, CancellationToken, ChannelRegistry, InfoSender,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -34,10 +34,12 @@ impl Channel for ChatChannel {
         socket.assign("username", username.clone());
         socket.assign("message_count", 0u32);
 
-        // Get a typed info sender for background tasks
+        // Get a typed info sender and shutdown token for background tasks
         if let Some(info_sender) = socket.info_sender::<ChatInfo>() {
+            let shutdown = socket.shutdown_token().unwrap();
             // Spawn a background task that sends periodic tick messages
-            tokio::spawn(counter_task(info_sender));
+            // It will automatically stop when the subscription terminates
+            tokio::spawn(counter_task(info_sender, shutdown));
         }
 
         JoinResult::ok(json!({
@@ -101,17 +103,22 @@ impl Channel for ChatChannel {
     }
 }
 
-/// Background task that sends periodic tick messages via InfoSender
-async fn counter_task(info_sender: InfoSender<ChatInfo>) {
+/// Background task that sends periodic tick messages via InfoSender.
+/// Automatically stops when the subscription terminates thanks to the shutdown token.
+async fn counter_task(info_sender: InfoSender<ChatInfo>, shutdown: CancellationToken) {
     let mut count = 0u32;
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        count += 1;
-
-        // Send tick to the channel's handle_info
-        if info_sender.send(ChatInfo::Tick(count)).is_err() {
-            // Channel closed, stop the task
-            break;
+        tokio::select! {
+            // Clean exit when subscription terminates
+            _ = shutdown.cancelled() => {
+                println!("Counter task shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                count += 1;
+                // Send tick to the channel's handle_info
+                let _ = info_sender.send(ChatInfo::Tick(count));
+            }
         }
     }
 }
