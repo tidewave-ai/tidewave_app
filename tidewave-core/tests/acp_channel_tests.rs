@@ -13,14 +13,14 @@ async fn test_channel_init_request_flow() {
     registry.register("acp:*", AcpChannel::with_state(state));
 
     let mut client = TestClient::new(registry);
-    let mut channel = client.join("acp:test", json!({})).await.unwrap();
+    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
 
     // Send init request via jsonrpc event
     let init_request = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": params_with_spawn_opts(json!({}))
+        "params": {}
     });
 
     channel.push("jsonrpc", init_request).await;
@@ -61,20 +61,21 @@ async fn test_channel_session_new_flow() {
     registry.register("acp:*", AcpChannel::with_state(state));
 
     let mut client = TestClient::new(registry);
-    let mut channel = client.join("acp:test", json!({})).await.unwrap();
+    // Process starts during join
+    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
 
-    // First send initialize to start the process
+    // Wait for process to start
+    process_started.await.expect("Process failed to start");
+
+    // First send initialize
     let init_request = json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
-        "params": params_with_spawn_opts(json!({}))
+        "params": {}
     });
 
     channel.push("jsonrpc", init_request).await;
-
-    // Wait for process to start
-    process_started.await.expect("Process failed to start");
 
     // Read and respond to init request
     let init_req = read_json_line(&mut test_stdout).await;
@@ -138,20 +139,21 @@ async fn test_channel_notification_forwarding() {
     registry.register("acp:*", AcpChannel::with_state(state));
 
     let mut client = TestClient::new(registry);
-    let mut channel = client.join("acp:test", json!({})).await.unwrap();
+    // Process starts during join
+    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
 
-    // First send initialize to start the process
+    // Wait for process to start
+    process_started.await.expect("Process failed to start");
+
+    // First send initialize
     let init_request = json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
-        "params": params_with_spawn_opts(json!({}))
+        "params": {}
     });
 
     channel.push("jsonrpc", init_request).await;
-
-    // Wait for process to start
-    process_started.await.expect("Process failed to start");
 
     // Read init request and send response
     let init_req = read_json_line(&mut test_stdout).await;
@@ -216,8 +218,9 @@ async fn test_channel_notification_forwarding() {
     assert_eq!(notif["params"]["sessionId"], "sess_123");
 }
 
+/// Test that concurrent channel joins with same spawn options only start one process
 #[tokio::test]
-async fn test_concurrent_initialize_requests() {
+async fn test_concurrent_channel_joins() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Create a barrier to control when the process start completes
@@ -229,52 +232,30 @@ async fn test_concurrent_initialize_requests() {
     let start_count_clone = start_count.clone();
 
     // Create a custom process starter that increments counter and waits on barrier
-    let (process_stdin, _test_stdin) = tokio::io::duplex(8192);
-    let process_stdin = Arc::new(tokio::sync::Mutex::new(Some(process_stdin)));
-    let (_test_stdout, process_stdout) = tokio::io::duplex(8192);
-    let process_stdout = Arc::new(tokio::sync::Mutex::new(Some(process_stdout)));
-    let (started_tx, _started_rx) = tokio::sync::oneshot::channel::<()>();
-    let started_tx = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
-
     let starter: ProcessStarterFn = Arc::new(move |_spawn_opts: TidewaveSpawnOptions| {
-        let process_stdin = process_stdin.clone();
-        let process_stdout = process_stdout.clone();
         let barrier = barrier.clone();
         let start_count = start_count_clone.clone();
-        let started_tx = started_tx.clone();
 
         Box::pin(async move {
             // Increment start counter
             start_count.fetch_add(1, Ordering::SeqCst);
 
-            let stdin = process_stdin
-                .lock()
-                .await
-                .take()
-                .expect("process already started");
-            let stdout = process_stdout
-                .lock()
-                .await
-                .take()
-                .expect("process already started");
-
-            // Wait for barrier
+            // Wait for barrier - this simulates slow process startup
             if let Some(rx) = barrier.lock().await.take() {
                 let _ = rx.await;
             }
 
-            // Signal that process has started
-            if let Some(tx) = started_tx.lock().await.take() {
-                let _ = tx.send(());
-            }
+            // Create duplex streams for the process
+            let (process_stdin, _test_stdin) = tokio::io::duplex(8192);
+            let (_test_stdout, process_stdout) = tokio::io::duplex(8192);
 
             // Create stderr (unused)
             let (stderr_write, stderr_read) = tokio::io::duplex(1024);
             drop(stderr_write);
 
             Ok::<ProcessIo, anyhow::Error>((
-                Box::new(stdout),
-                Box::new(BufReader::new(stdin)),
+                Box::new(process_stdout),
+                Box::new(BufReader::new(process_stdin)),
                 Box::new(BufReader::new(stderr_read)),
                 None,
             ))
@@ -293,64 +274,39 @@ async fn test_concurrent_initialize_requests() {
     let mut client1 = TestClient::new(registry1);
     let mut client2 = TestClient::new(registry2);
 
-    let mut channel1 = client1.join("acp:test1", json!({})).await.unwrap();
-    let mut channel2 = client2.join("acp:test2", json!({})).await.unwrap();
+    // Create futures for both joins (not awaited yet)
+    let join1_future = client1.join("acp:test1", spawn_opts());
+    let join2_future = client2.join("acp:test2", spawn_opts());
 
-    // Send init requests from both clients with SAME params (same process_key)
-    let init_request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": params_with_spawn_opts(json!({}))
-    });
-
-    // Send both requests at nearly the same time
-    channel1.push("jsonrpc", init_request.clone()).await;
-    channel2.push("jsonrpc", init_request).await;
-
-    // Wait for the process starter to be called exactly once
-    let start_time = tokio::time::Instant::now();
-    loop {
-        if start_count.load(Ordering::SeqCst) == 1 {
-            break;
+    // Run both joins concurrently, plus a task to release the barrier
+    let barrier_release = async {
+        // Wait for the process starter to be called
+        let start_time = tokio::time::Instant::now();
+        loop {
+            if start_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if start_time.elapsed() > tokio::time::Duration::from_secs(1) {
+                panic!("Timeout waiting for process starter to be called");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-        if start_time.elapsed() > tokio::time::Duration::from_secs(1) {
-            panic!("Timeout waiting for process starter to be called");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
 
-    // At this point, first request should be blocked on barrier
-    // Second request should be waiting on the lock
-    // Process starter should have been called exactly once
-    assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        // Process starter should have been called exactly once
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
 
-    // Release the barrier to complete the first process start
-    barrier_tx.send(()).unwrap();
+        // Release the barrier to complete the first process start
+        barrier_tx.send(()).unwrap();
+    };
 
-    // Check second client's response - should be the "Process alive, but no init response" error
-    let msg = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        channel2.recv(),
-    )
-    .await
-    .expect("Timeout waiting for response")
-    .expect("Channel closed");
+    // Run all three concurrently
+    let (result1, result2, _) = tokio::join!(join1_future, join2_future, barrier_release);
 
-    assert_eq!(msg.event, "jsonrpc");
-    let response = &msg.payload;
-    assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], 1);
-    // Should have an error, not a result
-    assert!(response.get("error").is_some());
-    let error = &response["error"];
-    assert_eq!(error["code"], -32004);
-    assert!(error["message"]
-        .as_str()
-        .unwrap()
-        .contains("no init response"));
+    // Both joins should succeed
+    assert!(result1.is_ok(), "First join should succeed");
+    assert!(result2.is_ok(), "Second join should succeed");
 
-    // Process starter should still have been called only once
+    // Process starter should have been called only once
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 }
 
@@ -445,21 +401,11 @@ async fn write_json_line(stream: &mut DuplexStream, value: &Value) {
     stream.flush().await.expect("Failed to flush");
 }
 
-/// Helper to create params with spawn options for initialize requests
-fn params_with_spawn_opts(additional_params: Value) -> Value {
-    let mut params = if additional_params.is_object() {
-        additional_params
-    } else {
-        json!({})
-    };
-
-    params["_meta"] = json!({
-        "tidewave.ai/spawn": {
-            "command": "test_acp",
-            "env": {},
-            "cwd": "."
-        }
-    });
-
-    params
+/// Helper to create spawn options for channel join
+fn spawn_opts() -> Value {
+    json!({
+        "command": "test_acp",
+        "env": {},
+        "cwd": "."
+    })
 }

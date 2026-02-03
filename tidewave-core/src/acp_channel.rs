@@ -303,6 +303,8 @@ pub type ProcessStarterFn = Arc<
 pub enum AcpChannelInfo {
     /// A JSON-RPC message from the ACP process
     JsonRpc(JsonRpcMessage),
+    /// Agent exit event
+    AgentExit(TidewaveExitParams),
 }
 
 // ============================================================================
@@ -572,7 +574,7 @@ impl Default for AcpChannel {
 
 #[async_trait]
 impl Channel for AcpChannel {
-    async fn join(&self, topic: &str, _payload: Value, socket: &mut SocketRef) -> JoinResult {
+    async fn join(&self, topic: &str, payload: Value, socket: &mut SocketRef) -> JoinResult {
         // Extract acp_id from topic "acp:{acp_id}"
         let acp_id = match topic.strip_prefix("acp:") {
             Some(id) => id.to_string(),
@@ -603,8 +605,53 @@ impl Channel for AcpChannel {
             .channel_senders
             .insert(channel_id, info_sender.clone());
 
-        // The actual process initialization happens when the client sends
-        // an "initialize" request via the jsonrpc event
+        // Parse spawn options from join payload
+        let spawn_opts: TidewaveSpawnOptions = match serde_json::from_value(payload) {
+            Ok(opts) => opts,
+            Err(e) => {
+                return JoinResult::error(json!({
+                    "reason": format!("invalid spawn options: {}", e)
+                }));
+            }
+        };
+
+        // Generate process key and start/reuse process
+        let process_key = generate_process_key(&spawn_opts.command, &spawn_opts.cwd, &Value::Null);
+        socket.assign("process_key", process_key.clone());
+
+        // Acquire or create a lock for this process_key
+        let lock = self.state
+            .process_start_locks
+            .entry(process_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let guard = lock.lock().await;
+
+        // Check if we already have a process for this key
+        if !self.state.processes.contains_key(&process_key) {
+            // Need to start a new process
+            let new_process = Arc::new(ProcessState::new(process_key.clone(), spawn_opts));
+
+            match self.start_acp_process(new_process.clone(), self.state.clone()).await {
+                Ok(()) => {
+                    self.state.processes.insert(process_key.clone(), new_process);
+                }
+                Err(e) => {
+                    drop(guard);
+                    self.state.process_start_locks.remove(&process_key);
+                    return JoinResult::error(json!({
+                        "reason": format!("failed to start process: {}", e)
+                    }));
+                }
+            }
+        }
+
+        drop(guard);
+        self.state.process_start_locks.remove(&process_key);
+
+        // Map channel to process
+        self.state.channel_to_process.insert(channel_id, process_key);
+
         JoinResult::ok(json!({
             "channel_id": channel_id.to_string(),
             "version": version()
@@ -649,6 +696,13 @@ impl Channel for AcpChannel {
 
                 HandleResult::no_reply()
             }
+            "exit" => {
+                // Handle exit channel event
+                if let Err(e) = self.handle_exit_request(&self.state, channel_id).await {
+                    error!("Error handling exit request: {}", e);
+                }
+                HandleResult::no_reply()
+            }
             _ => {
                 warn!("Unknown event in ACP channel: {}", event);
                 HandleResult::no_reply()
@@ -668,6 +722,16 @@ impl Channel for AcpChannel {
                         }
                     };
                     socket.push("jsonrpc", payload);
+                }
+                AcpChannelInfo::AgentExit(exit_params) => {
+                    let payload = match serde_json::to_value(&exit_params) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("Failed to serialize agent exit params: {}", e);
+                            return;
+                        }
+                    };
+                    socket.push("agent_exit", payload);
                 }
             }
         }
@@ -796,8 +860,6 @@ impl AcpChannel {
                 self.handle_acp_session_load(state, channel_id, request)
                     .await
             }
-            // Exit request
-            "_tidewave.ai/exit" => self.handle_exit_request(state, channel_id).await,
             // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
             _ => {
                 self.handle_regular_request(state, channel_id, request)
@@ -811,122 +873,20 @@ impl AcpChannel {
         state: &AcpChannelState,
         channel_id: ChannelId,
         request: &JsonRpcRequest,
-        socket: &mut SocketRef,
+        _socket: &mut SocketRef,
     ) -> Result<()> {
-        let init_params = request.params.as_ref().unwrap_or(&Value::Null);
+        // Process was already started during channel join
+        let process_state = self.ensure_process_for_channel(state, channel_id)?;
 
-        let spawn_opts = init_params
-            .get("_meta")
-            .and_then(|meta| meta.get("tidewave.ai/spawn"))
-            .ok_or_else(|| anyhow!("Missing _meta.tidewave.ai/spawn in initialize request"))?;
-
-        let spawn_opts: TidewaveSpawnOptions = serde_json::from_value(spawn_opts.clone())
-            .map_err(|e| anyhow!("Invalid spawn options format: {}", e))?;
-
-        debug!(
-            "Handling initialize request for command: {}",
-            spawn_opts.command
-        );
-        let process_key = generate_process_key(&spawn_opts.command, &spawn_opts.cwd, init_params);
-        trace!("Generated process key: {}", process_key);
-
-        socket.assign("process_key", process_key.clone());
-
-        // Acquire or create a lock for this process_key
-        let lock = state
-            .process_start_locks
-            .entry(process_key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let guard = lock.lock().await;
-
-        let result = self
-            .handle_initialize_request_locked(state, channel_id, spawn_opts, request, &process_key)
-            .await;
-
-        drop(guard);
-        state.process_start_locks.remove(&process_key);
-
-        result
-    }
-
-    async fn handle_initialize_request_locked(
-        &self,
-        state: &AcpChannelState,
-        channel_id: ChannelId,
-        spawn_opts: TidewaveSpawnOptions,
-        request: &JsonRpcRequest,
-        process_key: &ProcessKey,
-    ) -> Result<()> {
-        // Check if we already have a process for this command + params
-        if let Some(process_state) = state.processes.get(process_key) {
-            debug!("Found existing process for key: {}", process_key);
-            if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref()
-            {
-                let mut response = cached_response.clone();
-                response.id = request.id.clone();
-
-                self.send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-
-                state
-                    .channel_to_process
-                    .insert(channel_id, process_key.clone());
-
-                return Ok(());
-            }
+        // Check if we have a cached init response
+        if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
+            let mut response = cached_response.clone();
+            response.id = request.id.clone();
+            self.send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
+            return Ok(());
         }
 
-        // Need to start a new process
-        let process_state = match state.processes.get(process_key) {
-            Some(_existing) => {
-                let response = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id.clone(),
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32004,
-                        message: "Process alive, but no init response.".to_string(),
-                        data: None,
-                    }),
-                };
-
-                self.send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-
-                return Ok(());
-            }
-            None => {
-                let new_process =
-                    Arc::new(ProcessState::new(process_key.clone(), spawn_opts.clone()));
-
-                match self
-                    .start_acp_process(new_process.clone(), state.clone())
-                    .await
-                {
-                    Ok(()) => {
-                        state
-                            .processes
-                            .insert(process_key.clone(), new_process.clone());
-                        new_process
-                    }
-                    Err(e) => {
-                        self.send_exit_notification(
-                            state,
-                            channel_id,
-                            "process_start_failed",
-                            &e.to_string(),
-                            None,
-                            None,
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-        };
-
-        state
-            .channel_to_process
-            .insert(channel_id, process_key.clone());
-
+        // Forward the init request to the process
         let session_id = extract_session_id_from_request(request);
         let proxy_id =
             process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id);
@@ -940,7 +900,7 @@ impl AcpChannel {
             .await
         {
             error!("Failed to send initialize request to process: {}", e);
-            self.send_exit_notification(
+            self.send_agent_exit(
                 state,
                 channel_id,
                 "communication_error",
@@ -1430,24 +1390,15 @@ impl AcpChannel {
                 .collect();
 
             for channel_id in channels_to_notify {
-                let exit_notification = JsonRpcNotification {
-                    jsonrpc: "2.0".to_string(),
-                    method: "_tidewave.ai/exit".to_string(),
-                    params: Some(
-                        serde_json::to_value(TidewaveExitParams {
-                            error: error_type.to_string(),
-                            message: exit_message.clone(),
-                            stdout: stdout.clone(),
-                            stderr: stderr.clone(),
-                        })
-                        .unwrap(),
-                    ),
+                let exit_params = TidewaveExitParams {
+                    error: error_type.to_string(),
+                    message: exit_message.clone(),
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
                 };
 
                 if let Some(sender) = state_exit.channel_senders.get(&channel_id) {
-                    let _ = sender.send(AcpChannelInfo::JsonRpc(JsonRpcMessage::Notification(
-                        exit_notification,
-                    )));
+                    let _ = sender.send(AcpChannelInfo::AgentExit(exit_params));
                 }
             }
 
@@ -1510,7 +1461,7 @@ impl AcpChannel {
         self.send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
     }
 
-    fn send_exit_notification(
+    fn send_agent_exit(
         &self,
         state: &AcpChannelState,
         channel_id: ChannelId,
@@ -1519,25 +1470,16 @@ impl AcpChannel {
         stdout: Option<String>,
         stderr: Option<String>,
     ) {
-        let exit_notification = JsonRpcNotification {
-            jsonrpc: "2.0".to_string(),
-            method: "_tidewave.ai/exit".to_string(),
-            params: Some(
-                serde_json::to_value(TidewaveExitParams {
-                    error: error_type.to_string(),
-                    message: message.to_string(),
-                    stdout,
-                    stderr,
-                })
-                .unwrap(),
-            ),
+        let exit_params = TidewaveExitParams {
+            error: error_type.to_string(),
+            message: message.to_string(),
+            stdout,
+            stderr,
         };
 
-        self.send_to_channel(
-            state,
-            channel_id,
-            JsonRpcMessage::Notification(exit_notification),
-        );
+        if let Some(sender) = state.channel_senders.get(&channel_id) {
+            let _ = sender.send(AcpChannelInfo::AgentExit(exit_params));
+        }
     }
 
     /// Helper function to ensure a session is not already active on another channel.
