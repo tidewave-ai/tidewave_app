@@ -4,7 +4,8 @@ pub mod config;
 mod http_handlers;
 mod mcp_remote;
 pub mod server;
-pub mod tls;
+pub mod utils;
+pub mod ws;
 
 pub use config::{get_config_path, load_config, Config};
 pub use server::{

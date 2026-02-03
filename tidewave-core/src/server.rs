@@ -1,6 +1,7 @@
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
+use crate::utils::{load_tls_config_from_paths, normalize_path};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -318,6 +319,12 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
+    // Create WebSocket routes
+    let ws_state = crate::ws::WsState::new();
+    let ws_routes = Router::new()
+        .route("/ws", get(crate::ws::ws_handler))
+        .with_state(ws_state.clone());
+
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
@@ -341,7 +348,8 @@ async fn serve_http_server_inner(
         )
         .merge(mcp_routes)
         .merge(acp_routes)
-        .merge(download_routes);
+        .merge(download_routes)
+        .merge(ws_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -379,7 +387,7 @@ async fn serve_http_server_inner(
             .https_key_path
             .as_ref()
             .expect("https_key_path validated");
-        let rustls_config = crate::tls::load_tls_config_from_paths(cert_path, key_path)?;
+        let rustls_config = load_tls_config_from_paths(cert_path, key_path)?;
 
         let https_addr = get_bind_addr(https_port, config.allow_remote_access);
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
@@ -454,6 +462,9 @@ async fn serve_http_server_inner(
             let _ = exit_tx.send(());
         }
     }
+
+    // Clear all WebSocket state
+    ws_state.clear();
 
     Ok(())
 }
@@ -644,42 +655,6 @@ fn create_status_chunk(status: i32) -> Bytes {
     chunk.extend_from_slice(&(json.len() as u32).to_be_bytes());
     chunk.extend_from_slice(json.as_bytes());
     chunk.freeze()
-}
-
-#[cfg(target_os = "windows")]
-async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
-    use tokio::process::Command;
-    let mut command = Command::new("wsl.exe");
-    command
-        .arg("-e")
-        .arg("wslpath")
-        .arg("-w")
-        .arg(wsl_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run wslpath: {}", e))?;
-
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(path)
-    } else {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("wslpath failed: {}", error))
-    }
-}
-
-#[allow(unused_variables)]
-async fn normalize_path(path: &str, is_wsl: bool) -> Result<String, String> {
-    #[cfg(target_os = "windows")]
-    if is_wsl {
-        return wslpath_to_windows(path).await;
-    }
-
-    Ok(path.to_string())
 }
 
 async fn read_file_handler(
