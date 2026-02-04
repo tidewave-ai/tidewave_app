@@ -178,8 +178,8 @@ impl Socket {
 
             Ok(())
         } else {
-            let reply =
-                PhxMessage::reply(&msg, "error", serde_json::json!({"reason": "not joined"}));
+            // Phoenix returns ok for stale phx_leave (client raced server close)
+            let reply = PhxMessage::reply(&msg, "ok", serde_json::json!({}));
             self.send(reply)
         }
     }
@@ -476,12 +476,12 @@ mod tests {
         registry.register("room:*", EchoChannel);
         let (mut socket, mut receiver) = create_test_socket(registry);
 
+        // Phoenix returns ok for stale phx_leave (client raced server close)
         let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
         socket.handle_message(leave_msg).await.unwrap();
 
         let reply = receiver.recv().await.unwrap();
-        assert_eq!(reply.payload["status"], "error");
-        assert_eq!(reply.payload["response"]["reason"], "not joined");
+        assert_eq!(reply.payload["status"], "ok");
     }
 
     #[tokio::test]
