@@ -48,7 +48,6 @@ pub struct McpParams {
     pub session_id: Option<String>,
 }
 
-
 // ============================================================================
 // State Types
 // ============================================================================
@@ -146,12 +145,7 @@ impl Channel for McpChannel {
         }))
     }
 
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: Value,
-        socket: &mut SocketRef,
-    ) -> HandleResult {
+    async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
         match event {
             "mcp_message" => {
                 // The payload is the raw JSON-RPC message
@@ -187,10 +181,7 @@ impl Channel for McpChannel {
                         session_id, json_rpc_message
                     );
                 } else {
-                    info!(
-                        "Ignoring notification from browser: {:?}",
-                        json_rpc_message
-                    );
+                    info!("Ignoring notification from browser: {:?}", json_rpc_message);
                 }
 
                 HandleResult::no_reply()

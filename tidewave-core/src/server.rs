@@ -2,8 +2,8 @@ use crate::acp_channel::{AcpChannel, AcpChannelState};
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{load_tls_config_from_paths, normalize_path};
 use crate::mcp_channel::{mcp_channel_client_handler, McpChannel, McpChannelState};
+use crate::utils::{load_tls_config_from_paths, normalize_path};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -306,13 +306,9 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create Phoenix channels routes for file watching
+    // Create Phoenix channels routes
     let mut channel_registry = phoenix_rs::ChannelRegistry::new();
     channel_registry.register("watch:*", crate::watch_channel::WatchChannel);
-    let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
-
-    // Create Phoenix channel routes
-    let mut channel_registry = phoenix_rs::ChannelRegistry::new();
     channel_registry.register("acp:*", AcpChannel::with_state(acp_channel_state.clone()));
     channel_registry.register("mcp:*", McpChannel::with_state(mcp_channel_state.clone()));
     let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
