@@ -190,10 +190,7 @@ impl Channel for WatchChannel {
                 }
                 WatchInfo::WatchedPathRemoved => {
                     // Push error and stop - the subscription will be terminated
-                    socket.push(
-                        "error",
-                        json!({ "reason": "watched path was removed" }),
-                    );
+                    socket.push("error", json!({ "reason": "watched path was removed" }));
                 }
                 WatchInfo::WatchError { message } => {
                     socket.push("error", json!({ "reason": message }));
@@ -395,9 +392,7 @@ fn convert_notify_event(
                                 });
                             } else {
                                 // No pending from, or from was outside watched dir - treat as create
-                                results.push(WatchInfo::Created {
-                                    path: to_relative,
-                                });
+                                results.push(WatchInfo::Created { path: to_relative });
                             }
                         } else {
                             // to_path is outside watched dir, clear any pending rename
@@ -668,7 +663,10 @@ mod tests {
         assert!(msg.is_some(), "Expected created event for nested file");
         let msg = msg.unwrap();
         assert_eq!(msg.event, "created");
-        assert_eq!(msg.payload["path"].as_str().unwrap(), "subdir/nested_file.txt");
+        assert_eq!(
+            msg.payload["path"].as_str().unwrap(),
+            "subdir/nested_file.txt"
+        );
     }
 
     #[tokio::test]
