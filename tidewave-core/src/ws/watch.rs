@@ -4,13 +4,13 @@
 //!
 //! Client → Server:
 //! ```json
-//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
+//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1", "is_wsl": false}
 //! {"topic": "watch", "action": "unsubscribe", "ref": "watch1"}
 //! ```
 //!
 //! Server → Client:
 //! ```json
-//! {"topic": "watch", "event": "subscribed", "ref": "watch1"}
+//! {"topic": "watch", "event": "subscribed", "path": "/canonical/path", "ref": "watch1"}
 //! {"topic": "watch", "event": "unsubscribed", "ref": "watch1"}
 //! {"topic": "watch", "event": "unsubscribed", "ref": "watch1", "error": "..."}
 //! {"topic": "watch", "event": "created", "path": "/foo/bar/file.txt", "ref": "watch1"}
@@ -91,6 +91,7 @@ pub enum WatchEvent {
         reference: String,
     },
     Subscribed {
+        path: String,
         #[serde(rename = "ref")]
         reference: String,
     },
@@ -127,7 +128,10 @@ impl WatchEvent {
                 message: message.clone(),
                 reference: new_ref,
             },
-            WatchEvent::Subscribed { .. } => WatchEvent::Subscribed { reference: new_ref },
+            WatchEvent::Subscribed { path, .. } => WatchEvent::Subscribed {
+                path: path.clone(),
+                reference: new_ref,
+            },
             WatchEvent::Unsubscribed { error, .. } => WatchEvent::Unsubscribed {
                 reference: new_ref,
                 error: error.clone(),
@@ -312,65 +316,94 @@ async fn handle_subscribe(
         let canonical_path_for_task = canonical_path.clone();
         let state_for_task = state.clone();
 
+        // On Windows with WSL, use poll watcher directly since native watcher
+        // doesn't work well with WSL paths
+        #[cfg(target_os = "windows")]
+        let use_poll_watcher = is_wsl;
+        #[cfg(not(target_os = "windows"))]
+        let use_poll_watcher = false;
+
         tokio::spawn(async move {
             // Create a channel to receive notify events
             let (notify_tx, mut notify_rx) =
                 tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(256);
 
-            // Try to create the native watcher first, fall back to poll watcher if it fails
-            let notify_tx_clone = notify_tx.clone();
-            let watcher_result = RecommendedWatcher::new(
-                move |res| {
-                    let _ = notify_tx_clone.blocking_send(res);
-                },
-                notify::Config::default(),
-            );
-
-            // Box the watcher to allow different types
-            let mut watcher: Box<dyn Watcher + Send> = match watcher_result {
-                Ok(w) => Box::new(w),
-                Err(e) => {
-                    // Native watcher failed, try poll watcher as fallback
-                    warn!(
-                        "Native file watcher failed for {}: {}. Falling back to poll watcher.",
-                        canonical_path_for_task, e
-                    );
-
-                    let notify_tx_poll = notify_tx.clone();
+            // Helper to create poll watcher
+            let create_poll_watcher =
+                |notify_tx: tokio::sync::mpsc::Sender<notify::Result<notify::Event>>| {
                     let poll_config =
                         notify::Config::default().with_poll_interval(Duration::from_secs(2));
-
-                    match PollWatcher::new(
+                    PollWatcher::new(
                         move |res| {
-                            let _ = notify_tx_poll.blocking_send(res);
+                            let _ = notify_tx.blocking_send(res);
                         },
                         poll_config,
-                    ) {
-                        Ok(w) => {
-                            // Send warning to client about poll watcher fallback
-                            let _ = tx.send(WatchEvent::Warning {
-                                message: format!(
-                                    "Using poll-based file watching (native watcher unavailable: {}). \
-                                     File change detection may be slower.",
-                                    e
-                                ),
-                                reference: canonical_path_for_task.clone(),
-                            });
-                            Box::new(w)
-                        }
-                        Err(poll_err) => {
-                            let _ = tx.send(WatchEvent::Unsubscribed {
-                                reference: canonical_path_for_task.clone(),
-                                error: Some(format!(
-                                    "Failed to create watcher: {} (poll fallback also failed: {})",
-                                    e, poll_err
-                                )),
-                            });
-                            state_for_task
-                                .watch
-                                .watchers
-                                .remove(&canonical_path_for_task);
-                            return;
+                    )
+                };
+
+            // Box the watcher to allow different types
+            let mut watcher: Box<dyn Watcher + Send> = if use_poll_watcher {
+                // Use poll watcher directly (e.g., for WSL on Windows)
+                match create_poll_watcher(notify_tx.clone()) {
+                    Ok(w) => Box::new(w),
+                    Err(e) => {
+                        let _ = tx.send(WatchEvent::Unsubscribed {
+                            reference: canonical_path_for_task.clone(),
+                            error: Some(format!("Failed to create poll watcher: {}", e)),
+                        });
+                        state_for_task
+                            .watch
+                            .watchers
+                            .remove(&canonical_path_for_task);
+                        return;
+                    }
+                }
+            } else {
+                // Try native watcher first, fall back to poll watcher if it fails
+                let notify_tx_clone = notify_tx.clone();
+                let watcher_result = RecommendedWatcher::new(
+                    move |res| {
+                        let _ = notify_tx_clone.blocking_send(res);
+                    },
+                    notify::Config::default(),
+                );
+
+                match watcher_result {
+                    Ok(w) => Box::new(w),
+                    Err(e) => {
+                        // Native watcher failed, try poll watcher as fallback
+                        warn!(
+                            "Native file watcher failed for {}: {}. Falling back to poll watcher.",
+                            canonical_path_for_task, e
+                        );
+
+                        match create_poll_watcher(notify_tx.clone()) {
+                            Ok(w) => {
+                                // Send warning to client about poll watcher fallback
+                                let _ = tx.send(WatchEvent::Warning {
+                                    message: format!(
+                                        "Using poll-based file watching (native watcher unavailable: {}). \
+                                         File change detection may be slower.",
+                                        e
+                                    ),
+                                    reference: canonical_path_for_task.clone(),
+                                });
+                                Box::new(w)
+                            }
+                            Err(poll_err) => {
+                                let _ = tx.send(WatchEvent::Unsubscribed {
+                                    reference: canonical_path_for_task.clone(),
+                                    error: Some(format!(
+                                        "Failed to create watcher: {} (poll fallback also failed: {})",
+                                        e, poll_err
+                                    )),
+                                });
+                                state_for_task
+                                    .watch
+                                    .watchers
+                                    .remove(&canonical_path_for_task);
+                                return;
+                            }
                         }
                     }
                 }
@@ -446,6 +479,7 @@ async fn handle_subscribe(
     // Send subscribed confirmation
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
         let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Subscribed {
+            path: canonical_path,
             reference: reference.to_string(),
         }));
     }
