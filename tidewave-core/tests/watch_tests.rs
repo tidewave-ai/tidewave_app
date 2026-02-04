@@ -211,15 +211,12 @@ async fn test_watch_file_created() {
     let file_path = temp_dir.path().join("test_file.txt");
     tokio::fs::write(&file_path, "hello").await.unwrap();
 
-    // Should receive created event
+    // Should receive created event with relative path
     let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["path"]
-        .as_str()
-        .unwrap()
-        .contains("test_file.txt"));
+    assert_eq!(event["path"].as_str().unwrap(), "test_file.txt");
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("mywatch"));
 }
 
@@ -264,15 +261,12 @@ async fn test_watch_file_modified() {
     // Modify the file
     tokio::fs::write(&file_path, "modified content").await.unwrap();
 
-    // Should receive modified event
+    // Should receive modified event with relative path
     let event = wait_for_event(&mut ws_out_rx, "modified", 2000).await;
     assert!(event.is_some(), "Expected modified event");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["path"]
-        .as_str()
-        .unwrap()
-        .contains("existing_file.txt"));
+    assert_eq!(event["path"].as_str().unwrap(), "existing_file.txt");
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("modwatch"));
 }
 
@@ -317,15 +311,12 @@ async fn test_watch_file_deleted() {
     // Delete the file
     tokio::fs::remove_file(&file_path).await.unwrap();
 
-    // Should receive deleted event
+    // Should receive deleted event with relative path
     let event = wait_for_event(&mut ws_out_rx, "deleted", 2000).await;
     assert!(event.is_some(), "Expected deleted event");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["path"]
-        .as_str()
-        .unwrap()
-        .contains("file_to_delete.txt"));
+    assert_eq!(event["path"].as_str().unwrap(), "file_to_delete.txt");
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("delwatch"));
 }
 
@@ -533,14 +524,12 @@ async fn test_watch_subdirectory_events() {
     let file_path = sub_dir.join("nested_file.txt");
     tokio::fs::write(&file_path, "nested content").await.unwrap();
 
-    // Should receive created event for nested file (recursive watching)
+    // Should receive created event for nested file with relative path (recursive watching)
     let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event for nested file");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["path"]
-        .as_str()
-        .unwrap()
-        .contains("nested_file.txt"));
+    // Relative path includes subdirectory
+    assert_eq!(event["path"].as_str().unwrap(), "subdir/nested_file.txt");
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("recursive_watch"));
 }

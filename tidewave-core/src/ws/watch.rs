@@ -4,21 +4,23 @@
 //!
 //! Client → Server:
 //! ```json
-//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
+//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1", "is_wsl": false}
 //! {"topic": "watch", "action": "unsubscribe", "ref": "watch1"}
 //! ```
 //!
 //! Server → Client:
 //! ```json
-//! {"topic": "watch", "event": "subscribed", "ref": "watch1"}
+//! {"topic": "watch", "event": "subscribed", "path": "/canonical/path", "ref": "watch1"}
 //! {"topic": "watch", "event": "unsubscribed", "ref": "watch1"}
 //! {"topic": "watch", "event": "unsubscribed", "ref": "watch1", "error": "..."}
-//! {"topic": "watch", "event": "created", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"topic": "watch", "event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"topic": "watch", "event": "deleted", "path": "/foo/bar/file.txt", "ref": "watch1"}
-//! {"topic": "watch", "event": "renamed", "from": "/foo/bar/old.txt", "to": "/foo/bar/new.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "created", "path": "file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "modified", "path": "file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "deleted", "path": "file.txt", "ref": "watch1"}
+//! {"topic": "watch", "event": "renamed", "from": "old.txt", "to": "new.txt", "ref": "watch1"}
 //! {"topic": "watch", "event": "warning", "message": "...", "ref": "watch1"}
 //! ```
+//!
+//! Note: Event paths (created, modified, deleted, renamed) are relative to the watched directory.
 
 use dashmap::DashMap;
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
@@ -91,6 +93,7 @@ pub enum WatchEvent {
         reference: String,
     },
     Subscribed {
+        path: String,
         #[serde(rename = "ref")]
         reference: String,
     },
@@ -127,7 +130,10 @@ impl WatchEvent {
                 message: message.clone(),
                 reference: new_ref,
             },
-            WatchEvent::Subscribed { .. } => WatchEvent::Subscribed { reference: new_ref },
+            WatchEvent::Subscribed { path, .. } => WatchEvent::Subscribed {
+                path: path.clone(),
+                reference: new_ref,
+            },
             WatchEvent::Unsubscribed { error, .. } => WatchEvent::Unsubscribed {
                 reference: new_ref,
                 error: error.clone(),
@@ -312,65 +318,94 @@ async fn handle_subscribe(
         let canonical_path_for_task = canonical_path.clone();
         let state_for_task = state.clone();
 
+        // On Windows with WSL, use poll watcher directly since native watcher
+        // doesn't work well with WSL paths
+        #[cfg(target_os = "windows")]
+        let use_poll_watcher = is_wsl;
+        #[cfg(not(target_os = "windows"))]
+        let use_poll_watcher = false;
+
         tokio::spawn(async move {
             // Create a channel to receive notify events
             let (notify_tx, mut notify_rx) =
                 tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(256);
 
-            // Try to create the native watcher first, fall back to poll watcher if it fails
-            let notify_tx_clone = notify_tx.clone();
-            let watcher_result = RecommendedWatcher::new(
-                move |res| {
-                    let _ = notify_tx_clone.blocking_send(res);
-                },
-                notify::Config::default(),
-            );
-
-            // Box the watcher to allow different types
-            let mut watcher: Box<dyn Watcher + Send> = match watcher_result {
-                Ok(w) => Box::new(w),
-                Err(e) => {
-                    // Native watcher failed, try poll watcher as fallback
-                    warn!(
-                        "Native file watcher failed for {}: {}. Falling back to poll watcher.",
-                        canonical_path_for_task, e
-                    );
-
-                    let notify_tx_poll = notify_tx.clone();
+            // Helper to create poll watcher
+            let create_poll_watcher =
+                |notify_tx: tokio::sync::mpsc::Sender<notify::Result<notify::Event>>| {
                     let poll_config =
                         notify::Config::default().with_poll_interval(Duration::from_secs(2));
-
-                    match PollWatcher::new(
+                    PollWatcher::new(
                         move |res| {
-                            let _ = notify_tx_poll.blocking_send(res);
+                            let _ = notify_tx.blocking_send(res);
                         },
                         poll_config,
-                    ) {
-                        Ok(w) => {
-                            // Send warning to client about poll watcher fallback
-                            let _ = tx.send(WatchEvent::Warning {
-                                message: format!(
-                                    "Using poll-based file watching (native watcher unavailable: {}). \
-                                     File change detection may be slower.",
-                                    e
-                                ),
-                                reference: canonical_path_for_task.clone(),
-                            });
-                            Box::new(w)
-                        }
-                        Err(poll_err) => {
-                            let _ = tx.send(WatchEvent::Unsubscribed {
-                                reference: canonical_path_for_task.clone(),
-                                error: Some(format!(
-                                    "Failed to create watcher: {} (poll fallback also failed: {})",
-                                    e, poll_err
-                                )),
-                            });
-                            state_for_task
-                                .watch
-                                .watchers
-                                .remove(&canonical_path_for_task);
-                            return;
+                    )
+                };
+
+            // Box the watcher to allow different types
+            let mut watcher: Box<dyn Watcher + Send> = if use_poll_watcher {
+                // Use poll watcher directly (e.g., for WSL on Windows)
+                match create_poll_watcher(notify_tx.clone()) {
+                    Ok(w) => Box::new(w),
+                    Err(e) => {
+                        let _ = tx.send(WatchEvent::Unsubscribed {
+                            reference: canonical_path_for_task.clone(),
+                            error: Some(format!("Failed to create poll watcher: {}", e)),
+                        });
+                        state_for_task
+                            .watch
+                            .watchers
+                            .remove(&canonical_path_for_task);
+                        return;
+                    }
+                }
+            } else {
+                // Try native watcher first, fall back to poll watcher if it fails
+                let notify_tx_clone = notify_tx.clone();
+                let watcher_result = RecommendedWatcher::new(
+                    move |res| {
+                        let _ = notify_tx_clone.blocking_send(res);
+                    },
+                    notify::Config::default(),
+                );
+
+                match watcher_result {
+                    Ok(w) => Box::new(w),
+                    Err(e) => {
+                        // Native watcher failed, try poll watcher as fallback
+                        warn!(
+                            "Native file watcher failed for {}: {}. Falling back to poll watcher.",
+                            canonical_path_for_task, e
+                        );
+
+                        match create_poll_watcher(notify_tx.clone()) {
+                            Ok(w) => {
+                                // Send warning to client about poll watcher fallback
+                                let _ = tx.send(WatchEvent::Warning {
+                                    message: format!(
+                                        "Using poll-based file watching (native watcher unavailable: {}). \
+                                         File change detection may be slower.",
+                                        e
+                                    ),
+                                    reference: canonical_path_for_task.clone(),
+                                });
+                                Box::new(w)
+                            }
+                            Err(poll_err) => {
+                                let _ = tx.send(WatchEvent::Unsubscribed {
+                                    reference: canonical_path_for_task.clone(),
+                                    error: Some(format!(
+                                        "Failed to create watcher: {} (poll fallback also failed: {})",
+                                        e, poll_err
+                                    )),
+                                });
+                                state_for_task
+                                    .watch
+                                    .watchers
+                                    .remove(&canonical_path_for_task);
+                                return;
+                            }
                         }
                     }
                 }
@@ -446,6 +481,7 @@ async fn handle_subscribe(
     // Send subscribed confirmation
     if let Some(tx) = state.websocket_senders.get(&websocket_id) {
         let _ = tx.send(WsOutboundMessage::Watch(WatchEvent::Subscribed {
+            path: canonical_path,
             reference: reference.to_string(),
         }));
     }
@@ -480,6 +516,16 @@ fn send_unsubscribed_with_error(
     }
 }
 
+/// Convert an absolute path to a relative path (relative to watched_path).
+/// Returns None if the path is not under watched_path.
+fn to_relative_path(absolute_path: &Path, watched_path: &str) -> Option<String> {
+    let watched = Path::new(watched_path);
+    absolute_path
+        .strip_prefix(watched)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 fn convert_notify_event(
     event: notify::Event,
     watched_path: &str,
@@ -490,59 +536,95 @@ fn convert_notify_event(
     match event.kind {
         EventKind::Create(_) => {
             for path in event.paths {
-                results.push(WatchEvent::Created {
-                    path: path.to_string_lossy().to_string(),
-                    reference: watched_path.to_string(),
-                });
+                if let Some(relative_path) = to_relative_path(&path, watched_path) {
+                    results.push(WatchEvent::Created {
+                        path: relative_path,
+                        reference: watched_path.to_string(),
+                    });
+                }
             }
         }
         EventKind::Modify(modify_kind) => match modify_kind {
             notify::event::ModifyKind::Name(rename_mode) => match rename_mode {
                 notify::event::RenameMode::From => {
                     if let Some(path) = event.paths.first() {
-                        *pending_rename_from = Some(path.to_string_lossy().to_string());
+                        // Store the relative path for rename, or None if not relative
+                        *pending_rename_from = to_relative_path(path, watched_path);
                     }
                 }
                 notify::event::RenameMode::To => {
                     if let Some(to_path) = event.paths.first() {
-                        if let Some(from_path) = pending_rename_from.take() {
-                            results.push(WatchEvent::Renamed {
-                                from: from_path,
-                                to: to_path.to_string_lossy().to_string(),
-                                reference: watched_path.to_string(),
-                            });
+                        if let Some(to_relative) = to_relative_path(to_path, watched_path) {
+                            if let Some(from_relative) = pending_rename_from.take() {
+                                results.push(WatchEvent::Renamed {
+                                    from: from_relative,
+                                    to: to_relative,
+                                    reference: watched_path.to_string(),
+                                });
+                            } else {
+                                // No pending from, or from was outside watched dir - treat as create
+                                results.push(WatchEvent::Created {
+                                    path: to_relative,
+                                    reference: watched_path.to_string(),
+                                });
+                            }
                         } else {
-                            results.push(WatchEvent::Created {
-                                path: to_path.to_string_lossy().to_string(),
-                                reference: watched_path.to_string(),
-                            });
+                            // to_path is outside watched dir, clear any pending rename
+                            pending_rename_from.take();
                         }
                     }
                 }
                 notify::event::RenameMode::Both => {
                     if event.paths.len() >= 2 {
-                        results.push(WatchEvent::Renamed {
-                            from: event.paths[0].to_string_lossy().to_string(),
-                            to: event.paths[1].to_string_lossy().to_string(),
-                            reference: watched_path.to_string(),
-                        });
+                        let from_relative = to_relative_path(&event.paths[0], watched_path);
+                        let to_relative = to_relative_path(&event.paths[1], watched_path);
+                        match (from_relative, to_relative) {
+                            (Some(from), Some(to)) => {
+                                results.push(WatchEvent::Renamed {
+                                    from,
+                                    to,
+                                    reference: watched_path.to_string(),
+                                });
+                            }
+                            (Some(from), None) => {
+                                // Renamed out of watched directory - treat as delete
+                                results.push(WatchEvent::Deleted {
+                                    path: from,
+                                    reference: watched_path.to_string(),
+                                });
+                            }
+                            (None, Some(to)) => {
+                                // Renamed into watched directory - treat as create
+                                results.push(WatchEvent::Created {
+                                    path: to,
+                                    reference: watched_path.to_string(),
+                                });
+                            }
+                            (None, None) => {
+                                // Both outside watched dir - ignore
+                            }
+                        }
                     }
                 }
                 _ => {
                     for path in event.paths {
-                        results.push(WatchEvent::Modified {
-                            path: path.to_string_lossy().to_string(),
-                            reference: watched_path.to_string(),
-                        });
+                        if let Some(relative_path) = to_relative_path(&path, watched_path) {
+                            results.push(WatchEvent::Modified {
+                                path: relative_path,
+                                reference: watched_path.to_string(),
+                            });
+                        }
                     }
                 }
             },
             _ => {
                 for path in event.paths {
-                    results.push(WatchEvent::Modified {
-                        path: path.to_string_lossy().to_string(),
-                        reference: watched_path.to_string(),
-                    });
+                    if let Some(relative_path) = to_relative_path(&path, watched_path) {
+                        results.push(WatchEvent::Modified {
+                            path: relative_path,
+                            reference: watched_path.to_string(),
+                        });
+                    }
                 }
             }
         },
@@ -556,9 +638,9 @@ fn convert_notify_event(
                         reference: watched_path.to_string(),
                         error: Some("watched path was removed".to_string()),
                     });
-                } else {
+                } else if let Some(relative_path) = to_relative_path(path, watched_path) {
                     results.push(WatchEvent::Deleted {
-                        path: path_str,
+                        path: relative_path,
                         reference: watched_path.to_string(),
                     });
                 }
