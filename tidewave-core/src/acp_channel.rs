@@ -13,8 +13,8 @@ add our own custom messages using the protocol extensibility features
 to support a "_tidewave.ai/session/load" request for loading chats that
 are still active on the agent side.
 
-To start an agent, we hijack init requests and dynamically start a new
-ACP process in case there's no existing one running.
+We start an agent when joining the channel - checking if there's not
+already an existing process for the given command/cwd combination.
 
 An overview of our protocol extensions:
 
@@ -95,34 +95,6 @@ An overview of our protocol extensions:
       "params": {
         "latestId": "notif_12"
       }
-    }
-
-5. Exit notifications
-
-    To tell a client when an ACP process dies, we send a custom `_tidewave.ai/exit` notification:
-
-    {
-      "jsonrpc": "2.0",
-      "method": "_tidewave.ai/exit",
-      "params": {
-        "error": "process_exit",
-        "message": "ACP process exited with code 137"
-      }
-    }
-
-6. Exit request
-
-    To allow a client to stop an ACP process (for example in order to restart
-    after logging in in Claude Code), we add a `_tidewave.ai/exit` request.
-
-    This will stop the ACP process for that WebSocket and send exit notifications to all
-    connected clients. When they reconnect, a new process will be started.
-
-    {
-      "jsonrpc": "2.0",
-      "id": ...,
-      "method": "_tidewave.ai/exit",
-      "params": {}
     }
 
 The proxy keeps a mapping of sessionId to the active socket connection.
