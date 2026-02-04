@@ -5,7 +5,7 @@ mod http_handlers;
 pub mod mcp_channel;
 pub mod server;
 pub mod utils;
-pub mod ws;
+pub mod watch_channel;
 
 pub use config::{get_config_path, load_config, Config};
 pub use server::{
