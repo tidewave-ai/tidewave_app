@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use phoenix_rs::{
+    ChannelRegistry, PhxMessage,
     channel::{Channel, HandleResult, JoinResult, SocketRef},
-    events, phoenix_router, ChannelRegistry, PhxMessage,
+    events, phoenix_router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -113,8 +114,7 @@ async fn test_connect_and_heartbeat() {
     let (mut write, mut read) = ws_stream.split();
 
     // Send heartbeat
-    let heartbeat =
-        PhxMessage::new("phoenix", events::HEARTBEAT, json!({})).with_ref("1");
+    let heartbeat = PhxMessage::new("phoenix", events::HEARTBEAT, json!({})).with_ref("1");
     let encoded = phoenix_rs::serializer::encode(&heartbeat).unwrap();
     write.send(Message::Text(encoded.into())).await.unwrap();
 
@@ -145,8 +145,8 @@ async fn test_join_channel() {
     let mut ws = ws_stream.split();
 
     // Join channel
-    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({"user_id": "alice"}))
-        .with_ref("1");
+    let join_msg =
+        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({"user_id": "alice"})).with_ref("1");
 
     let reply = send_and_receive(&mut ws, join_msg).await.unwrap();
 
@@ -167,8 +167,7 @@ async fn test_join_rejected() {
     let mut ws = ws_stream.split();
 
     // Try to join private channel (should be rejected)
-    let join_msg =
-        PhxMessage::new("private:secret", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("private:secret", events::PHX_JOIN, json!({})).with_ref("1");
 
     let reply = send_and_receive(&mut ws, join_msg).await.unwrap();
 
@@ -185,8 +184,7 @@ async fn test_join_unknown_topic() {
     let mut ws = ws_stream.split();
 
     // Try to join unknown topic
-    let join_msg =
-        PhxMessage::new("unknown:topic", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("unknown:topic", events::PHX_JOIN, json!({})).with_ref("1");
 
     let reply = send_and_receive(&mut ws, join_msg).await.unwrap();
 
@@ -203,8 +201,7 @@ async fn test_push_and_reply() {
     let mut ws = ws_stream.split();
 
     // Join first
-    let join_msg =
-        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
     let _ = send_and_receive(&mut ws, join_msg).await.unwrap();
 
     // Send ping
@@ -226,14 +223,16 @@ async fn test_echo() {
     let mut ws = ws_stream.split();
 
     // Join first
-    let join_msg =
-        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
     let _ = send_and_receive(&mut ws, join_msg).await.unwrap();
 
     // Send echo
-    let echo_msg =
-        PhxMessage::new("room:lobby", "echo", json!({"message": "hello", "number": 42}))
-            .with_ref("2");
+    let echo_msg = PhxMessage::new(
+        "room:lobby",
+        "echo",
+        json!({"message": "hello", "number": 42}),
+    )
+    .with_ref("2");
     let reply = send_and_receive(&mut ws, echo_msg).await.unwrap();
 
     assert_eq!(reply.payload["status"], "ok");
@@ -250,8 +249,7 @@ async fn test_error_reply() {
     let mut ws = ws_stream.split();
 
     // Join first
-    let join_msg =
-        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
     let _ = send_and_receive(&mut ws, join_msg).await.unwrap();
 
     // Send error event
@@ -271,13 +269,11 @@ async fn test_leave_channel() {
     let mut ws = ws_stream.split();
 
     // Join first
-    let join_msg =
-        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
     let _ = send_and_receive(&mut ws, join_msg).await.unwrap();
 
     // Leave channel
-    let leave_msg =
-        PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("2");
+    let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("2");
     let reply = send_and_receive(&mut ws, leave_msg).await.unwrap();
 
     assert_eq!(reply.payload["status"], "ok");
@@ -292,8 +288,7 @@ async fn test_leave_without_join() {
     let mut ws = ws_stream.split();
 
     // Leave without joining
-    let leave_msg =
-        PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
+    let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
     let reply = send_and_receive(&mut ws, leave_msg).await.unwrap();
 
     assert_eq!(reply.payload["status"], "error");
@@ -309,15 +304,13 @@ async fn test_server_push() {
     let (mut write, mut read) = ws_stream.split();
 
     // Join first
-    let join_msg =
-        PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
+    let join_msg = PhxMessage::new("room:lobby", events::PHX_JOIN, json!({})).with_ref("1");
     let encoded = phoenix_rs::serializer::encode(&join_msg).unwrap();
     write.send(Message::Text(encoded.into())).await.unwrap();
     let _ = read.next().await; // consume join reply
 
     // Request server push
-    let push_msg =
-        PhxMessage::new("room:lobby", "push_to_me", json!({})).with_ref("2");
+    let push_msg = PhxMessage::new("room:lobby", "push_to_me", json!({})).with_ref("2");
     let encoded = phoenix_rs::serializer::encode(&push_msg).unwrap();
     write.send(Message::Text(encoded.into())).await.unwrap();
 
@@ -451,9 +444,12 @@ async fn test_broadcast_to_multiple_clients() {
     let _ = read2.next().await; // consume join reply
 
     // Client 1 broadcasts a message
-    let broadcast_msg =
-        PhxMessage::new("room:broadcast", "broadcast", json!({"message": "hello everyone"}))
-            .with_ref("2");
+    let broadcast_msg = PhxMessage::new(
+        "room:broadcast",
+        "broadcast",
+        json!({"message": "hello everyone"}),
+    )
+    .with_ref("2");
     let encoded = phoenix_rs::serializer::encode(&broadcast_msg).unwrap();
     write1.send(Message::Text(encoded.into())).await.unwrap();
 

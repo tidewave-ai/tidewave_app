@@ -50,18 +50,14 @@ fn decode_array_format(arr: Vec<Value>) -> Result<PhxMessage, PhoenixError> {
         _ => {
             return Err(PhoenixError::InvalidMessage(
                 "Invalid join_ref type".to_string(),
-            ))
+            ));
         }
     };
 
     let ref_ = match &arr[1] {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
-        _ => {
-            return Err(PhoenixError::InvalidMessage(
-                "Invalid ref type".to_string(),
-            ))
-        }
+        _ => return Err(PhoenixError::InvalidMessage("Invalid ref type".to_string())),
     };
 
     let topic = match &arr[2] {
@@ -69,7 +65,7 @@ fn decode_array_format(arr: Vec<Value>) -> Result<PhxMessage, PhoenixError> {
         _ => {
             return Err(PhoenixError::InvalidMessage(
                 "Invalid topic type".to_string(),
-            ))
+            ));
         }
     };
 
@@ -78,7 +74,7 @@ fn decode_array_format(arr: Vec<Value>) -> Result<PhxMessage, PhoenixError> {
         _ => {
             return Err(PhoenixError::InvalidMessage(
                 "Invalid event type".to_string(),
-            ))
+            ));
         }
     };
 
@@ -182,7 +178,8 @@ mod tests {
 
     #[test]
     fn test_decode_v2_array_format() {
-        let data = r#"["1", "2", "room:lobby", "new_message", {"body": "Hello World", "user": "john"}]"#;
+        let data =
+            r#"["1", "2", "room:lobby", "new_message", {"body": "Hello World", "user": "john"}]"#;
 
         let msg = decode(data).unwrap();
 
@@ -221,8 +218,7 @@ mod tests {
 
     #[test]
     fn test_decode_v1_map_format_with_nulls() {
-        let data =
-            r#"{"join_ref": null, "ref": null, "topic": "room:test", "event": "test", "payload": {}}"#;
+        let data = r#"{"join_ref": null, "ref": null, "topic": "room:test", "event": "test", "payload": {}}"#;
 
         let msg = decode(data).unwrap();
 

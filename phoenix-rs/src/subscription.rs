@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::channel::{Assigns, BoxedInfo, Channel, HandleResult, JoinResult, SocketRef};
-use crate::message::{events, PhxMessage};
+use crate::message::{PhxMessage, events};
 
 /// Message sent to a subscription from the socket router
 pub(crate) enum SubscriptionMsg {

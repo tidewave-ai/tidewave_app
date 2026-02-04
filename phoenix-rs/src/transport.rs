@@ -95,10 +95,7 @@ pub fn phoenix_state(registry: ChannelRegistry) -> PhoenixState {
 }
 
 /// WebSocket upgrade handler
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<PhoenixState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<PhoenixState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -195,18 +192,16 @@ async fn handle_socket(ws: WebSocket, state: PhoenixState) {
     // Main loop for receiving messages from client
     while let Some(result) = ws_receiver.next().await {
         match result {
-            Ok(Message::Text(text)) => {
-                match serializer::decode(&text) {
-                    Ok(msg) => {
-                        if let Err(e) = socket.handle_message(msg).await {
-                            warn!(socket_id = %socket_id, error = %e, "Error handling message");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(socket_id = %socket_id, error = %e, "Failed to decode message");
+            Ok(Message::Text(text)) => match serializer::decode(&text) {
+                Ok(msg) => {
+                    if let Err(e) = socket.handle_message(msg).await {
+                        warn!(socket_id = %socket_id, error = %e, "Error handling message");
                     }
                 }
-            }
+                Err(e) => {
+                    warn!(socket_id = %socket_id, error = %e, "Failed to decode message");
+                }
+            },
             Ok(Message::Binary(_)) => {
                 // Binary messages not supported yet
                 warn!(socket_id = %socket_id, "Received binary message, not supported");
@@ -244,7 +239,7 @@ mod tests {
     use super::*;
     use crate::channel::{Channel, HandleResult, JoinResult, SocketRef};
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     struct TestChannel;
 
