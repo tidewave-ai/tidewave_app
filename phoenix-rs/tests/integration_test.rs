@@ -287,12 +287,11 @@ async fn test_leave_without_join() {
     let (ws_stream, _) = connect_async(&url).await.unwrap();
     let mut ws = ws_stream.split();
 
-    // Leave without joining
+    // Leave without joining - Phoenix returns ok for stale phx_leave
     let leave_msg = PhxMessage::new("room:lobby", events::PHX_LEAVE, json!({})).with_ref("1");
     let reply = send_and_receive(&mut ws, leave_msg).await.unwrap();
 
-    assert_eq!(reply.payload["status"], "error");
-    assert_eq!(reply.payload["response"]["reason"], "not joined");
+    assert_eq!(reply.payload["status"], "ok");
 }
 
 #[tokio::test]
