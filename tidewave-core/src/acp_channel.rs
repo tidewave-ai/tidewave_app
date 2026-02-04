@@ -591,7 +591,7 @@ impl Channel for AcpChannel {
         };
 
         // Generate process key and start/reuse process
-        let process_key = generate_process_key(&spawn_opts.command, &spawn_opts.cwd, &Value::Null);
+        let process_key = format!("{}:{}", &spawn_opts.command, &spawn_opts.cwd);
         socket.assign("process_key", process_key.clone());
 
         // Acquire or create a lock for this process_key
@@ -1018,6 +1018,9 @@ impl AcpChannel {
                 }
             };
 
+            // Map this websocket to the session BEFORE forwarding the request
+            // This ensures that when the agent sends notifications during session/load,
+            // we can route them to the correct websocket
             self.state
                 .session_to_channel
                 .insert(session_id.clone(), channel_id);
@@ -1031,6 +1034,7 @@ impl AcpChannel {
             );
         }
 
+        // Forward the request to the agent as a regular request
         self.handle_regular_request(channel_id, request).await
     }
 
@@ -1068,6 +1072,8 @@ impl AcpChannel {
         } else {
             warn!("No exit channel available for process: {}", process_key);
         }
+
+        // The exit monitor will handle killing the process, sending notifications, and cleanup
 
         Ok(())
     }
@@ -1151,7 +1157,9 @@ impl AcpChannel {
             serde_json::from_value(notification.params.clone().unwrap_or(Value::Null))
                 .map_err(|e| anyhow!("Invalid ack params: {}", e))?;
 
+        // Find the specific session to prune
         if let Some(session_state) = self.state.sessions.get(&params.session_id) {
+            // Verify this websocket is actually connected to this session
             if let Some(mapped_channel_id) = self.state.session_to_channel.get(&params.session_id) {
                 if *mapped_channel_id == channel_id {
                     session_state.prune_buffer(&params.latest_id).await;
@@ -1190,6 +1198,7 @@ impl AcpChannel {
     ) -> Result<()> {
         let process_state = self.ensure_process_for_channel(channel_id)?;
 
+        // Forward response directly (no ID mapping needed for process -> client -> process flow)
         process_state
             .send_to_process(JsonRpcMessage::Response(response.clone()))
             .await?;
@@ -1247,6 +1256,7 @@ impl AcpChannel {
                     }
                 } else {
                     debug!("Received non-JSON line from process: {}", line);
+                    // Buffer if init hasn't completed yet
                     if process_state_clone
                         .cached_init_response
                         .read()
@@ -1266,6 +1276,7 @@ impl AcpChannel {
             let mut lines = stderr.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 debug!("Process stderr: {}", line);
+                // Buffer if init hasn't completed yet
                 if process_state_stderr
                     .cached_init_response
                     .read()
@@ -1278,7 +1289,7 @@ impl AcpChannel {
             debug!("Process stderr handler ended");
         });
 
-        // Create exit channel
+        // Create exit channel and store the sender in process_state
         let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<()>();
         *process_state.exit_tx.write().await = Some(exit_tx);
 
@@ -1289,7 +1300,9 @@ impl AcpChannel {
             let exit_reason = {
                 let mut child_guard = process_state_exit.child.write().await;
                 if let Some(process) = child_guard.as_mut() {
+                    // Use tokio::select! to wait for either process exit or exit signal
                     tokio::select! {
+                        // Process exited naturally
                         status = process.child.wait() => {
                             match status {
                                 Ok(s) => {
@@ -1307,8 +1320,10 @@ impl AcpChannel {
                                 }
                             }
                         }
+                        // Received exit signal
                         _ = exit_rx.recv() => {
                             debug!("Exit signal received for process: {}", process_state_exit.key);
+                            // Take ownership and drop to kill the process tree via ChildProcess::Drop
                             child_guard.take();
                             ("exit_requested", "ACP process was stopped by exit request".to_string())
                         }
@@ -1320,6 +1335,7 @@ impl AcpChannel {
 
             let (error_type, exit_message) = exit_reason;
 
+            // If init never completed, include buffered output in the exit notification
             let (stdout, stderr) = if process_state_exit
                 .cached_init_response
                 .read()
@@ -1352,6 +1368,7 @@ impl AcpChannel {
                 .map(|entry| *entry.key())
                 .collect();
 
+            // Send exit notification (the client will disconnect)
             for channel_id in channels_to_notify {
                 let exit_params = TidewaveExitParams {
                     error: error_type.to_string(),
@@ -1611,6 +1628,7 @@ async fn maybe_handle_session_new_response(
     client_response: &JsonRpcResponse,
     channel_id: ChannelId,
 ) {
+    // check if new or fork - both are treated the same
     if process_state
         .new_request_ids
         .remove(&response.id)
@@ -1676,6 +1694,7 @@ async fn handle_disconnected_client_response(
                 )));
             }
         } else {
+            // Client disconnected, buffer response
             if let Some(session_state) = state.sessions.get(&session_id) {
                 let session_state = session_state.clone();
                 let _ = session_state
@@ -1687,6 +1706,7 @@ async fn handle_disconnected_client_response(
             }
         }
 
+        // Clean up the session mapping
         process_state.proxy_to_session_ids.remove(&response.id);
     }
 }
@@ -1702,12 +1722,14 @@ async fn handle_process_notification_or_request(
         if let Some(session_state) = state.sessions.get(&session_id) {
             let session_state = session_state.clone();
 
+            // Add notification ID if this is a notification
             let mut routed_message = message.clone();
             let buffer_id = if let JsonRpcMessage::Notification(ref mut n) = routed_message {
                 let notif_id = session_state.generate_notification_id();
                 inject_notification_id(n, notif_id.clone());
                 notif_id
             } else {
+                // For requests/responses, use their existing ID converted to string
                 match &routed_message {
                     JsonRpcMessage::Request(req) => req.id.to_string(),
                     JsonRpcMessage::Response(resp) => resp.id.to_string(),
@@ -1719,6 +1741,7 @@ async fn handle_process_notification_or_request(
                 .add_to_buffer(routed_message.clone(), buffer_id)
                 .await;
 
+            // Route to appropriate WebSocket based on session_id
             if let Some(channel_id) = state.session_to_channel.get(&session_id) {
                 if let Some(sender) = state.channel_senders.get(&channel_id) {
                     let _ = sender.send(AcpChannelInfo::JsonRpc(routed_message));
@@ -1740,31 +1763,6 @@ async fn handle_process_notification_or_request(
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-// String key of command + cwd + init params (from initialize request) for process deduplication
-// We exclude _meta.tidewave.ai/spawn from the params since command and cwd are already
-// explicitly part of the key
-pub fn generate_process_key(command: &str, cwd: &str, init_params: &Value) -> ProcessKey {
-    let mut params_without_spawn_meta = init_params.clone();
-    if let Some(obj) = params_without_spawn_meta.as_object_mut() {
-        if let Some(meta) = obj.get_mut("_meta") {
-            if let Some(meta_obj) = meta.as_object_mut() {
-                meta_obj.remove("tidewave.ai/spawn");
-                // If _meta is now empty, remove it entirely
-                if meta_obj.is_empty() {
-                    obj.remove("_meta");
-                }
-            }
-        }
-    }
-
-    format!(
-        "{}:{}:{}",
-        command,
-        cwd,
-        serde_json::to_string(&params_without_spawn_meta).unwrap_or_default()
-    )
-}
 
 fn inject_tidewave_version(response: &mut JsonRpcResponse, version: &str) {
     if let Some(result) = &mut response.result {
