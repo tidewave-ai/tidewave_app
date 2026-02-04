@@ -693,7 +693,8 @@ async fn test_write_file_exclusive_succeeds_if_not_exists() {
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
-    let temp_dir = std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
     let file_path = temp_dir.join("new_file.txt");
 
@@ -734,7 +735,8 @@ async fn test_write_file_exclusive_fails_if_exists() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
     // Create a temp file that already exists
-    let temp_dir = std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("write_exclusive_test_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
     let file_path = temp_dir.join("existing_file.txt");
     fs::write(&file_path, "original content").expect("Failed to write file");
@@ -941,7 +943,8 @@ async fn test_delete_symlink_removes_link_not_target() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
     // Create a temp directory with a file and a symlink to it
-    let temp_dir = std::env::temp_dir().join(format!("delete_symlink_test_{}", uuid::Uuid::new_v4()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("delete_symlink_test_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
     let target_file = temp_dir.join("target.txt");
@@ -1115,7 +1118,10 @@ async fn test_listdir_requires_absolute_path() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("http://127.0.0.1:{}/listdir?path=relative/path", port))
+        .get(format!(
+            "http://127.0.0.1:{}/listdir?path=relative/path",
+            port
+        ))
         .send()
         .await
         .unwrap();

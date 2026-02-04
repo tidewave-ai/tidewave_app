@@ -128,10 +128,7 @@ async fn test_watch_subscribe_relative_path_error() {
     assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["error"]
-        .as_str()
-        .unwrap()
-        .contains("absolute"));
+    assert!(event["error"].as_str().unwrap().contains("absolute"));
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("watch1"));
 }
 
@@ -165,10 +162,7 @@ async fn test_watch_subscribe_nonexistent_path_error() {
     assert!(event.is_some(), "Expected unsubscribed event with error");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert!(event["error"]
-        .as_str()
-        .unwrap()
-        .contains("does not exist"));
+    assert!(event["error"].as_str().unwrap().contains("does not exist"));
     assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("watch1"));
 }
 
@@ -229,7 +223,9 @@ async fn test_watch_file_modified() {
     // Create a temp directory and file
     let temp_dir = tempfile::tempdir().unwrap();
     let file_path = temp_dir.path().join("existing_file.txt");
-    tokio::fs::write(&file_path, "initial content").await.unwrap();
+    tokio::fs::write(&file_path, "initial content")
+        .await
+        .unwrap();
 
     let watch_path = temp_dir.path().to_string_lossy().to_string();
 
@@ -259,7 +255,9 @@ async fn test_watch_file_modified() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Modify the file
-    tokio::fs::write(&file_path, "modified content").await.unwrap();
+    tokio::fs::write(&file_path, "modified content")
+        .await
+        .unwrap();
 
     // Should receive modified event with relative path
     let event = wait_for_event(&mut ws_out_rx, "modified", 2000).await;
@@ -370,7 +368,10 @@ async fn test_watch_unsubscribe() {
     assert!(event.is_some(), "Expected unsubscribed event");
     let event = event.unwrap();
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
-    assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("unsub_test"));
+    assert_eq!(
+        event.get("ref").and_then(|r| r.as_str()),
+        Some("unsub_test")
+    );
 }
 
 #[tokio::test]
@@ -462,8 +463,14 @@ async fn test_watch_concurrent_subscribers() {
     let event2 = wait_for_event(&mut ws2_out_rx, "subscribed", 1000).await;
     assert!(event1.is_some());
     assert!(event2.is_some());
-    assert_eq!(event1.unwrap().get("ref").and_then(|r| r.as_str()), Some("client1_watch"));
-    assert_eq!(event2.unwrap().get("ref").and_then(|r| r.as_str()), Some("client2_watch"));
+    assert_eq!(
+        event1.unwrap().get("ref").and_then(|r| r.as_str()),
+        Some("client1_watch")
+    );
+    assert_eq!(
+        event2.unwrap().get("ref").and_then(|r| r.as_str()),
+        Some("client2_watch")
+    );
 
     // Give watchers time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -478,8 +485,14 @@ async fn test_watch_concurrent_subscribers() {
 
     assert!(event1.is_some(), "WebSocket 1 should receive created event");
     assert!(event2.is_some(), "WebSocket 2 should receive created event");
-    assert_eq!(event1.unwrap().get("ref").and_then(|r| r.as_str()), Some("client1_watch"));
-    assert_eq!(event2.unwrap().get("ref").and_then(|r| r.as_str()), Some("client2_watch"));
+    assert_eq!(
+        event1.unwrap().get("ref").and_then(|r| r.as_str()),
+        Some("client1_watch")
+    );
+    assert_eq!(
+        event2.unwrap().get("ref").and_then(|r| r.as_str()),
+        Some("client2_watch")
+    );
 }
 
 #[tokio::test]
@@ -522,7 +535,9 @@ async fn test_watch_subdirectory_events() {
 
     // Create a file in the subdirectory
     let file_path = sub_dir.join("nested_file.txt");
-    tokio::fs::write(&file_path, "nested content").await.unwrap();
+    tokio::fs::write(&file_path, "nested content")
+        .await
+        .unwrap();
 
     // Should receive created event for nested file with relative path (recursive watching)
     let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
@@ -531,5 +546,8 @@ async fn test_watch_subdirectory_events() {
     assert_eq!(event.get("topic").and_then(|t| t.as_str()), Some("watch"));
     // Relative path includes subdirectory
     assert_eq!(event["path"].as_str().unwrap(), "subdir/nested_file.txt");
-    assert_eq!(event.get("ref").and_then(|r| r.as_str()), Some("recursive_watch"));
+    assert_eq!(
+        event.get("ref").and_then(|r| r.as_str()),
+        Some("recursive_watch")
+    );
 }

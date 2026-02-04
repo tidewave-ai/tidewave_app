@@ -11,8 +11,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing::{debug, error, info};
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::prelude::*;
 
 struct ServerState {
     handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
@@ -445,8 +445,7 @@ fn config_error_dialog(app: &tauri::AppHandle, error_message: impl Into<String>)
 }
 
 fn log_path() -> PathBuf {
-    let data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::env::temp_dir());
+    let data_dir = dirs::data_local_dir().unwrap_or_else(|| std::env::temp_dir());
     data_dir.join("tidewave").join("logs").join("tidewave.log")
 }
 

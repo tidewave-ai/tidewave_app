@@ -411,9 +411,10 @@ async fn handle_subscribe(
                 }
             };
 
-            if let Err(e) =
-                watcher.watch(Path::new(&canonical_path_for_task), RecursiveMode::Recursive)
-            {
+            if let Err(e) = watcher.watch(
+                Path::new(&canonical_path_for_task),
+                RecursiveMode::Recursive,
+            ) {
                 let _ = tx.send(WatchEvent::Unsubscribed {
                     reference: canonical_path_for_task.clone(),
                     error: Some(format!("Failed to watch path: {}", e)),

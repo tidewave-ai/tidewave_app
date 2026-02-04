@@ -735,7 +735,12 @@ async fn write_file_handler(
                 .create_new(true)
                 .open(&path)
                 .await
-                .map_err(|e| (e.kind() == std::io::ErrorKind::AlreadyExists, e.kind().to_string()))?;
+                .map_err(|e| {
+                    (
+                        e.kind() == std::io::ErrorKind::AlreadyExists,
+                        e.kind().to_string(),
+                    )
+                })?;
             file.write_all(content.as_bytes())
                 .await
                 .map_err(|e| (false, e.kind().to_string()))?;
@@ -784,7 +789,9 @@ async fn delete_file_handler(
     let result = tokio::fs::remove_file(&file_path).await;
 
     match result {
-        Ok(()) => Ok(Json(DeleteFileResponse::DeleteFileResponseOk { success: true })),
+        Ok(()) => Ok(Json(DeleteFileResponse::DeleteFileResponseOk {
+            success: true,
+        })),
         Err(error) => Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
             success: false,
             error: error.kind().to_string(),
@@ -792,9 +799,7 @@ async fn delete_file_handler(
     }
 }
 
-async fn stat_handler(
-    Query(query): Query<StatParams>,
-) -> Result<Json<StatResponse>, StatusCode> {
+async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {
     let file_path = match normalize_path(&query.path, query.is_wsl).await {
         Ok(path) => path,
         Err(error) => {
