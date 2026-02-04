@@ -306,11 +306,10 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create WebSocket routes
-    let ws_state = crate::ws::WsState::new();
-    let ws_routes = Router::new()
-        .route("/ws", get(crate::ws::ws_handler))
-        .with_state(ws_state.clone());
+    // Create Phoenix channels routes for file watching
+    let mut channel_registry = phoenix_rs::ChannelRegistry::new();
+    channel_registry.register("watch:*", crate::watch_channel::WatchChannel);
+    let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
 
     // Create Phoenix channel routes
     let mut channel_registry = phoenix_rs::ChannelRegistry::new();
@@ -345,9 +344,8 @@ async fn serve_http_server_inner(
             }),
         )
         .merge(download_routes)
-        .merge(ws_routes)
-        .merge(phoenix_routes)
-        .merge(mcp_channel_routes);
+        .merge(mcp_channel_routes)
+        .merge(phoenix_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -460,9 +458,6 @@ async fn serve_http_server_inner(
             let _ = exit_tx.send(());
         }
     }
-
-    // Clear all WebSocket state
-    ws_state.clear();
 
     Ok(())
 }
