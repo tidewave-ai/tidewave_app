@@ -77,12 +77,15 @@ pub fn phoenix_router(registry: ChannelRegistry) -> Router {
         .with_state(state)
 }
 
-/// Create a router with a custom path
+/// Create a router with a custom path prefix
+///
+/// The WebSocket endpoint will be at `{path}/websocket` to match Phoenix convention.
 pub fn phoenix_router_at(path: &str, registry: ChannelRegistry) -> Router {
     let state = PhoenixState::new(registry);
+    let ws_path = format!("{}/websocket", path.trim_end_matches('/'));
 
     Router::new()
-        .route(path, get(ws_handler))
+        .route(&ws_path, get(ws_handler))
         .with_state(state)
 }
 
