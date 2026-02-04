@@ -749,21 +749,29 @@ impl Channel for AcpChannel {
         self.state.channel_senders.remove(&channel_id);
         self.state.channel_to_process.remove(&channel_id);
 
-        // Capture sessions for this channel and remove mappings
-        let mut sessions_for_channel = Vec::new();
-        for entry in self.state.session_to_channel.iter() {
-            if *entry.value() == channel_id {
-                if let Some(session) = self.state.sessions.get(entry.key()) {
-                    sessions_for_channel.push((
-                        entry.key().clone(),
-                        session.cancel_counter.load(Ordering::Relaxed),
-                    ));
-                }
-            }
-        }
+        // Capture sessions for this channel and remove mappings.
+        // We first collect all session IDs that map to this channel, then look up
+        // their state separately. This is important because the process exit handler
+        // might have already removed sessions from state.sessions, but we still need
+        // to clean up session_to_channel.
+        let session_ids_for_channel: Vec<SessionId> = self
+            .state
+            .session_to_channel
+            .iter()
+            .filter(|entry| *entry.value() == channel_id)
+            .map(|entry| entry.key().clone())
+            .collect();
 
-        for (session_id, _counter) in &sessions_for_channel {
+        // Now get the cancel counters for sessions that still exist
+        let mut sessions_for_channel = Vec::new();
+        for session_id in &session_ids_for_channel {
             self.state.session_to_channel.remove(session_id);
+            if let Some(session) = self.state.sessions.get(session_id) {
+                sessions_for_channel.push((
+                    session_id.clone(),
+                    session.cancel_counter.load(Ordering::Relaxed),
+                ));
+            }
         }
 
         // Spawn a task to send session/cancel after 10 seconds

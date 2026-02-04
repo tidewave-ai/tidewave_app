@@ -48,13 +48,6 @@ pub struct McpParams {
     pub session_id: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct McpRemoteMessage {
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    #[serde(rename = "jsonRpcMessage")]
-    json_rpc_message: Value,
-}
 
 // ============================================================================
 // State Types
@@ -157,27 +150,30 @@ impl Channel for McpChannel {
         &self,
         event: &str,
         payload: Value,
-        _socket: &mut SocketRef,
+        socket: &mut SocketRef,
     ) -> HandleResult {
         match event {
             "mcp_message" => {
-                // Parse the MCP message from the browser
-                let message: McpRemoteMessage = match serde_json::from_value(payload) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Failed to parse MCP message: {}", e);
+                // The payload is the raw JSON-RPC message
+                let json_rpc_message = payload;
+
+                // Get session_id from socket assigns (set during join)
+                let session_id = match socket.get_assign::<String>("session_id") {
+                    Some(id) => id.clone(),
+                    None => {
+                        error!("No session_id in socket assigns");
                         return HandleResult::error(json!({
-                            "reason": format!("failed to parse message: {}", e)
+                            "reason": "no session_id in socket assigns"
                         }));
                     }
                 };
 
                 // Check if this is a reply to a pending request
-                if let Some(id) = message.json_rpc_message.get("id") {
-                    let key = (message.session_id.clone(), id.clone());
+                if let Some(id) = json_rpc_message.get("id") {
+                    let key = (session_id.clone(), id.clone());
                     if let Some((_, response_tx)) = self.state.awaiting_answers.remove(&key) {
                         // This is a reply to a pending request
-                        if response_tx.send(message.json_rpc_message.clone()).is_err() {
+                        if response_tx.send(json_rpc_message.clone()).is_err() {
                             warn!("Failed to send response to waiting request");
                         }
                         return HandleResult::no_reply();
@@ -185,15 +181,15 @@ impl Channel for McpChannel {
                 }
 
                 // This is a notification or unexpected message
-                if message.json_rpc_message.get("id").is_some() {
+                if json_rpc_message.get("id").is_some() {
                     error!(
                         "Did not expect a reply (or request) for session {}: {:?}",
-                        message.session_id, message.json_rpc_message
+                        session_id, json_rpc_message
                     );
                 } else {
                     info!(
                         "Ignoring notification from browser: {:?}",
-                        message.json_rpc_message
+                        json_rpc_message
                     );
                 }
 
@@ -222,14 +218,8 @@ impl Channel for McpChannel {
                         }
                     }
 
-                    // Forward the message to the browser
-                    socket.push(
-                        "mcp_message",
-                        json!({
-                            "sessionId": session_id,
-                            "jsonRpcMessage": json_rpc_message
-                        }),
-                    );
+                    // Forward the raw JSON-RPC message to the browser
+                    socket.push("mcp_message", json_rpc_message);
                 }
             }
         }
@@ -266,8 +256,6 @@ impl Channel for McpChannel {
                 }));
             }
         }
-
-        info!("MCP channel terminated for session: {}", session_id);
     }
 }
 
