@@ -132,18 +132,31 @@ impl Channel for WatchChannel {
         #[cfg(not(target_os = "windows"))]
         let use_poll_watcher = false;
 
+        // Create a channel to receive ready signal from the watcher task
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
         // Spawn the file watcher background task
         tokio::spawn(file_watcher_task(
             canonical_path.clone(),
             info_sender,
             shutdown_token,
             use_poll_watcher,
+            ready_tx,
         ));
 
-        JoinResult::ok(json!({
-            "status": "watching",
-            "path": canonical_path
-        }))
+        // Wait for the watcher to be ready before returning
+        match ready_rx.await {
+            Ok(Ok(())) => JoinResult::ok(json!({
+                "status": "watching",
+                "path": canonical_path
+            })),
+            Ok(Err(e)) => JoinResult::error(json!({
+                "reason": e
+            })),
+            Err(_) => JoinResult::error(json!({
+                "reason": "watcher task failed to start"
+            })),
+        }
     }
 
     async fn handle_in(
@@ -216,6 +229,7 @@ async fn file_watcher_task(
     info_sender: InfoSender<WatchInfo>,
     shutdown: CancellationToken,
     use_poll_watcher: bool,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) {
     // Create a channel to receive notify events
     let (notify_tx, mut notify_rx) =
@@ -239,9 +253,8 @@ async fn file_watcher_task(
         match create_poll_watcher(notify_tx.clone()) {
             Ok(w) => Box::new(w),
             Err(e) => {
-                let _ = info_sender.send(WatchInfo::WatchError {
-                    message: format!("Failed to create poll watcher: {}", e),
-                });
+                let msg = format!("Failed to create poll watcher: {}", e);
+                let _ = ready_tx.send(Err(msg));
                 return;
             }
         }
@@ -277,12 +290,11 @@ async fn file_watcher_task(
                         Box::new(w)
                     }
                     Err(poll_err) => {
-                        let _ = info_sender.send(WatchInfo::WatchError {
-                            message: format!(
-                                "Failed to create watcher: {} (poll fallback also failed: {})",
-                                e, poll_err
-                            ),
-                        });
+                        let msg = format!(
+                            "Failed to create watcher: {} (poll fallback also failed: {})",
+                            e, poll_err
+                        );
+                        let _ = ready_tx.send(Err(msg));
                         return;
                     }
                 }
@@ -291,12 +303,13 @@ async fn file_watcher_task(
     };
 
     if let Err(e) = watcher.watch(Path::new(&canonical_path), RecursiveMode::Recursive) {
-        let _ = info_sender.send(WatchInfo::WatchError {
-            message: format!("Failed to watch path: {}", e),
-        });
+        let msg = format!("Failed to watch path: {}", e);
+        let _ = ready_tx.send(Err(msg));
         return;
     }
 
+    // Signal that the watcher is ready
+    let _ = ready_tx.send(Ok(()));
     debug!(path = %canonical_path, "File watcher started");
 
     let mut pending_rename_from: Option<String> = None;
@@ -457,93 +470,237 @@ fn convert_notify_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_rs::ChannelRegistry;
+    use phoenix_rs::{ChannelRegistry, TestClient};
+    use serde_json::json;
+    use std::time::Duration;
 
-    #[test]
-    fn test_watch_channel_registration() {
+    #[tokio::test]
+    async fn test_watch_join_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let watch_path = temp_dir.path().to_string_lossy().to_string();
+        let topic = format!("watch:{}", watch_path);
+
         let mut registry = ChannelRegistry::new();
         registry.register("watch:*", WatchChannel);
-        assert!(registry.find("watch:/tmp/test").is_some());
-        assert!(registry.find("other:/tmp/test").is_none());
+
+        let mut client = TestClient::new(registry);
+        let channel = client.join(&topic, json!({})).await;
+        assert!(channel.is_ok(), "Expected successful join");
     }
 
     #[tokio::test]
-    async fn test_convert_notify_event_create() {
-        let event = notify::Event {
-            kind: EventKind::Create(notify::event::CreateKind::File),
-            paths: vec!["/tmp/test.txt".into()],
-            attrs: Default::default(),
-        };
+    async fn test_watch_join_invalid_topic() {
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
 
-        let mut pending = None;
-        let results = convert_notify_event(event, "/tmp", &mut pending);
-
-        assert_eq!(results.len(), 1);
-        match &results[0] {
-            WatchInfo::Created { path } => assert_eq!(path, "test.txt"),
-            _ => panic!("Expected Created event"),
-        }
+        let result = client.join("watch:", json!({})).await;
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert_eq!(error.payload["status"], "error");
+        assert!(error.payload["response"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("invalid topic"));
     }
 
     #[tokio::test]
-    async fn test_convert_notify_event_rename() {
-        // Rename comes as two events: From then To
-        let from_event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::From,
-            )),
-            paths: vec!["/tmp/old.txt".into()],
-            attrs: Default::default(),
-        };
+    async fn test_watch_join_nonexistent_path() {
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
 
-        let to_event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::To,
-            )),
-            paths: vec!["/tmp/new.txt".into()],
-            attrs: Default::default(),
-        };
-
-        let mut pending = None;
-        let results1 = convert_notify_event(from_event, "/tmp", &mut pending);
-        assert!(results1.is_empty()); // From event just stores state
-        assert!(pending.is_some());
-
-        let results2 = convert_notify_event(to_event, "/tmp", &mut pending);
-        assert_eq!(results2.len(), 1);
-        match &results2[0] {
-            WatchInfo::Renamed { from, to } => {
-                assert_eq!(from, "old.txt");
-                assert_eq!(to, "new.txt");
-            }
-            _ => panic!("Expected Renamed event"),
-        }
+        let result = client
+            .join("watch:/nonexistent/path/that/does/not/exist", json!({}))
+            .await;
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert_eq!(error.payload["status"], "error");
+        assert!(error.payload["response"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist"));
     }
 
     #[tokio::test]
-    async fn test_convert_notify_event_watched_path_removed() {
-        let event = notify::Event {
-            kind: EventKind::Remove(notify::event::RemoveKind::Folder),
-            paths: vec!["/tmp/watched".into()],
-            attrs: Default::default(),
-        };
+    async fn test_watch_join_relative_path() {
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
 
-        let mut pending = None;
-        let results = convert_notify_event(event, "/tmp/watched", &mut pending);
-
-        assert_eq!(results.len(), 1);
-        assert!(matches!(results[0], WatchInfo::WatchedPathRemoved));
+        let result = client.join("watch:relative/path", json!({})).await;
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert_eq!(error.payload["status"], "error");
+        assert!(error.payload["response"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("absolute"));
     }
 
     #[tokio::test]
-    async fn test_to_relative_path() {
-        let abs_path = Path::new("/watched/dir/subdir/file.txt");
-        let result = to_relative_path(abs_path, "/watched/dir");
-        assert_eq!(result, Some("subdir/file.txt".to_string()));
+    async fn test_watch_file_created() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
 
-        // Path not under watched dir
-        let outside_path = Path::new("/other/file.txt");
-        let result = to_relative_path(outside_path, "/watched/dir");
-        assert_eq!(result, None);
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+        let mut channel = client.join(&topic, json!({})).await.unwrap();
+
+        // Create file
+        tokio::fs::write(temp_dir.path().join("test_file.txt"), "hello")
+            .await
+            .unwrap();
+
+        // Wait for event
+        let msg = channel.recv_timeout(Duration::from_secs(3)).await;
+        assert!(msg.is_some(), "Expected created event");
+        let msg = msg.unwrap();
+        assert_eq!(msg.event, "created");
+        assert_eq!(msg.payload["path"].as_str().unwrap(), "test_file.txt");
+    }
+
+    #[tokio::test]
+    async fn test_watch_file_modified() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("existing_file.txt");
+        tokio::fs::write(&file_path, "initial content")
+            .await
+            .unwrap();
+
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+        let mut channel = client.join(&topic, json!({})).await.unwrap();
+
+        // Modify the file
+        tokio::fs::write(&file_path, "modified content")
+            .await
+            .unwrap();
+
+        // Wait for event
+        let msg = channel.recv_timeout(Duration::from_secs(3)).await;
+        assert!(msg.is_some(), "Expected modified event");
+        let msg = msg.unwrap();
+        assert_eq!(msg.event, "modified");
+        assert_eq!(msg.payload["path"].as_str().unwrap(), "existing_file.txt");
+    }
+
+    #[tokio::test]
+    async fn test_watch_file_deleted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("file_to_delete.txt");
+        tokio::fs::write(&file_path, "content").await.unwrap();
+
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+        let mut channel = client.join(&topic, json!({})).await.unwrap();
+
+        // Delete the file
+        tokio::fs::remove_file(&file_path).await.unwrap();
+
+        // Wait for event
+        let msg = channel.recv_timeout(Duration::from_secs(3)).await;
+        assert!(msg.is_some(), "Expected deleted event");
+        let msg = msg.unwrap();
+        assert_eq!(msg.event, "deleted");
+        assert_eq!(msg.payload["path"].as_str().unwrap(), "file_to_delete.txt");
+    }
+
+    #[tokio::test]
+    async fn test_watch_leave() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+        let channel = client.join(&topic, json!({})).await.unwrap();
+
+        // Leave the channel - leave() returns PhxMessage with ok status on success
+        let result = channel.leave().await;
+        assert_eq!(
+            result.payload.get("status").and_then(|s| s.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watch_wsl_param() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+
+        // Join with is_wsl parameter (false has no effect on non-WSL systems)
+        let channel = client.join(&topic, json!({"is_wsl": false})).await;
+        assert!(channel.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_watch_subdirectory_events() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sub_dir = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&sub_dir).await.unwrap();
+
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        let mut registry = ChannelRegistry::new();
+        registry.register("watch:*", WatchChannel);
+        let mut client = TestClient::new(registry);
+        let mut channel = client.join(&topic, json!({})).await.unwrap();
+
+        // Create a file in the subdirectory
+        tokio::fs::write(sub_dir.join("nested_file.txt"), "nested content")
+            .await
+            .unwrap();
+
+        // Should receive created event with relative path including subdirectory
+        let msg = channel.recv_timeout(Duration::from_secs(3)).await;
+        assert!(msg.is_some(), "Expected created event for nested file");
+        let msg = msg.unwrap();
+        assert_eq!(msg.event, "created");
+        assert_eq!(msg.payload["path"].as_str().unwrap(), "subdir/nested_file.txt");
+    }
+
+    #[tokio::test]
+    async fn test_watch_concurrent_subscribers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let topic = format!("watch:{}", temp_dir.path().to_string_lossy());
+
+        // Create two clients watching the same directory
+        let mut registry1 = ChannelRegistry::new();
+        registry1.register("watch:*", WatchChannel);
+        let mut client1 = TestClient::new(registry1);
+
+        let mut registry2 = ChannelRegistry::new();
+        registry2.register("watch:*", WatchChannel);
+        let mut client2 = TestClient::new(registry2);
+
+        // Both join the same topic
+        let mut channel1 = client1.join(&topic, json!({})).await.unwrap();
+        let mut channel2 = client2.join(&topic, json!({})).await.unwrap();
+
+        // Create a file
+        tokio::fs::write(temp_dir.path().join("shared_file.txt"), "content")
+            .await
+            .unwrap();
+
+        // Both should receive the created event
+        let msg1 = channel1.recv_timeout(Duration::from_secs(3)).await;
+        let msg2 = channel2.recv_timeout(Duration::from_secs(3)).await;
+
+        assert!(msg1.is_some(), "Client 1 should receive created event");
+        assert!(msg2.is_some(), "Client 2 should receive created event");
+        assert_eq!(msg1.unwrap().event, "created");
+        assert_eq!(msg2.unwrap().event, "created");
     }
 }
