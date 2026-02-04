@@ -22,13 +22,13 @@
 //! channel.leave().await;
 //! ```
 
-use crate::message::{events, PhxMessage};
+use crate::message::{PhxMessage, events};
 use crate::registry::ChannelRegistry;
 use crate::socket::Socket;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -77,7 +77,11 @@ impl TestClient {
     /// # Returns
     /// * `Ok(JoinedChannel)` if join succeeded
     /// * `Err(PhxMessage)` if join failed (contains the error reply)
-    pub async fn join(&mut self, topic: &str, payload: Value) -> Result<JoinedChannel<'_>, PhxMessage> {
+    pub async fn join(
+        &mut self,
+        topic: &str,
+        payload: Value,
+    ) -> Result<JoinedChannel<'_>, PhxMessage> {
         let ref_id = self.next_ref();
         self.join_with_ref(topic, payload, &ref_id).await
     }
@@ -168,11 +172,17 @@ impl<'a> JoinedChannel<'a> {
     /// # Returns
     /// The reply message from the server.
     pub async fn call(&mut self, event: &str, payload: Value) -> PhxMessage {
-        self.call_timeout(event, payload, Duration::from_secs(5)).await
+        self.call_timeout(event, payload, Duration::from_secs(5))
+            .await
     }
 
     /// Push an event and wait for reply with custom timeout.
-    pub async fn call_timeout(&mut self, event: &str, payload: Value, timeout: Duration) -> PhxMessage {
+    pub async fn call_timeout(
+        &mut self,
+        event: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> PhxMessage {
         let ref_id = self.client.next_ref();
         let msg = PhxMessage::new(&self.topic, event, payload)
             .with_ref(&ref_id)

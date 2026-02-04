@@ -11,10 +11,10 @@ pub mod transport;
 pub use channel::{
     Assigns, Channel, HandleResult, InfoSendError, InfoSender, JoinResult, ReplyStatus, SocketRef,
 };
-pub use tokio_util::sync::CancellationToken;
 pub use error::PhoenixError;
-pub use message::{events, PhxMessage};
+pub use message::{PhxMessage, events};
 pub use registry::{ChannelRegistry, TopicPattern};
 pub use socket::Socket;
 pub use testing::{JoinedChannel, TestClient};
+pub use tokio_util::sync::CancellationToken;
 pub use transport::{PhoenixState, phoenix_router, phoenix_router_at, phoenix_state};

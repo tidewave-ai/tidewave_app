@@ -2,12 +2,13 @@ use std::any::Any;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::{response::Html, routing::get, Router};
+use axum::{Router, response::Html, routing::get};
 use phoenix_rs::{
+    CancellationToken, ChannelRegistry, InfoSender,
     channel::{Channel, HandleResult, JoinResult, SocketRef},
-    phoenix_router, CancellationToken, ChannelRegistry, InfoSender,
+    phoenix_router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 /// Info messages sent from background tasks to the channel
@@ -51,7 +52,8 @@ impl Channel for ChatChannel {
 
     async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
         // Get username from assigns (stored during join)
-        let username = socket.get_assign::<String>("username")
+        let username = socket
+            .get_assign::<String>("username")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -65,17 +67,23 @@ impl Channel for ChatChannel {
 
                 // Broadcast with username injected from assigns
                 let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                socket.broadcast("shout", json!({
-                    "username": username,
-                    "body": body
-                }));
+                socket.broadcast(
+                    "shout",
+                    json!({
+                        "username": username,
+                        "body": body
+                    }),
+                );
                 HandleResult::ok(json!({}))
             }
             "typing" => {
                 // Broadcast typing indicator with username from assigns
-                socket.broadcast_from("typing", json!({
-                    "username": username
-                }));
+                socket.broadcast_from(
+                    "typing",
+                    json!({
+                        "username": username
+                    }),
+                );
                 HandleResult::no_reply()
             }
             _ => HandleResult::no_reply(),
@@ -95,11 +103,18 @@ impl Channel for ChatChannel {
     }
 
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
-        let username = socket.get_assign::<String>("username")
+        let username = socket
+            .get_assign::<String>("username")
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        let message_count = socket.get_assign::<u32>("message_count").copied().unwrap_or(0);
-        println!("User '{}' left ({}), sent {} messages", username, reason, message_count);
+        let message_count = socket
+            .get_assign::<u32>("message_count")
+            .copied()
+            .unwrap_or(0);
+        println!(
+            "User '{}' left ({}), sent {} messages",
+            username, reason, message_count
+        );
     }
 }
 

@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use crate::channel::{HandleResult, JoinResult, SocketRef};
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     #[test]

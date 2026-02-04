@@ -10,9 +10,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::error::PhoenixError;
-use crate::message::{events, PhxMessage};
+use crate::message::{PhxMessage, events};
 use crate::registry::ChannelRegistry;
-use crate::subscription::{spawn_subscription, SubscriptionHandle};
+use crate::subscription::{SubscriptionHandle, spawn_subscription};
 
 /// Represents a single WebSocket connection
 pub struct Socket {
@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     use crate::channel::{Channel, HandleResult, JoinResult, SocketRef};
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::any::Any;
 
     struct EchoChannel;

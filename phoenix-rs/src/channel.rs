@@ -183,9 +183,7 @@ pub enum HandleResult {
     /// No reply needed
     NoReply,
     /// Stop the channel (will send phx_close)
-    Stop {
-        reason: String,
-    },
+    Stop { reason: String },
 }
 
 impl HandleResult {
@@ -336,7 +334,9 @@ impl SocketRef {
     ///
     /// Returns `None` if info messaging is not enabled (shouldn't happen in normal use).
     pub fn info_sender<M: Send + 'static>(&self) -> Option<InfoSender<M>> {
-        self.info_sender.as_ref().map(|s| InfoSender::new(s.clone()))
+        self.info_sender
+            .as_ref()
+            .map(|s| InfoSender::new(s.clone()))
     }
 
     /// Get a cancellation token that is cancelled when the subscription terminates.
