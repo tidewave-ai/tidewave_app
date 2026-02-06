@@ -388,6 +388,128 @@ async fn test_concurrent_channel_joins() {
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 }
 
+/// Test that concurrent init requests from two clients only send one init to the process
+#[tokio::test]
+async fn test_concurrent_init_requests() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    // Two phoenix handlers sharing the same AcpChannelState (same process)
+    let phoenix_state1 = PhoenixState::new(state.clone(), McpChannelState::new());
+    let phoenix_state2 = PhoenixState::new(state, McpChannelState::new());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    // Start both handlers
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx1, in_rx1, phoenix_state1).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx2, in_rx2, phoenix_state2).await;
+    });
+
+    // Join client 1
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload["status"], "ok");
+
+    // Wait for process to start
+    process_started.await.expect("Process failed to start");
+
+    // Join client 2 (same spawn opts = same process)
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload["status"], "ok");
+
+    // Both clients send init requests concurrently
+    let init_request1 = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    });
+    let init_request2 = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "initialize",
+        "params": {}
+    });
+    let push_msg1 = PhxMessage::new("acp:test1", "jsonrpc", init_request1)
+        .with_ref("2")
+        .with_join_ref("j1");
+    let push_msg2 = PhxMessage::new("acp:test2", "jsonrpc", init_request2)
+        .with_ref("2")
+        .with_join_ref("j2");
+
+    // Send both init requests as close together as possible
+    send_phoenix_msg(&in_tx1, &push_msg1);
+    send_phoenix_msg(&in_tx2, &push_msg2);
+
+    // The process should receive exactly ONE init request
+    let received_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(received_request["method"], "initialize");
+    let proxy_id = received_request["id"].clone();
+
+    // Respond from the process
+    let init_response = json!({
+        "jsonrpc": "2.0",
+        "id": proxy_id,
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {}
+        }
+    });
+    write_json_line(&mut test_stdin, &init_response).await;
+
+    // Both clients should receive their init responses (with their original IDs)
+    let msg1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected response for client 1");
+    assert_eq!(msg1.event, "jsonrpc");
+    assert_eq!(msg1.payload["id"], 1);
+    assert_eq!(msg1.payload["result"]["protocolVersion"], 1);
+
+    let msg2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected response for client 2");
+    assert_eq!(msg2.event, "jsonrpc");
+    assert_eq!(msg2.payload["id"], 2);
+    assert_eq!(msg2.payload["result"]["protocolVersion"], 1);
+
+    // Verify no additional init request was sent to the process by sending another
+    // request and checking it's not an init
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", session_new)
+        .with_ref("3")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let next_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(
+        next_request["method"], "session/new",
+        "Next request to process should be session/new, not a duplicate initialize"
+    );
+}
+
 // ============================================================================
 // Fake Process Infrastructure
 // ============================================================================

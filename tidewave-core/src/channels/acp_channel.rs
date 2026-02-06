@@ -128,7 +128,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{mpsc, Mutex, RwLock},
+    sync::{mpsc, Mutex, Notify, RwLock},
 };
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -271,7 +271,7 @@ pub type ProcessStarterFn = Arc<
 // ============================================================================
 
 pub type ChannelId = Uuid;
-pub type ProcessKey = String; // command + init params
+pub type ProcessKey = String; // command + cwd
 pub type SessionId = String;
 pub type NotificationId = String;
 
@@ -338,6 +338,10 @@ pub struct ProcessState {
 
     /// The cached init response we resend when a client reconnects.
     pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
+    /// Whether an init request has already been sent to the process.
+    pub init_sent: AtomicBool,
+    /// Notified when the init response is cached, so waiters can grab it.
+    pub init_complete: Arc<Notify>,
 
     /// Buffers for stdout/stderr output before init completes.
     /// Used to provide detailed error messages when process exits before init.
@@ -380,6 +384,8 @@ impl ProcessState {
             proxy_to_client_ids: Arc::new(DashMap::new()),
             proxy_to_session_ids: Arc::new(DashMap::new()),
             cached_init_response: Arc::new(RwLock::new(None)),
+            init_sent: AtomicBool::new(false),
+            init_complete: Arc::new(Notify::new()),
             stdout_buffer: Arc::new(RwLock::new(Vec::new())),
             stderr_buffer: Arc::new(RwLock::new(Vec::new())),
             init_request_id: Arc::new(RwLock::new(None)),
@@ -812,7 +818,7 @@ impl AcpChannel {
         // Process was already started during channel join
         let process_state = self.ensure_process_for_channel(channel_id)?;
 
-        // Check if we have a cached init response
+        // Fast path: already have a cached init response
         if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
             let mut response = cached_response.clone();
             response.id = request.id.clone();
@@ -820,27 +826,47 @@ impl AcpChannel {
             return Ok(());
         }
 
-        // Forward the init request to the process
-        let session_id = extract_session_id_from_request(request);
-        let proxy_id =
-            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id);
-        let mut proxy_request = request.clone();
-        proxy_request.id = proxy_id.clone();
-
-        *process_state.init_request_id.write().await = Some(proxy_id);
-
-        if let Err(e) = process_state
-            .send_to_process(JsonRpcMessage::Request(proxy_request))
-            .await
+        // Try to be the one that sends the init request
+        if process_state
+            .init_sent
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
         {
-            error!("Failed to send initialize request to process: {}", e);
-            self.send_agent_exit(
-                channel_id,
-                "communication_error",
-                "Failed to communicate with process",
-                None,
-                None,
-            );
+            // We won the race — send the init request to the process
+            let session_id = extract_session_id_from_request(request);
+            let proxy_id =
+                process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id);
+            let mut proxy_request = request.clone();
+            proxy_request.id = proxy_id.clone();
+
+            *process_state.init_request_id.write().await = Some(proxy_id);
+
+            if let Err(e) = process_state
+                .send_to_process(JsonRpcMessage::Request(proxy_request))
+                .await
+            {
+                error!("Failed to send initialize request to process: {}", e);
+                self.send_agent_exit(
+                    channel_id,
+                    "communication_error",
+                    "Failed to communicate with process",
+                    None,
+                    None,
+                );
+            }
+        } else {
+            // Another client already sent the init request — wait for the response
+            process_state.init_complete.notified().await;
+
+            if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref()
+            {
+                let mut response = cached_response.clone();
+                response.id = request.id.clone();
+                self.send_to_channel(channel_id, JsonRpcMessage::Response(response));
+            } else {
+                // Init completed but no cached response (error case, e.g. process died)
+                self.send_agent_exit(channel_id, "init_error", "Process init failed", None, None);
+            }
         }
 
         Ok(())
@@ -1348,6 +1374,9 @@ impl AcpChannel {
                 state_exit.sessions.remove(session_id);
             }
 
+            // Notify any waiters for init response so they don't hang forever
+            process_state_exit.init_complete.notify_waiters();
+
             state_exit.processes.remove(&process_state_exit.key);
 
             debug!(
@@ -1532,6 +1561,8 @@ async fn maybe_handle_init_response(
         inject_proxy_capabilities(client_response);
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
+        // Notify any waiters that the init response is now cached
+        process_state.init_complete.notify_waiters();
         // Clear buffers
         *process_state.stderr_buffer.write().await = Vec::new();
         *process_state.stdout_buffer.write().await = Vec::new();
