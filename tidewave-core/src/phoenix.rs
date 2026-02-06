@@ -157,9 +157,6 @@ pub enum HandleResult {
         response: Value,
     },
     NoReply,
-    Stop {
-        reason: String,
-    },
 }
 
 impl HandleResult {
@@ -177,11 +174,6 @@ impl HandleResult {
     }
     pub fn no_reply() -> Self {
         HandleResult::NoReply
-    }
-    pub fn stop(reason: impl Into<String>) -> Self {
-        HandleResult::Stop {
-            reason: reason.into(),
-        }
     }
 }
 
@@ -334,22 +326,6 @@ fn spawn_subscription(
                             let _ = client_tx.send(reply);
                         }
                         HandleResult::NoReply => {}
-                        HandleResult::Stop { reason } => {
-                            shutdown.cancel();
-                            let close = PhxMessage {
-                                join_ref: Some(join_ref.clone()),
-                                ref_: None,
-                                topic: topic.clone(),
-                                event: events::PHX_CLOSE.to_string(),
-                                payload: serde_json::json!({"reason": &reason}),
-                            };
-                            let _ = client_tx.send(close);
-                            channel.terminate(&reason, &mut socket).await;
-                            let _ = remove_tx.send(RemoveSubscription {
-                                topic: topic.clone(),
-                            });
-                            return;
-                        }
                     }
                 }
                 SubscriptionMsg::Leave { msg_ref } => {

@@ -15,7 +15,6 @@
 //!
 //! Note: Event paths are relative to the watched directory.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -78,16 +77,15 @@ pub struct ActiveWatch {
 pub struct WatchChannelState {
     /// Active watchers (canonical_path → active_watch)
     pub watchers: Arc<DashMap<String, Arc<ActiveWatch>>>,
-    /// Subscriptions per socket (socket.unique_id → (canonical_path → topic))
-    /// Used to track which paths each socket is subscribed to
-    pub subscriptions: Arc<DashMap<uuid::Uuid, HashMap<String, String>>>,
+    /// Canonical path per channel instance (socket.unique_id → canonical_path)
+    pub canonical_paths: Arc<DashMap<uuid::Uuid, String>>,
 }
 
 impl WatchChannelState {
     pub fn new() -> Self {
         Self {
             watchers: Arc::new(DashMap::new()),
-            subscriptions: Arc::new(DashMap::new()),
+            canonical_paths: Arc::new(DashMap::new()),
         }
     }
 }
@@ -180,12 +178,10 @@ impl Channel for WatchChannel {
             }
         };
 
-        // Add to this socket's subscriptions (canonical_path -> topic)
+        // Store the canonical path for this channel instance
         self.state
-            .subscriptions
-            .entry(socket.unique_id)
-            .or_default()
-            .insert(canonical_path.clone(), topic.to_string());
+            .canonical_paths
+            .insert(socket.unique_id, canonical_path.clone());
 
         // Get or create active watch entry (atomic via entry API)
         let active_watch = self
@@ -295,12 +291,11 @@ impl Channel for WatchChannel {
     }
 
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
-        let canonical_path = socket.topic.strip_prefix("watch:").and_then(|p| {
-            Path::new(p)
-                .canonicalize()
-                .ok()
-                .map(|c| c.to_string_lossy().to_string())
-        });
+        let canonical_path = self
+            .state
+            .canonical_paths
+            .remove(&socket.unique_id)
+            .map(|(_, cp)| cp);
 
         debug!(
             path = ?canonical_path,
@@ -308,18 +303,6 @@ impl Channel for WatchChannel {
             socket_id = %socket.unique_id,
             "Watch subscription terminated"
         );
-
-        // Remove this socket's subscription
-        if let Some(mut subs) = self.state.subscriptions.get_mut(&socket.unique_id) {
-            if let Some(ref path) = canonical_path {
-                subs.remove(path);
-            }
-        }
-
-        // Cleanup empty subscription entry
-        self.state
-            .subscriptions
-            .remove_if(&socket.unique_id, |_, subs| subs.is_empty());
     }
 }
 
@@ -327,6 +310,9 @@ impl Channel for WatchChannel {
 // File Watcher Task
 // ============================================================================
 
+// The watcher uses a broadcast channel to send events to all subscribers.
+// We spawn one unique watcher task per canonical path and channel instances
+// subscribe to it in join (`active_watch.tx.subscribe()`).
 async fn run_watcher(
     active_watch: Arc<ActiveWatch>,
     canonical_path: String,
