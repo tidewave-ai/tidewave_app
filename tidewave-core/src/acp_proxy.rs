@@ -649,21 +649,28 @@ pub async fn unit_testable_ws_handler<W, R>(
     state.websocket_senders.remove(&websocket_id);
     state.websocket_to_process.remove(&websocket_id);
 
-    // Capture sessions for this WebSocket and remove mappings
-    let mut sessions_for_websocket = Vec::new();
-    for entry in state.session_to_websocket.iter() {
-        if *entry.value() == websocket_id {
-            if let Some(session) = state.sessions.get(entry.key()) {
-                sessions_for_websocket.push((
-                    entry.key().clone(),
-                    session.cancel_counter.load(Ordering::Relaxed),
-                ));
-            }
-        }
-    }
+    // Capture sessions for this WebSocket and remove mappings.
+    // We first collect all session IDs that map to this websocket, then look up
+    // their state separately. This is important because the process exit handler
+    // might have already removed sessions from state.sessions, but we still need
+    // to clean up session_to_websocket.
+    let session_ids_for_websocket: Vec<SessionId> = state
+        .session_to_websocket
+        .iter()
+        .filter(|entry| *entry.value() == websocket_id)
+        .map(|entry| entry.key().clone())
+        .collect();
 
-    for (session_id, _counter) in &sessions_for_websocket {
+    // Now get the cancel counters for sessions that still exist
+    let mut sessions_for_websocket = Vec::new();
+    for session_id in &session_ids_for_websocket {
         state.session_to_websocket.remove(session_id);
+        if let Some(session) = state.sessions.get(session_id) {
+            sessions_for_websocket.push((
+                session_id.clone(),
+                session.cancel_counter.load(Ordering::Relaxed),
+            ));
+        }
     }
 
     debug!("WebSocket connection closed: {}", websocket_id);
