@@ -12,7 +12,7 @@
 //! endpoint. When receiving such a POST request, we look up the registered browsers
 //! and forward the raw MCP message to the browser. The response is routed back to the agent.
 
-use crate::phoenix::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
+use crate::phoenix::{Channel, HandleResult, JoinResult, SocketRef};
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -27,21 +27,6 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-// ============================================================================
-// Message Types
-// ============================================================================
-
-/// Message sent from background tasks to the channel's handle_info
-#[derive(Debug)]
-pub enum McpChannelInfo {
-    /// A JSON-RPC message to forward to the browser
-    JsonRpc {
-        session_id: String,
-        json_rpc_message: Value,
-        response_tx: Option<oneshot::Sender<Value>>,
-    },
-}
-
 #[derive(Deserialize)]
 pub struct McpParams {
     #[serde(rename = "sessionId")]
@@ -54,8 +39,8 @@ pub struct McpParams {
 
 #[derive(Clone)]
 pub struct McpChannelState {
-    /// Registry mapping session_id to channel sender
-    pub sessions: Arc<DashMap<String, InfoSender<McpChannelInfo>>>,
+    /// Registry mapping session_id to socket
+    pub sessions: Arc<DashMap<String, SocketRef>>,
     /// Pending responses waiting for answers from the browser
     pub awaiting_answers: Arc<DashMap<(String, Value), oneshot::Sender<Value>>>,
 }
@@ -122,10 +107,10 @@ impl Channel for McpChannel {
 
         debug!("MCP channel join for session_id: {}", session_id);
 
-        // Get info sender for forwarding messages from the HTTP handler
-        let info_sender = socket.info_sender::<McpChannelInfo>();
-        // Register this channel for the session
-        self.state.sessions.insert(session_id.clone(), info_sender);
+        // Register this channel's socket for the session
+        self.state
+            .sessions
+            .insert(session_id.clone(), socket.clone());
 
         JoinResult::ok(json!({
             "status": "registered",
@@ -169,29 +154,6 @@ impl Channel for McpChannel {
             _ => {
                 warn!("Unknown event in MCP channel: {}", event);
                 HandleResult::no_reply()
-            }
-        }
-    }
-
-    async fn handle_info(&self, message: Box<dyn std::any::Any + Send>, socket: &mut SocketRef) {
-        if let Ok(info) = message.downcast::<McpChannelInfo>() {
-            match *info {
-                McpChannelInfo::JsonRpc {
-                    session_id,
-                    json_rpc_message,
-                    response_tx,
-                } => {
-                    // If this has a response channel, store it for later
-                    if let Some(response_tx) = response_tx {
-                        if let Some(id) = json_rpc_message.get("id") {
-                            let key = (session_id.clone(), id.clone());
-                            self.state.awaiting_answers.insert(key, response_tx);
-                        }
-                    }
-
-                    // Forward the raw JSON-RPC message to the browser
-                    socket.push("mcp_message", json_rpc_message);
-                }
             }
         }
     }
@@ -254,9 +216,9 @@ pub async fn mcp_channel_client_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Look up the session in the registry
-    let session = match state.sessions.get(&session_id) {
-        Some(session) => session.clone(),
+    // Look up the session's socket in the registry
+    let socket = match state.sessions.get(&session_id) {
+        Some(socket) => socket.clone(),
         None => {
             error!("Session not found: {}", session_id);
             let error_response = json!({
@@ -272,24 +234,17 @@ pub async fn mcp_channel_client_handler(
     };
 
     // Create response channel if this is a request (has "id")
-    let (response_tx, response_rx) = if json_rpc_message.get("id").is_some() {
+    let response_rx = if let Some(id) = json_rpc_message.get("id") {
         let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
+        let key = (session_id.clone(), id.clone());
+        state.awaiting_answers.insert(key, tx);
+        Some(rx)
     } else {
-        (None, None)
+        None
     };
 
-    // Send the message to the channel
-    let info = McpChannelInfo::JsonRpc {
-        session_id: session_id.clone(),
-        json_rpc_message: json_rpc_message.clone(),
-        response_tx,
-    };
-
-    if session.send(info).is_err() {
-        error!("Failed to send message to channel");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
+    // Push the message directly to the browser
+    socket.push("mcp_message", json_rpc_message.clone());
 
     // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {

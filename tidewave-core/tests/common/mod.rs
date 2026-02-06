@@ -17,7 +17,7 @@ pub fn create_fake_phoenix_socket() -> (
 
 /// Send a Phoenix message
 pub fn send_phoenix_msg(tx: &futures_mpsc::UnboundedSender<Result<String, ()>>, msg: &PhxMessage) {
-    tx.unbounded_send(Ok(msg.encode())).unwrap();
+    tx.unbounded_send(Ok(msg.clone().encode())).unwrap();
 }
 
 /// Receive the next Phoenix message (no timeout, no filtering)

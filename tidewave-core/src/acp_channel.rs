@@ -112,7 +112,7 @@ JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forw
 any requests to the new connection.
 */
 use crate::command::{create_shell_command, spawn_command, ChildProcess};
-use crate::phoenix::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
+use crate::phoenix::{Channel, HandleResult, JoinResult, SocketRef};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
@@ -267,19 +267,6 @@ pub type ProcessStarterFn = Arc<
 >;
 
 // ============================================================================
-// Channel Info Message Type
-// ============================================================================
-
-/// Message sent from background tasks to the channel's handle_info
-#[derive(Debug)]
-pub enum AcpChannelInfo {
-    /// A JSON-RPC message from the ACP process
-    JsonRpc(JsonRpcMessage),
-    /// Agent exit event
-    AgentExit(TidewaveExitParams),
-}
-
-// ============================================================================
 // Server State Types
 // ============================================================================
 
@@ -292,8 +279,8 @@ pub type NotificationId = String;
 pub struct AcpChannelState {
     /// Active ACP processes (process_key -> process_state)
     pub processes: Arc<DashMap<ProcessKey, Arc<ProcessState>>>,
-    /// Channel senders (channel_id -> info_sender)
-    pub channel_senders: Arc<DashMap<ChannelId, InfoSender<AcpChannelInfo>>>,
+    /// Channel senders (channel_id -> socket)
+    pub channel_senders: Arc<DashMap<ChannelId, SocketRef>>,
     /// Sessions (session_id -> session_state)
     pub sessions: Arc<DashMap<SessionId, Arc<SessionState>>>,
     /// Session to Channel mapping (session_id -> channel_id)
@@ -518,6 +505,24 @@ impl SessionState {
 }
 
 // ============================================================================
+// Push Helpers
+// ============================================================================
+
+fn push_jsonrpc(socket: &SocketRef, message: &JsonRpcMessage) {
+    match serde_json::to_value(message) {
+        Ok(payload) => socket.push("jsonrpc", payload),
+        Err(e) => error!("Failed to serialize JSON-RPC message: {}", e),
+    }
+}
+
+fn push_agent_exit(socket: &SocketRef, exit_params: &TidewaveExitParams) {
+    match serde_json::to_value(exit_params) {
+        Ok(payload) => socket.push("agent_exit", payload),
+        Err(e) => error!("Failed to serialize agent exit params: {}", e),
+    }
+}
+
+// ============================================================================
 // Phoenix Channel Implementation
 // ============================================================================
 
@@ -564,13 +569,10 @@ impl Channel for AcpChannel {
             acp_id, channel_id
         );
 
-        // Get info sender for forwarding messages from the ACP process
-        let info_sender = socket.info_sender::<AcpChannelInfo>();
-
-        // Store the info sender for this channel
+        // Store the socket for this channel
         self.state
             .channel_senders
-            .insert(channel_id, info_sender.clone());
+            .insert(channel_id, socket.clone());
 
         // Parse spawn options from join payload
         let spawn_opts: TidewaveSpawnOptions = match serde_json::from_value(payload) {
@@ -673,33 +675,6 @@ impl Channel for AcpChannel {
             _ => {
                 warn!("Unknown event in ACP channel: {}", event);
                 HandleResult::no_reply()
-            }
-        }
-    }
-
-    async fn handle_info(&self, message: Box<dyn std::any::Any + Send>, socket: &mut SocketRef) {
-        if let Ok(info) = message.downcast::<AcpChannelInfo>() {
-            match *info {
-                AcpChannelInfo::JsonRpc(json_rpc) => {
-                    let payload = match serde_json::to_value(&json_rpc) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to serialize JSON-RPC message: {}", e);
-                            return;
-                        }
-                    };
-                    socket.push("jsonrpc", payload);
-                }
-                AcpChannelInfo::AgentExit(exit_params) => {
-                    let payload = match serde_json::to_value(&exit_params) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to serialize agent exit params: {}", e);
-                            return;
-                        }
-                    };
-                    socket.push("agent_exit", payload);
-                }
             }
         }
     }
@@ -906,7 +881,7 @@ impl AcpChannel {
 
         let was_cancelled = session_state.cancelled.swap(false, Ordering::SeqCst);
 
-        if let Some(sender) = self.state.channel_senders.get(&channel_id) {
+        if let Some(socket) = self.state.channel_senders.get(&channel_id) {
             // Map channel to process (needed for any requests during catchup)
             self.state
                 .channel_to_process
@@ -923,9 +898,9 @@ impl AcpChannel {
                     SessionState::get_buffered_messages_after(&buffer, &params.latest_id);
 
                 // Stream buffered messages while holding the lock
-                // This is safe because sender.send() is non-blocking (unbounded channel)
+                // This is safe because socket.push() is non-blocking (unbounded channel)
                 for buffered in buffered_messages {
-                    let _ = sender.send(AcpChannelInfo::JsonRpc(buffered.message));
+                    push_jsonrpc(&socket, &buffered.message);
                 }
 
                 // NOW register the session mapping while still holding the lock
@@ -946,9 +921,7 @@ impl AcpChannel {
                 error: None,
             };
 
-            let _ = sender.send(AcpChannelInfo::JsonRpc(JsonRpcMessage::Response(
-                success_response,
-            )));
+            push_jsonrpc(&socket, &JsonRpcMessage::Response(success_response));
         }
 
         Ok(())
@@ -1358,8 +1331,8 @@ impl AcpChannel {
                     stderr: stderr.clone(),
                 };
 
-                if let Some(sender) = state_exit.channel_senders.get(&channel_id) {
-                    let _ = sender.send(AcpChannelInfo::AgentExit(exit_params));
+                if let Some(socket) = state_exit.channel_senders.get(&channel_id) {
+                    push_agent_exit(&socket, &exit_params);
                 }
             }
 
@@ -1391,8 +1364,8 @@ impl AcpChannel {
     // ============================================================================
 
     fn send_to_channel(&self, channel_id: ChannelId, message: JsonRpcMessage) {
-        if let Some(sender) = self.state.channel_senders.get(&channel_id) {
-            let _ = sender.send(AcpChannelInfo::JsonRpc(message));
+        if let Some(socket) = self.state.channel_senders.get(&channel_id) {
+            push_jsonrpc(&socket, &message);
         }
     }
 
@@ -1426,8 +1399,8 @@ impl AcpChannel {
             stderr,
         };
 
-        if let Some(sender) = self.state.channel_senders.get(&channel_id) {
-            let _ = sender.send(AcpChannelInfo::AgentExit(exit_params));
+        if let Some(socket) = self.state.channel_senders.get(&channel_id) {
+            push_agent_exit(&socket, &exit_params);
         }
     }
 
@@ -1534,10 +1507,8 @@ async fn handle_process_response(
         )
         .await;
 
-        if let Some(sender) = state.channel_senders.get(&channel_id) {
-            let _ = sender.send(AcpChannelInfo::JsonRpc(JsonRpcMessage::Response(
-                client_response,
-            )));
+        if let Some(socket) = state.channel_senders.get(&channel_id) {
+            push_jsonrpc(&socket, &JsonRpcMessage::Response(client_response));
         } else {
             handle_disconnected_client_response(process_state, state, response).await;
         }
@@ -1584,10 +1555,8 @@ async fn maybe_handle_session_load_resume(
             info!("Failed to load session, removing mapping! {}", session_id);
             state.sessions.remove(&session_id);
             state.session_to_channel.remove(&session_id);
-            if let Some(sender) = state.channel_senders.get(&channel_id) {
-                let _ = sender.send(AcpChannelInfo::JsonRpc(JsonRpcMessage::Response(
-                    client_response.clone(),
-                )));
+            if let Some(socket) = state.channel_senders.get(&channel_id) {
+                push_jsonrpc(&socket, &JsonRpcMessage::Response(client_response.clone()));
             }
             return Err(anyhow!(
                 "Failed to load session, removing mapping! {}",
@@ -1669,10 +1638,8 @@ async fn handle_disconnected_client_response(
 
         if let Some(current_channel_id) = state.session_to_channel.get(&session_id) {
             let current_channel_id = *current_channel_id;
-            if let Some(sender) = state.channel_senders.get(&current_channel_id) {
-                let _ = sender.send(AcpChannelInfo::JsonRpc(JsonRpcMessage::Response(
-                    client_response,
-                )));
+            if let Some(socket) = state.channel_senders.get(&current_channel_id) {
+                push_jsonrpc(&socket, &JsonRpcMessage::Response(client_response));
             }
         } else {
             // Client disconnected, buffer response
@@ -1724,8 +1691,8 @@ async fn handle_process_notification_or_request(
 
             // Route to appropriate WebSocket based on session_id
             if let Some(channel_id) = state.session_to_channel.get(&session_id) {
-                if let Some(sender) = state.channel_senders.get(&channel_id) {
-                    let _ = sender.send(AcpChannelInfo::JsonRpc(routed_message));
+                if let Some(socket) = state.channel_senders.get(&channel_id) {
+                    push_jsonrpc(&socket, &routed_message);
                 }
             }
         } else {

@@ -30,6 +30,24 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::phoenix::{Channel, HandleResult, JoinResult, SocketRef};
+
+fn push_watch_event(socket: &SocketRef, event: &WatchEvent) {
+    match event {
+        WatchEvent::Created { path } => socket.push("created", json!({ "path": path })),
+        WatchEvent::Modified { path } => socket.push("modified", json!({ "path": path })),
+        WatchEvent::Deleted { path } => socket.push("deleted", json!({ "path": path })),
+        WatchEvent::Renamed { from, to } => {
+            socket.push("renamed", json!({ "from": from, "to": to }))
+        }
+        WatchEvent::Warning { message } => socket.push("warning", json!({ "message": message })),
+        WatchEvent::Stopped { error } => {
+            socket.push(
+                "error",
+                json!({ "reason": error.as_deref().unwrap_or("stopped") }),
+            );
+        }
+    }
+}
 use crate::utils::normalize_path;
 
 // ============================================================================
@@ -207,11 +225,11 @@ impl Channel for WatchChannel {
 
         // Subscribe this socket to the watch events
         let mut rx = active_watch.tx.subscribe();
-        let socket_sender = socket.info_sender::<WatchEvent>();
-        let shutdown = socket.shutdown_token();
+        let socket = socket.clone();
 
         // Spawn task to forward events to this socket
         tokio::spawn(async move {
+            let shutdown = socket.shutdown_token();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
@@ -221,15 +239,13 @@ impl Channel for WatchChannel {
                         match result {
                             Ok(event) => {
                                 let is_stopped = matches!(&event, WatchEvent::Stopped { .. });
-                                let _ = socket_sender.send(event);
+                                push_watch_event(&socket, &event);
                                 if is_stopped {
                                     break;
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                let _ = socket_sender.send(WatchEvent::Stopped {
-                                    error: Some("watcher closed".to_string()),
-                                });
+                                socket.push("error", json!({ "reason": "watcher closed" }));
                                 break;
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -296,35 +312,6 @@ impl Channel for WatchChannel {
     ) -> HandleResult {
         // No client->server events needed for watch
         HandleResult::no_reply()
-    }
-
-    async fn handle_info(&self, message: Box<dyn std::any::Any + Send>, socket: &mut SocketRef) {
-        // Downcast to our expected type
-        if let Ok(event) = message.downcast::<WatchEvent>() {
-            match *event {
-                WatchEvent::Created { path } => {
-                    socket.push("created", json!({ "path": path }));
-                }
-                WatchEvent::Modified { path } => {
-                    socket.push("modified", json!({ "path": path }));
-                }
-                WatchEvent::Deleted { path } => {
-                    socket.push("deleted", json!({ "path": path }));
-                }
-                WatchEvent::Renamed { from, to } => {
-                    socket.push("renamed", json!({ "from": from, "to": to }));
-                }
-                WatchEvent::Warning { message } => {
-                    socket.push("warning", json!({ "message": message }));
-                }
-                WatchEvent::Stopped { error } => {
-                    socket.push(
-                        "error",
-                        json!({ "reason": error.unwrap_or_else(|| "stopped".to_string()) }),
-                    );
-                }
-            }
-        }
     }
 
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
