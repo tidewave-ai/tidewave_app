@@ -1,7 +1,10 @@
+use crate::channels::acp_channel::AcpChannelState;
+use crate::channels::mcp_channel::{mcp_channel_client_handler, McpChannelState};
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use crate::utils::{load_tls_config_from_paths, normalize_path};
+
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -269,8 +272,6 @@ async fn serve_http_server_inner(
     };
 
     let https_port = config.https_port;
-    let mcp_state = crate::mcp_remote::McpRemoteState::new();
-    let acp_state = crate::acp_proxy::AcpProxyState::new();
     let download_state = DownloadState::new();
 
     // Build allowed origins for both HTTP and HTTPS
@@ -290,23 +291,6 @@ async fn serve_http_server_inner(
         https_port,
     };
 
-    // Create the MCP routes that need state
-    let mcp_routes = Router::new()
-        .route(
-            "/acp/mcp-remote",
-            get(crate::mcp_remote::mcp_remote_ws_handler),
-        )
-        .route(
-            "/acp/mcp-remote-client",
-            post(crate::mcp_remote::mcp_remote_client_handler),
-        )
-        .with_state(mcp_state);
-
-    // Create ACP routes
-    let acp_routes = Router::new()
-        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state.clone());
-
     // Create download routes
     let client_for_download = client.clone();
     let download_routes = Router::new()
@@ -319,11 +303,23 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create WebSocket routes
-    let ws_state = crate::ws::WsState::new();
-    let ws_routes = Router::new()
-        .route("/ws", get(crate::ws::ws_handler))
-        .with_state(ws_state.clone());
+    // Create Phoenix WebSocket routes
+    let acp_channel_state = AcpChannelState::new();
+    let mcp_channel_state = McpChannelState::new();
+
+    let phoenix_state =
+        crate::phoenix::PhoenixState::new(acp_channel_state.clone(), mcp_channel_state.clone());
+    let phoenix_routes = axum::Router::new()
+        .route(
+            "/socket/websocket",
+            axum::routing::get(crate::phoenix::ws_handler),
+        )
+        .with_state(phoenix_state);
+
+    // Create MCP channel client route (HTTP endpoint for agent requests)
+    let mcp_channel_routes = Router::new()
+        .route("/acp/mcp-remote-client", post(mcp_channel_client_handler))
+        .with_state(mcp_channel_state);
 
     // Create the main app without state
     let client_for_proxy = client.clone();
@@ -346,10 +342,9 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
-        .merge(mcp_routes)
-        .merge(acp_routes)
         .merge(download_routes)
-        .merge(ws_routes);
+        .merge(mcp_channel_routes)
+        .merge(phoenix_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -453,18 +448,15 @@ async fn serve_http_server_inner(
     // Kill all ACP processes via their exit channels.
     // Note: We use the exit_tx channel instead of directly killing, because
     // the exit monitor task holds the child write lock while waiting.
-    let acp_process_count = acp_state.processes.len();
+    let acp_process_count = acp_channel_state.processes.len();
     debug!("Found {} ACP processes to clean up", acp_process_count);
 
-    for entry in acp_state.processes.iter() {
+    for entry in acp_channel_state.processes.iter() {
         let process_state = entry.value();
         if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
             let _ = exit_tx.send(());
         }
     }
-
-    // Clear all WebSocket state
-    ws_state.clear();
 
     Ok(())
 }

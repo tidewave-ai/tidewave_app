@@ -1,11 +1,10 @@
-pub mod acp_proxy;
+pub mod channels;
 mod command;
 pub mod config;
 mod http_handlers;
-mod mcp_remote;
+pub mod phoenix;
 pub mod server;
 pub mod utils;
-pub mod ws;
 
 pub use config::{get_config_path, load_config, Config};
 pub use server::{
