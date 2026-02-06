@@ -17,9 +17,9 @@ use tracing::{info, warn};
 
 pub use tokio_util::sync::CancellationToken;
 
-use crate::acp_channel::{AcpChannel, AcpChannelState};
-use crate::mcp_channel::{McpChannel, McpChannelState};
-use crate::watch_channel::{WatchChannel, WatchChannelState};
+use crate::channels::acp_channel::{AcpChannel, AcpChannelState};
+use crate::channels::mcp_channel::{McpChannel, McpChannelState};
+use crate::channels::watch_channel::{WatchChannel, WatchChannelState};
 
 // ============================================================================
 // Message Types & Wire Format

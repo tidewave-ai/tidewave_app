@@ -1,9 +1,10 @@
-use crate::acp_channel::AcpChannelState;
+use crate::channels::acp_channel::AcpChannelState;
+use crate::channels::mcp_channel::{mcp_channel_client_handler, McpChannelState};
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::mcp_channel::{mcp_channel_client_handler, McpChannelState};
 use crate::utils::{load_tls_config_from_paths, normalize_path};
+
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -273,10 +274,6 @@ async fn serve_http_server_inner(
     let https_port = config.https_port;
     let download_state = DownloadState::new();
 
-    // Phoenix channels state
-    let acp_channel_state = AcpChannelState::new();
-    let mcp_channel_state = McpChannelState::new();
-
     // Build allowed origins for both HTTP and HTTPS
     let mut allowed_origins = config.allowed_origins.clone();
 
@@ -307,6 +304,9 @@ async fn serve_http_server_inner(
         .with_state(download_state);
 
     // Create Phoenix WebSocket routes
+    let acp_channel_state = AcpChannelState::new();
+    let mcp_channel_state = McpChannelState::new();
+
     let phoenix_state =
         crate::phoenix::PhoenixState::new(acp_channel_state.clone(), mcp_channel_state.clone());
     let phoenix_routes = axum::Router::new()

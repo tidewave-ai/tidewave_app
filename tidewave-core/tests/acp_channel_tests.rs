@@ -3,8 +3,8 @@ mod common;
 use common::{create_fake_phoenix_socket, recv_phoenix_msg, send_phoenix_msg};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tidewave_core::acp_channel::*;
-use tidewave_core::mcp_channel::McpChannelState;
+use tidewave_core::channels::acp_channel::*;
+use tidewave_core::channels::mcp_channel::McpChannelState;
 use tidewave_core::phoenix::{unit_testable_phoenix_handler, PhoenixState, PhxMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 

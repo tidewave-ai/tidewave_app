@@ -1,12 +1,10 @@
-pub mod acp_channel;
+pub mod channels;
 mod command;
 pub mod config;
 mod http_handlers;
-pub mod mcp_channel;
 pub mod phoenix;
 pub mod server;
 pub mod utils;
-pub mod watch_channel;
 
 pub use config::{get_config_path, load_config, Config};
 pub use server::{

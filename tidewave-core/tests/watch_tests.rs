@@ -2,8 +2,8 @@ mod common;
 
 use common::{create_fake_phoenix_socket, send_phoenix_msg, wait_for_event, wait_for_reply};
 use serde_json::json;
-use tidewave_core::acp_channel::AcpChannelState;
-use tidewave_core::mcp_channel::McpChannelState;
+use tidewave_core::channels::acp_channel::AcpChannelState;
+use tidewave_core::channels::mcp_channel::McpChannelState;
 use tidewave_core::phoenix::{unit_testable_phoenix_handler, PhoenixState, PhxMessage};
 
 // ============================================================================

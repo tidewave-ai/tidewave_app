@@ -24,30 +24,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::phoenix::{Channel, HandleResult, JoinResult, SocketRef};
-
-fn push_watch_event(socket: &SocketRef, event: &WatchEvent) {
-    match event {
-        WatchEvent::Created { path } => socket.push("created", json!({ "path": path })),
-        WatchEvent::Modified { path } => socket.push("modified", json!({ "path": path })),
-        WatchEvent::Deleted { path } => socket.push("deleted", json!({ "path": path })),
-        WatchEvent::Renamed { from, to } => {
-            socket.push("renamed", json!({ "from": from, "to": to }))
-        }
-        WatchEvent::Warning { message } => socket.push("warning", json!({ "message": message })),
-        WatchEvent::Stopped { error } => {
-            socket.push(
-                "error",
-                json!({ "reason": error.as_deref().unwrap_or("stopped") }),
-            );
-        }
-    }
-}
 use crate::utils::normalize_path;
 
 // ============================================================================
@@ -55,8 +36,7 @@ use crate::utils::normalize_path;
 // ============================================================================
 
 /// Watch events broadcast to all subscribers of a path
-#[derive(Serialize, Clone, Debug)]
-#[serde(tag = "event", rename_all = "lowercase")]
+#[derive(Clone, Debug)]
 pub enum WatchEvent {
     Created {
         path: String,
@@ -491,10 +471,6 @@ async fn run_watcher(
     }
 }
 
-// ============================================================================
-// Notify Event Conversion
-// ============================================================================
-
 /// Convert an absolute path to a relative path (relative to watched_path).
 /// Returns None if the path is not under watched_path.
 fn to_relative_path(absolute_path: &Path, watched_path: &str) -> Option<String> {
@@ -610,4 +586,22 @@ fn convert_notify_event(
     }
 
     results
+}
+
+fn push_watch_event(socket: &SocketRef, event: &WatchEvent) {
+    match event {
+        WatchEvent::Created { path } => socket.push("created", json!({ "path": path })),
+        WatchEvent::Modified { path } => socket.push("modified", json!({ "path": path })),
+        WatchEvent::Deleted { path } => socket.push("deleted", json!({ "path": path })),
+        WatchEvent::Renamed { from, to } => {
+            socket.push("renamed", json!({ "from": from, "to": to }))
+        }
+        WatchEvent::Warning { message } => socket.push("warning", json!({ "message": message })),
+        WatchEvent::Stopped { error } => {
+            socket.push(
+                "error",
+                json!({ "reason": error.as_deref().unwrap_or("stopped") }),
+            );
+        }
+    }
 }
