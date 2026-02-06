@@ -11,7 +11,6 @@ axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 async-stream = "0.3"
 async-trait = "0.1"
-phoenix-rs = { path = "../phoenix-rs" }
 bytes = "1.10.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }

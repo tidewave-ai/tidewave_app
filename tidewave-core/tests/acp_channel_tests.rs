@@ -1,19 +1,45 @@
-use phoenix_rs::{ChannelRegistry, TestClient};
+mod common;
+
+use common::{create_fake_phoenix_socket, recv_phoenix_msg, send_phoenix_msg};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tidewave_core::acp_channel::*;
+use tidewave_core::mcp_channel::McpChannelState;
+use tidewave_core::phoenix::{unit_testable_phoenix_handler, PhoenixState, PhxMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[tokio::test]
 async fn test_channel_init_request_flow() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
     let state = AcpChannelState::with_process_starter(starter);
+    let phoenix_state = PhoenixState::new(state, McpChannelState::new());
 
-    let mut registry = ChannelRegistry::new();
-    registry.register("acp:*", AcpChannel::with_state(state));
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
 
-    let mut client = TestClient::new(registry);
-    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
+    // Start the handler in background
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx, in_rx, phoenix_state).await;
+    });
+
+    // Join the channel
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+
+    // Wait for join reply
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.event, "phx_reply");
+    assert_eq!(reply.payload["status"], "ok");
+
+    // Wait for process to actually start
+    process_started.await.expect("Process failed to start");
 
     // Send init request via jsonrpc event
     let init_request = json!({
@@ -22,11 +48,10 @@ async fn test_channel_init_request_flow() {
         "method": "initialize",
         "params": {}
     });
-
-    channel.push("jsonrpc", init_request).await;
-
-    // Wait for process to actually start
-    process_started.await.expect("Process failed to start");
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", init_request)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
 
     // Read what the process received on stdin
     let received_request = read_json_line(&mut test_stdout).await;
@@ -45,7 +70,9 @@ async fn test_channel_init_request_flow() {
     write_json_line(&mut test_stdin, &init_response).await;
 
     // Client should receive response via jsonrpc event with original ID
-    let msg = channel.recv().await.expect("Expected response message");
+    let msg = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected response message");
     assert_eq!(msg.event, "jsonrpc");
     let response = &msg.payload;
     assert_eq!(response["id"], 1);
@@ -56,13 +83,23 @@ async fn test_channel_init_request_flow() {
 async fn test_channel_session_new_flow() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
     let state = AcpChannelState::with_process_starter(starter);
+    let phoenix_state = PhoenixState::new(state, McpChannelState::new());
 
-    let mut registry = ChannelRegistry::new();
-    registry.register("acp:*", AcpChannel::with_state(state));
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
 
-    let mut client = TestClient::new(registry);
-    // Process starts during join
-    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
+    // Start the handler
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx, in_rx, phoenix_state).await;
+    });
+
+    // Join the channel
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+
+    // Wait for join reply
+    let _ = recv_phoenix_msg(&mut out_rx).await;
 
     // Wait for process to start
     process_started.await.expect("Process failed to start");
@@ -74,8 +111,10 @@ async fn test_channel_session_new_flow() {
         "method": "initialize",
         "params": {}
     });
-
-    channel.push("jsonrpc", init_request).await;
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", init_request)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
 
     // Read and respond to init request
     let init_req = read_json_line(&mut test_stdout).await;
@@ -91,7 +130,7 @@ async fn test_channel_session_new_flow() {
     write_json_line(&mut test_stdin, &init_response).await;
 
     // Consume init response
-    let _ = channel.recv().await;
+    let _ = recv_phoenix_msg(&mut out_rx).await;
 
     // Send session/new request
     let session_new_request = json!({
@@ -103,8 +142,10 @@ async fn test_channel_session_new_flow() {
             "mcpServers": []
         }
     });
-
-    channel.push("jsonrpc", session_new_request).await;
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", session_new_request)
+        .with_ref("3")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
 
     // Read session/new from process
     let received_request = read_json_line(&mut test_stdout).await;
@@ -123,7 +164,9 @@ async fn test_channel_session_new_flow() {
     write_json_line(&mut test_stdin, &session_response).await;
 
     // Client receives response
-    let msg = channel.recv().await.expect("Expected response message");
+    let msg = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected response message");
     assert_eq!(msg.event, "jsonrpc");
     let response = &msg.payload;
     assert_eq!(response["id"], "new_123");
@@ -134,13 +177,21 @@ async fn test_channel_session_new_flow() {
 async fn test_channel_notification_forwarding() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
     let state = AcpChannelState::with_process_starter(starter);
+    let phoenix_state = PhoenixState::new(state, McpChannelState::new());
 
-    let mut registry = ChannelRegistry::new();
-    registry.register("acp:*", AcpChannel::with_state(state));
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
 
-    let mut client = TestClient::new(registry);
-    // Process starts during join
-    let mut channel = client.join("acp:test", spawn_opts()).await.unwrap();
+    // Start the handler
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx, in_rx, phoenix_state).await;
+    });
+
+    // Join the channel
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let _ = recv_phoenix_msg(&mut out_rx).await;
 
     // Wait for process to start
     process_started.await.expect("Process failed to start");
@@ -152,8 +203,10 @@ async fn test_channel_notification_forwarding() {
         "method": "initialize",
         "params": {}
     });
-
-    channel.push("jsonrpc", init_request).await;
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", init_request)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
 
     // Read init request and send response
     let init_req = read_json_line(&mut test_stdout).await;
@@ -169,7 +222,7 @@ async fn test_channel_notification_forwarding() {
     write_json_line(&mut test_stdin, &init_response).await;
 
     // Consume init response
-    let _ = channel.recv().await;
+    let _ = recv_phoenix_msg(&mut out_rx).await;
 
     // Create a session by sending session/new
     let session_new = json!({
@@ -181,8 +234,10 @@ async fn test_channel_notification_forwarding() {
             "mcpServers": []
         }
     });
-
-    channel.push("jsonrpc", session_new).await;
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", session_new)
+        .with_ref("3")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
 
     // Read session/new and respond
     let new_req = read_json_line(&mut test_stdout).await;
@@ -197,7 +252,7 @@ async fn test_channel_notification_forwarding() {
     write_json_line(&mut test_stdin, &new_response).await;
 
     // Consume session/new response
-    let _ = channel.recv().await;
+    let _ = recv_phoenix_msg(&mut out_rx).await;
 
     // Write notification from process
     let notification = json!({
@@ -211,7 +266,9 @@ async fn test_channel_notification_forwarding() {
     write_json_line(&mut test_stdin, &notification).await;
 
     // Client receives notification
-    let msg = channel.recv().await.expect("Expected notification message");
+    let msg = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected notification message");
     assert_eq!(msg.event, "jsonrpc");
     let notif = &msg.payload;
     assert_eq!(notif["method"], "session/update");
@@ -264,19 +321,37 @@ async fn test_concurrent_channel_joins() {
 
     let state = AcpChannelState::with_process_starter(starter);
 
-    // Create two clients with the same shared state
-    let mut registry1 = ChannelRegistry::new();
-    registry1.register("acp:*", AcpChannel::with_state(state.clone()));
+    // Create two phoenix handlers with the same shared state
+    let phoenix_state1 = PhoenixState::new(state.clone(), McpChannelState::new());
+    let phoenix_state2 = PhoenixState::new(state, McpChannelState::new());
 
-    let mut registry2 = ChannelRegistry::new();
-    registry2.register("acp:*", AcpChannel::with_state(state));
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
 
-    let mut client1 = TestClient::new(registry1);
-    let mut client2 = TestClient::new(registry2);
+    // Start both handlers
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx1, in_rx1, phoenix_state1).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_phoenix_handler(out_tx2, in_rx2, phoenix_state2).await;
+    });
 
-    // Create futures for both joins (not awaited yet)
-    let join1_future = client1.join("acp:test1", spawn_opts());
-    let join2_future = client2.join("acp:test2", spawn_opts());
+    // Create futures for both joins
+    let join1_future = async {
+        let join_msg = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+            .with_ref("1")
+            .with_join_ref("j1");
+        send_phoenix_msg(&in_tx1, &join_msg);
+        recv_phoenix_msg(&mut out_rx1).await
+    };
+
+    let join2_future = async {
+        let join_msg = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+            .with_ref("1")
+            .with_join_ref("j1");
+        send_phoenix_msg(&in_tx2, &join_msg);
+        recv_phoenix_msg(&mut out_rx2).await
+    };
 
     // Run both joins concurrently, plus a task to release the barrier
     let barrier_release = async {
@@ -300,11 +375,14 @@ async fn test_concurrent_channel_joins() {
     };
 
     // Run all three concurrently
-    let (result1, result2, _) = tokio::join!(join1_future, join2_future, barrier_release);
+    let (result1, result2, ()): (Option<PhxMessage>, Option<PhxMessage>, ()) =
+        tokio::join!(join1_future, join2_future, barrier_release);
 
     // Both joins should succeed
-    assert!(result1.is_ok(), "First join should succeed");
-    assert!(result2.is_ok(), "Second join should succeed");
+    assert!(result1.is_some(), "First join should succeed");
+    assert!(result2.is_some(), "Second join should succeed");
+    assert_eq!(result1.unwrap().payload["status"], "ok");
+    assert_eq!(result2.unwrap().payload["status"], "ok");
 
     // Process starter should have been called only once
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
@@ -372,10 +450,6 @@ fn create_fake_process_starter() -> (
 
     (starter, test_stdin, test_stdout, started_rx)
 }
-
-// ============================================================================
-// Test Helper Functions
-// ============================================================================
 
 /// Reads a JSON line from a stream (expects newline-terminated JSON)
 async fn read_json_line(stream: &mut DuplexStream) -> Value {

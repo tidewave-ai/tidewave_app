@@ -112,10 +112,10 @@ JSON-RPC messages and use the ACP-SDK for types. The proxy will continue to forw
 any requests to the new connection.
 */
 use crate::command::{create_shell_command, spawn_command, ChildProcess};
+use crate::phoenix::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use phoenix_rs::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -557,8 +557,7 @@ impl Channel for AcpChannel {
             }
         };
 
-        let channel_id = Uuid::new_v4();
-        socket.assign("channel_id", channel_id);
+        let channel_id = socket.unique_id;
 
         debug!(
             "ACP channel join: acp_id={}, channel_id={}",
@@ -566,14 +565,7 @@ impl Channel for AcpChannel {
         );
 
         // Get info sender for forwarding messages from the ACP process
-        let info_sender = match socket.info_sender::<AcpChannelInfo>() {
-            Some(sender) => sender,
-            None => {
-                return JoinResult::error(json!({
-                    "reason": "failed to get info sender"
-                }));
-            }
-        };
+        let info_sender = socket.info_sender::<AcpChannelInfo>();
 
         // Store the info sender for this channel
         self.state
@@ -592,7 +584,6 @@ impl Channel for AcpChannel {
 
         // Generate process key and start/reuse process
         let process_key = format!("{}:{}", &spawn_opts.command, &spawn_opts.cwd);
-        socket.assign("process_key", process_key.clone());
 
         // Acquire or create a lock for this process_key
         let lock = self
@@ -642,14 +633,7 @@ impl Channel for AcpChannel {
     }
 
     async fn handle_in(&self, event: &str, payload: Value, socket: &mut SocketRef) -> HandleResult {
-        let channel_id = match socket.get_assign::<ChannelId>("channel_id") {
-            Some(id) => *id,
-            None => {
-                return HandleResult::error(json!({
-                    "reason": "no channel_id in assigns"
-                }));
-            }
-        };
+        let channel_id = socket.unique_id;
 
         match event {
             "jsonrpc" => {
@@ -723,10 +707,7 @@ impl Channel for AcpChannel {
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
         debug!("ACP channel terminating: {}", reason);
 
-        let channel_id = match socket.get_assign::<ChannelId>("channel_id") {
-            Some(id) => *id,
-            None => return,
-        };
+        let channel_id = socket.unique_id;
 
         // Cleanup
         self.state.channel_senders.remove(&channel_id);
@@ -1907,4 +1888,620 @@ pub fn real_process_starter() -> ProcessStarterFn {
             ))
         })
     })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Helper function to create test TidewaveSpawnOptions
+    fn test_spawn_opts() -> TidewaveSpawnOptions {
+        TidewaveSpawnOptions {
+            command: "test_cmd".to_string(),
+            env: HashMap::new(),
+            cwd: ".".to_string(),
+            is_wsl: false,
+        }
+    }
+
+    // Helper function to create a test SessionState
+    fn create_test_session() -> SessionState {
+        SessionState::new("test_command:params".to_string())
+    }
+
+    // Helper function to create a test notification message
+    fn create_test_notification(method: &str, session_id: &str) -> JsonRpcMessage {
+        JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(json!({
+                "sessionId": session_id,
+                "update": "test_data"
+            })),
+        })
+    }
+
+    // Helper function to create a test response message
+    fn create_test_response(id: u64) -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(id)),
+            result: Some(json!({"status": "ok"})),
+            error: None,
+        })
+    }
+
+    // ============================================================================
+    // Basic Buffer Operations Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_generate_notification_id() {
+        let session = create_test_session();
+
+        let id1 = session.generate_notification_id();
+        let id2 = session.generate_notification_id();
+        let id3 = session.generate_notification_id();
+
+        assert_eq!(id1, "notif_1");
+        assert_eq!(id2, "notif_2");
+        assert_eq!(id3, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_add_to_buffer() {
+        let session = create_test_session();
+
+        let msg1 = create_test_notification("session/update", "sess_123");
+        let msg2 = create_test_notification("session/update", "sess_123");
+
+        let id1 = session
+            .add_to_buffer(msg1.clone(), "notif_1".to_string())
+            .await;
+        let id2 = session
+            .add_to_buffer(msg2.clone(), "notif_2".to_string())
+            .await;
+
+        assert_eq!(id1, "notif_1");
+        assert_eq!(id2, "notif_2");
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].id, "notif_1");
+        assert_eq!(buffer[1].id, "notif_2");
+    }
+
+    // ============================================================================
+    // Buffer Pruning Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_prune_buffer_basic() {
+        let session = create_test_session();
+
+        // Add three messages
+        let msg1 = create_test_notification("session/update", "sess_123");
+        let msg2 = create_test_notification("session/update", "sess_123");
+        let msg3 = create_test_notification("session/update", "sess_123");
+
+        session.add_to_buffer(msg1, "notif_1".to_string()).await;
+        session.add_to_buffer(msg2, "notif_2".to_string()).await;
+        session.add_to_buffer(msg3, "notif_3".to_string()).await;
+
+        // Prune up to and including notif_1
+        session.prune_buffer("notif_1").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].id, "notif_2");
+        assert_eq!(buffer[1].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_unknown_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Try to prune with an unknown ID (should be a no-op)
+        session.prune_buffer("notif_unknown").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer[0].id, "notif_1");
+        assert_eq!(buffer[1].id, "notif_2");
+        assert_eq!(buffer[2].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_empty() {
+        let session = create_test_session();
+
+        // Pruning an empty buffer should not panic
+        session.prune_buffer("notif_1").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_buffer_all() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Prune all messages
+        session.prune_buffer("notif_3").await;
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    // ============================================================================
+    // Buffer Retrieval Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_basic() {
+        let session = create_test_session();
+
+        // Add five messages
+        for i in 1..=5 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages after notif_2
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_2");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].id, "notif_3");
+        assert_eq!(messages[1].id, "notif_4");
+        assert_eq!(messages[2].id, "notif_5");
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_unknown_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages with unknown ID (should return all messages)
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_unknown");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].id, "notif_1");
+        assert_eq!(messages[1].id, "notif_2");
+        assert_eq!(messages[2].id, "notif_3");
+    }
+
+    #[tokio::test]
+    async fn test_get_buffered_messages_after_last_id() {
+        let session = create_test_session();
+
+        // Add three messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Get messages after the last ID (should return empty)
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_3");
+
+        assert_eq!(messages.len(), 0);
+    }
+
+    // ============================================================================
+    // Combined Operations Test
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_buffer_workflow() {
+        let session = create_test_session();
+
+        // Step 1: Add initial messages
+        for i in 1..=3 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Step 2: Client connects and gets all messages (empty latest_id)
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "");
+        drop(buffer);
+        assert_eq!(messages.len(), 3);
+
+        // Step 3: Client acknowledges up to notif_2
+        session.prune_buffer("notif_2").await;
+
+        // Step 4: Verify only notif_3 remains in buffer
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].id, "notif_3");
+        drop(buffer); // Release lock
+
+        // Step 5: Add more messages
+        for i in 4..=6 {
+            let msg = create_test_notification("session/update", "sess_123");
+            session.add_to_buffer(msg, format!("notif_{}", i)).await;
+        }
+
+        // Step 6: Client reconnects and gets messages after notif_2
+        let buffer = session.message_buffer.read().await;
+        let messages = SessionState::get_buffered_messages_after(&buffer, "notif_2");
+        drop(buffer);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].id, "notif_3");
+        assert_eq!(messages[1].id, "notif_4");
+        assert_eq!(messages[2].id, "notif_5");
+        assert_eq!(messages[3].id, "notif_6");
+
+        // Step 7: Client acknowledges all messages
+        session.prune_buffer("notif_6").await;
+
+        // Step 8: Verify buffer is empty
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_with_different_message_types() {
+        let session = create_test_session();
+
+        // Add notification
+        let notif = create_test_notification("session/update", "sess_123");
+        session.add_to_buffer(notif, "notif_1".to_string()).await;
+
+        // Add response
+        let response = create_test_response(42);
+        session.add_to_buffer(response, "notif_2".to_string()).await;
+
+        // Add another notification
+        let notif2 = create_test_notification("session/complete", "sess_123");
+        session.add_to_buffer(notif2, "notif_3".to_string()).await;
+
+        // Verify all messages are in buffer
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 3);
+
+        // Verify message types are preserved
+        match &buffer[0].message {
+            JsonRpcMessage::Notification(_) => {}
+            _ => panic!("Expected notification"),
+        }
+        match &buffer[1].message {
+            JsonRpcMessage::Response(_) => {}
+            _ => panic!("Expected response"),
+        }
+        match &buffer[2].message {
+            JsonRpcMessage::Notification(_) => {}
+            _ => panic!("Expected notification"),
+        }
+    }
+
+    // ============================================================================
+    // ProcessState ID Mapping Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_process_generate_proxy_id() {
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
+
+        let id1 = process.generate_proxy_id();
+        let id2 = process.generate_proxy_id();
+        let id3 = process.generate_proxy_id();
+
+        assert_eq!(id1, Value::Number(serde_json::Number::from(1)));
+        assert_eq!(id2, Value::Number(serde_json::Number::from(2)));
+        assert_eq!(id3, Value::Number(serde_json::Number::from(3)));
+    }
+
+    #[tokio::test]
+    async fn test_process_id_mapping_basic() {
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None);
+
+        // Should be able to resolve back
+        let resolved = process.resolve_proxy_id_to_client(&proxy_id);
+        assert!(resolved.is_some());
+        let (resolved_ws, resolved_client) = resolved.unwrap();
+        assert_eq!(resolved_ws, ws_id);
+        assert_eq!(resolved_client, client_id);
+    }
+
+    #[tokio::test]
+    async fn test_process_id_mapping_with_session() {
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+        let session_id = "sess_123".to_string();
+
+        let proxy_id =
+            process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+
+        // Should have session mapping
+        let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
+        assert!(session_mapping.is_some());
+        let (mapped_session, mapped_client) = session_mapping.unwrap().clone();
+        assert_eq!(mapped_session, session_id);
+        assert_eq!(mapped_client, client_id);
+    }
+
+    #[tokio::test]
+    async fn test_process_id_cleanup() {
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
+        let ws_id = Uuid::new_v4();
+        let client_id = Value::String("client_1".to_string());
+        let session_id = "sess_123".to_string();
+
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id));
+
+        // Verify mappings exist
+        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_some());
+        assert!(process.proxy_to_session_ids.contains_key(&proxy_id));
+
+        // Cleanup
+        process.cleanup_id_mappings(&proxy_id);
+
+        // Verify mappings are removed
+        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
+        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+    }
+
+    #[tokio::test]
+    async fn test_process_multiple_clients_same_process() {
+        let process = ProcessState::new("test_key".to_string(), test_spawn_opts());
+
+        let ws_id1 = Uuid::new_v4();
+        let ws_id2 = Uuid::new_v4();
+        let client_id1 = Value::String("1".to_string());
+        let client_id2 = Value::String("1".to_string());
+
+        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None);
+        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None);
+
+        // Should have different proxy IDs
+        assert_ne!(proxy_id1, proxy_id2);
+
+        // Both should resolve correctly
+        let (resolved_ws1, resolved_client1) =
+            process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
+        let (resolved_ws2, resolved_client2) =
+            process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+
+        assert_eq!(resolved_ws1, ws_id1);
+        assert_eq!(resolved_client1, client_id1);
+        assert_eq!(resolved_ws2, ws_id2);
+        assert_eq!(resolved_client2, client_id2);
+    }
+
+    // ============================================================================
+    // Message Extraction Tests
+    // ============================================================================
+
+    #[test]
+    fn test_extract_session_id_from_request() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            method: "session/prompt".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "prompt": "test"
+            })),
+        };
+
+        let session_id = extract_session_id_from_request(&request);
+        assert_eq!(session_id, Some("sess_123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_from_request_missing() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({
+                "protocolVersion": 1
+            })),
+        };
+
+        let session_id = extract_session_id_from_request(&request);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_from_notification() {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_456",
+                "update": "data"
+            })),
+        };
+
+        let message = JsonRpcMessage::Notification(notification);
+        let session_id = extract_session_id_from_message(&message);
+        assert_eq!(session_id, Some("sess_456".to_string()));
+    }
+
+    #[test]
+    fn test_inject_notification_id() {
+        let mut notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "update": "test"
+            })),
+        };
+
+        inject_notification_id(&mut notification, "notif_42".to_string());
+
+        let params = notification.params.unwrap();
+        let meta = params.get("_meta").unwrap();
+        let notif_id = meta.get("tidewave.ai/notificationId").unwrap();
+        assert_eq!(notif_id, "notif_42");
+    }
+
+    #[test]
+    fn test_inject_notification_id_with_existing_meta() {
+        let mut notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(json!({
+                "sessionId": "sess_123",
+                "_meta": {
+                    "existing": "value"
+                }
+            })),
+        };
+
+        inject_notification_id(&mut notification, "notif_99".to_string());
+
+        let params = notification.params.unwrap();
+        let meta = params.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "value");
+
+        // Should add notification ID
+        assert_eq!(meta.get("tidewave.ai/notificationId").unwrap(), "notif_99");
+    }
+
+    // ============================================================================
+    // Tidewave Version Injection Tests
+    // ============================================================================
+
+    #[test]
+    fn test_inject_tidewave_version() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_tidewave_version(&mut response, "0.1.0");
+
+        let result = response.result.unwrap();
+        let meta = result.get("_meta").unwrap();
+        let tidewave = meta.get("tidewave.ai").unwrap();
+
+        assert_eq!(tidewave.get("version").unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn test_inject_tidewave_version_preserves_existing_meta() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "_meta": {
+                    "existing": "metadata"
+                },
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_tidewave_version(&mut response, "0.2.0");
+
+        let result = response.result.unwrap();
+        let meta = result.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "metadata");
+
+        // Should add tidewave meta
+        let tidewave = meta.get("tidewave.ai").unwrap();
+        assert_eq!(tidewave.get("version").unwrap(), "0.2.0");
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+        let tidewave = meta.get("tidewave.ai").unwrap();
+
+        assert_eq!(tidewave.get("exit").unwrap(), true);
+    }
+
+    #[test]
+    fn test_inject_proxy_capabilities_preserves_existing_meta() {
+        let mut response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(1)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "_meta": {
+                        "existing": "metadata"
+                    }
+                }
+            })),
+            error: None,
+        };
+
+        inject_proxy_capabilities(&mut response);
+
+        let result = response.result.unwrap();
+        let agent_caps = result.get("agentCapabilities").unwrap();
+        let meta = agent_caps.get("_meta").unwrap();
+
+        // Should preserve existing meta
+        assert_eq!(meta.get("existing").unwrap(), "metadata");
+
+        // Should add tidewave meta
+        let tidewave = meta.get("tidewave.ai").unwrap();
+        assert_eq!(tidewave.get("exit").unwrap(), true);
+    }
 }

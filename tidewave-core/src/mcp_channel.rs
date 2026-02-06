@@ -12,6 +12,7 @@
 //! endpoint. When receiving such a POST request, we look up the registered browsers
 //! and forward the raw MCP message to the browser. The response is routed back to the agent.
 
+use crate::phoenix::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -20,7 +21,6 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use dashmap::DashMap;
-use phoenix_rs::{Channel, HandleResult, InfoSender, JoinResult, SocketRef};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -122,22 +122,10 @@ impl Channel for McpChannel {
 
         debug!("MCP channel join for session_id: {}", session_id);
 
-        socket.assign("session_id", session_id.clone());
-
         // Get info sender for forwarding messages from the HTTP handler
-        let info_sender = match socket.info_sender::<McpChannelInfo>() {
-            Some(sender) => sender,
-            None => {
-                return JoinResult::error(json!({
-                    "reason": "failed to get info sender"
-                }));
-            }
-        };
-
+        let info_sender = socket.info_sender::<McpChannelInfo>();
         // Register this channel for the session
         self.state.sessions.insert(session_id.clone(), info_sender);
-
-        info!("Registered MCP channel for session: {}", session_id);
 
         JoinResult::ok(json!({
             "status": "registered",
@@ -151,16 +139,8 @@ impl Channel for McpChannel {
                 // The payload is the raw JSON-RPC message
                 let json_rpc_message = payload;
 
-                // Get session_id from socket assigns (set during join)
-                let session_id = match socket.get_assign::<String>("session_id") {
-                    Some(id) => id.clone(),
-                    None => {
-                        error!("No session_id in socket assigns");
-                        return HandleResult::error(json!({
-                            "reason": "no session_id in socket assigns"
-                        }));
-                    }
-                };
+                // Parse session_id from topic "mcp:{session_id}"
+                let session_id = socket.topic.strip_prefix("mcp:").unwrap().to_string();
 
                 // Check if this is a reply to a pending request
                 if let Some(id) = json_rpc_message.get("id") {
@@ -219,10 +199,7 @@ impl Channel for McpChannel {
     async fn terminate(&self, reason: &str, socket: &mut SocketRef) {
         debug!("MCP channel terminating: {}", reason);
 
-        let session_id = match socket.get_assign::<String>("session_id") {
-            Some(id) => id.clone(),
-            None => return,
-        };
+        let session_id = socket.topic.strip_prefix("mcp:").unwrap().to_string();
 
         // Remove this session from the registry
         self.state.sessions.remove(&session_id);

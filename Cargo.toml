@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "tidewave-core",
     "tidewave-cli",
-    "src-tauri", "phoenix-rs",
+    "src-tauri",
 ]
 
 [workspace.package]

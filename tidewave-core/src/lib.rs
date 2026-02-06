@@ -3,6 +3,7 @@ mod command;
 pub mod config;
 mod http_handlers;
 pub mod mcp_channel;
+pub mod phoenix;
 pub mod server;
 pub mod utils;
 pub mod watch_channel;

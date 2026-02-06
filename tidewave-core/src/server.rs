@@ -1,8 +1,8 @@
-use crate::acp_channel::{AcpChannel, AcpChannelState};
+use crate::acp_channel::AcpChannelState;
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::mcp_channel::{mcp_channel_client_handler, McpChannel, McpChannelState};
+use crate::mcp_channel::{mcp_channel_client_handler, McpChannelState};
 use crate::utils::{load_tls_config_from_paths, normalize_path};
 use axum::{
     body::{Body, Bytes},
@@ -306,12 +306,15 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create Phoenix channels routes
-    let mut channel_registry = phoenix_rs::ChannelRegistry::new();
-    channel_registry.register("watch:*", crate::watch_channel::WatchChannel);
-    channel_registry.register("acp:*", AcpChannel::with_state(acp_channel_state.clone()));
-    channel_registry.register("mcp:*", McpChannel::with_state(mcp_channel_state.clone()));
-    let phoenix_routes = phoenix_rs::phoenix_router_at("/socket", channel_registry);
+    // Create Phoenix WebSocket routes
+    let phoenix_state =
+        crate::phoenix::PhoenixState::new(acp_channel_state.clone(), mcp_channel_state.clone());
+    let phoenix_routes = axum::Router::new()
+        .route(
+            "/socket/websocket",
+            axum::routing::get(crate::phoenix::ws_handler),
+        )
+        .with_state(phoenix_state);
 
     // Create MCP channel client route (HTTP endpoint for agent requests)
     let mcp_channel_routes = Router::new()
