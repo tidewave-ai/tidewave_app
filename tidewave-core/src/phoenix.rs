@@ -29,6 +29,7 @@ pub mod events {
     pub const PHX_JOIN: &str = "phx_join";
     pub const PHX_LEAVE: &str = "phx_leave";
     pub const PHX_REPLY: &str = "phx_reply";
+    pub const PHX_ERROR: &str = "phx_error";
     pub const PHX_CLOSE: &str = "phx_close";
     pub const HEARTBEAT: &str = "heartbeat";
 }

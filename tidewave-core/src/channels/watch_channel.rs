@@ -11,7 +11,9 @@
 //! - `deleted` - File deleted: `{"path": "relative/path"}`
 //! - `renamed` - File renamed: `{"from": "old/path", "to": "new/path"}`
 //! - `warning` - Non-fatal warning: `{"message": "..."}`
-//! - `error` - Fatal error: `{"reason": "..."}`
+//!
+//! Fatal errors (e.g., watcher failure) are sent as `phx_error` with `{"reason": "..."}` and
+//! cause the client to rejoin.
 //!
 //! Note: Event paths are relative to the watched directory.
 
@@ -221,7 +223,7 @@ impl Channel for WatchChannel {
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                socket.push("error", json!({ "reason": "watcher closed" }));
+                                socket.push(crate::phoenix::events::PHX_ERROR, json!({ "reason": "watcher closed" }));
                                 break;
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -585,7 +587,7 @@ fn push_watch_event(socket: &SocketRef, event: &WatchEvent) {
         WatchEvent::Warning { message } => socket.push("warning", json!({ "message": message })),
         WatchEvent::Stopped { error } => {
             socket.push(
-                "error",
+                crate::phoenix::events::PHX_ERROR,
                 json!({ "reason": error.as_deref().unwrap_or("stopped") }),
             );
         }
