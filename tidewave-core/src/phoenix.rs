@@ -226,15 +226,15 @@ enum SubscriptionMsg {
     },
 }
 
-/// Sent from the subscription task to the main loop when the subscription
-/// should be removed (join failed, handle_in returned Stop, etc.)
-struct RemoveSubscription {
+/// Returned by subscription tasks to signal cleanup to the main loop.
+/// The optional reply is sent by the main loop after removing the subscription.
+struct SubscriptionExit {
     topic: String,
+    reply: Option<PhxMessage>,
 }
 
 struct SubscriptionHandle {
     sender: mpsc::UnboundedSender<SubscriptionMsg>,
-    task: tokio::task::JoinHandle<()>,
 }
 
 impl SubscriptionHandle {
@@ -256,19 +256,19 @@ impl SubscriptionHandle {
 }
 
 fn spawn_subscription(
+    tasks: &mut tokio::task::JoinSet<SubscriptionExit>,
     channel: Arc<dyn Channel>,
     topic: String,
     join_ref: String,
     msg_ref: Option<String>,
     join_payload: Value,
     client_tx: mpsc::UnboundedSender<PhxMessage>,
-    remove_tx: mpsc::UnboundedSender<RemoveSubscription>,
 ) -> SubscriptionHandle {
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<SubscriptionMsg>();
     let shutdown = CancellationToken::new();
     let unique_id = uuid::Uuid::new_v4();
 
-    let task = tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut socket = SocketRef {
             topic: topic.clone(),
             join_ref: join_ref.clone(),
@@ -297,9 +297,10 @@ fn spawn_subscription(
                     event: events::PHX_REPLY.to_string(),
                     payload: serde_json::json!({ "status": "error", "response": reason }),
                 };
-                let _ = client_tx.send(reply);
-                let _ = remove_tx.send(RemoveSubscription { topic });
-                return;
+                return SubscriptionExit {
+                    topic,
+                    reply: Some(reply),
+                };
             }
         }
 
@@ -339,22 +340,23 @@ fn spawn_subscription(
                         event: events::PHX_REPLY.to_string(),
                         payload: serde_json::json!({ "status": "ok", "response": {} }),
                     };
-                    let _ = client_tx.send(reply);
-                    return;
+                    return SubscriptionExit {
+                        topic,
+                        reply: Some(reply),
+                    };
                 }
                 SubscriptionMsg::Terminate { reason } => {
                     shutdown.cancel();
                     channel.terminate(&reason, &mut socket).await;
-                    return;
+                    return SubscriptionExit { topic, reply: None };
                 }
             }
         }
+
+        SubscriptionExit { topic, reply: None }
     });
 
-    SubscriptionHandle {
-        sender: msg_tx,
-        task,
-    }
+    SubscriptionHandle { sender: msg_tx }
 }
 
 // ============================================================================
@@ -461,7 +463,7 @@ async fn handle_socket_core(
     info!(socket_id = %socket_id, "Phoenix socket connected");
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<PhxMessage>();
-    let (remove_tx, mut remove_rx) = mpsc::unbounded_channel::<RemoveSubscription>();
+    let mut tasks: tokio::task::JoinSet<SubscriptionExit> = tokio::task::JoinSet::new();
     let mut subscriptions: HashMap<String, SubscriptionHandle> = HashMap::new();
 
     // Sender task - forward from internal channel to output
@@ -527,20 +529,22 @@ async fn handle_socket_core(
                         };
 
                         let handle = spawn_subscription(
+                            &mut tasks,
                             channel,
                             topic.clone(),
                             join_ref,
                             msg.ref_,
                             msg.payload,
                             client_tx.clone(),
-                            remove_tx.clone(),
                         );
                         subscriptions.insert(topic.to_string(), handle);
                     }
                     events::PHX_LEAVE => {
                         if let Some(handle) = subscriptions.remove(&msg.topic) {
                             handle.send_leave(msg.ref_.clone());
-                            let _ = handle.task.await;
+                            // Don't await the task - it will process the leave,
+                            // send the reply via client_tx, and exit on its own.
+                            // Awaiting here would block the entire select! loop.
                         } else {
                             let _ = client_tx.send(PhxMessage::reply(
                                 &msg,
@@ -562,18 +566,28 @@ async fn handle_socket_core(
                     }
                 }
             }
-            Some(remove) = remove_rx.recv() => {
-                subscriptions.remove(&remove.topic);
+            Some(result) = tasks.join_next() => {
+                match result {
+                    Ok(exit) => {
+                        subscriptions.remove(&exit.topic);
+                        if let Some(reply) = exit.reply {
+                            let _ = client_tx.send(reply);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Subscription task panicked: {}", e);
+                    }
+                }
             }
         }
     }
 
-    // Cleanup
+    // Cleanup: signal all subscriptions to terminate, then await them
     info!(socket_id = %socket_id, "Phoenix socket disconnecting");
     for (_, handle) in subscriptions.drain() {
         handle.send_terminate("disconnect".to_string());
-        let _ = handle.task.await;
     }
+    while tasks.join_next().await.is_some() {}
     send_task.abort();
 }
 
