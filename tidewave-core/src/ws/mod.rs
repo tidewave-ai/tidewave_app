@@ -1,37 +1,40 @@
-//! WebSocket module for bidirectional communication.
+//! WebSocket module for bidirectional communication using Phoenix V2 wire format.
 //!
-//! This module provides a unified WebSocket endpoint (`/ws`) that supports
+//! This module provides a unified WebSocket endpoint (`/socket/websocket`) that supports
 //! multiple features over a single connection:
-//! - `watch`: File system watching
+//! - `watch`: File system watching (topics: `watch:<ref>`)
 //!
 //! # Protocol
 //!
-//! All messages (except ping/pong) include a `topic` field for routing:
+//! Messages use the Phoenix V2 JSON array format: `[join_ref, ref, topic, event, payload]`
 //!
 //! Client → Server:
 //! ```json
-//! {"topic": "watch", "action": "subscribe", "path": "/foo/bar", "ref": "watch1"}
-//! {"topic": "watch", "action": "unsubscribe", "ref": "watch1"}
+//! ["1", "1", "watch:watch1", "phx_join", {"path": "/foo/bar"}]
+//! ["1", "2", "watch:watch1", "phx_leave", {}]
+//! [null, "3", "phoenix", "heartbeat", {}]
 //! ```
 //!
 //! Server → Client:
 //! ```json
-//! {"topic": "watch", "event": "subscribed", "ref": "watch1"}
-//! {"topic": "watch", "event": "modified", "path": "/foo/bar/file.txt", "ref": "watch1"}
+//! ["1", "1", "watch:watch1", "phx_reply", {"status": "ok", "response": {"path": "/canonical/path"}}]
+//! ["1", null, "watch:watch1", "modified", {"path": "file.txt"}]
+//! [null, "3", "phoenix", "phx_reply", {"status": "ok", "response": {}}]
 //! ```
 
 pub mod connection;
 pub mod watch;
 
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::phoenix::PhxMessage;
+
 pub use connection::ws_handler;
-pub use watch::{WatchClientMessage, WatchEvent, WatchFeatureState};
+pub use watch::WatchFeatureState;
 
 // ============================================================================
 // Types
@@ -39,37 +42,11 @@ pub use watch::{WatchClientMessage, WatchEvent, WatchFeatureState};
 
 pub type WebSocketId = Uuid;
 
-/// Inbound message with topic-based routing (client → server)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "topic")]
-pub enum ClientMessage {
-    #[serde(rename = "watch")]
-    Watch {
-        #[serde(flatten)]
-        message: WatchClientMessage,
-    },
-}
-
-/// Outbound message types for WebSocket communication (server → client)
-#[derive(Debug, Clone)]
-pub enum WsOutboundMessage {
-    Watch(WatchEvent),
-    Pong,
-}
-
-/// Helper struct for serializing outbound messages with topic field
-#[derive(Serialize)]
-struct TopicMessage<'a, T: Serialize> {
-    topic: &'a str,
-    #[serde(flatten)]
-    inner: T,
-}
-
 /// Global WebSocket state
 #[derive(Clone, Default)]
 pub struct WsState {
     /// WebSocket connections (websocket_id → sender)
-    pub websocket_senders: Arc<DashMap<WebSocketId, UnboundedSender<WsOutboundMessage>>>,
+    pub websocket_senders: Arc<DashMap<WebSocketId, UnboundedSender<PhxMessage>>>,
     /// Watch feature state
     pub watch: WatchFeatureState,
 }

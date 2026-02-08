@@ -322,7 +322,7 @@ async fn serve_http_server_inner(
     // Create WebSocket routes
     let ws_state = crate::ws::WsState::new();
     let ws_routes = Router::new()
-        .route("/ws", get(crate::ws::ws_handler))
+        .route("/socket/websocket", get(crate::ws::ws_handler))
         .with_state(ws_state.clone());
 
     // Create the main app without state

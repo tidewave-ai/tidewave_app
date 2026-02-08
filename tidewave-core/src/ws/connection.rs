@@ -1,4 +1,4 @@
-//! WebSocket connection management.
+//! WebSocket connection management using Phoenix V2 wire format.
 
 use axum::{
     extract::{
@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{ClientMessage, TopicMessage, WebSocketId, WsOutboundMessage, WsState};
+use super::{WebSocketId, WsState};
+use crate::phoenix::{events, PhxMessage};
 
 // ============================================================================
 // WebSocket Handler
@@ -44,7 +45,7 @@ pub async fn unit_testable_ws_handler<W, R>(
     R: Stream<Item = Result<Message, axum::Error>> + Unpin + Send + 'static,
 {
     // Create channel for sending messages to this WebSocket
-    let (tx, mut rx) = mpsc::unbounded_channel::<WsOutboundMessage>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<PhxMessage>();
 
     // Register WebSocket sender and initialize empty subscriptions
     state.websocket_senders.insert(websocket_id, tx.clone());
@@ -56,12 +57,8 @@ pub async fn unit_testable_ws_handler<W, R>(
     // Task to handle outgoing messages (server → client)
     let websocket_id_tx = websocket_id;
     let tx_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            let ws_message = serialize_outbound(message);
-            let Some(ws_message) = ws_message else {
-                continue;
-            };
-
+        while let Some(phx) = rx.recv().await {
+            let ws_message = Message::Text(phx.encode().into());
             if ws_sender.send(ws_message).await.is_err() {
                 debug!("WebSocket send failed for: {}", websocket_id_tx);
                 break;
@@ -102,37 +99,32 @@ pub async fn unit_testable_ws_handler<W, R>(
 }
 
 async fn handle_incoming_message(state: &WsState, websocket_id: WebSocketId, text: &str) {
-    // Handle ping first (not namespaced)
-    if text.trim() == "ping" {
+    let msg = match PhxMessage::decode(text) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    // Handle heartbeat
+    if msg.topic == "phoenix" && msg.event == events::HEARTBEAT {
         if let Some(tx) = state.websocket_senders.get(&websocket_id) {
-            let _ = tx.send(WsOutboundMessage::Pong);
+            let _ = tx.send(PhxMessage::heartbeat_reply(&msg));
         }
         return;
     }
 
-    // Route based on topic
-    match serde_json::from_str::<ClientMessage>(text) {
-        Ok(ClientMessage::Watch { message }) => {
-            super::watch::handle_watch_message(state, websocket_id, message).await;
+    let reply = if msg.topic.starts_with("watch:") {
+        match msg.event.as_str() {
+            events::PHX_JOIN => Some(super::watch::handle_join(state, websocket_id, &msg).await),
+            events::PHX_LEAVE => Some(super::watch::handle_leave(state, websocket_id, &msg).await),
+            _ => None,
         }
-        Err(_) => {
-            // Unknown message format - ignore
-        }
-    }
-}
+    } else {
+        None
+    };
 
-fn serialize_outbound(message: WsOutboundMessage) -> Option<Message> {
-    match message {
-        WsOutboundMessage::Watch(event) => {
-            let msg = TopicMessage {
-                topic: "watch",
-                inner: event,
-            };
-            match serde_json::to_string(&msg) {
-                Ok(json_str) => Some(Message::Text(format!("{}\n", json_str).into())),
-                Err(_) => None,
-            }
+    if let Some(reply) = reply {
+        if let Some(tx) = state.websocket_senders.get(&websocket_id) {
+            let _ = tx.send(reply);
         }
-        WsOutboundMessage::Pong => Some(Message::Text("pong".into())),
     }
 }
