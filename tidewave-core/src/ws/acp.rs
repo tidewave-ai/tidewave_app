@@ -698,7 +698,7 @@ pub async fn init(
         }
     }
 
-    // Cleanup (equivalent to old terminate)
+    // Cleanup
     debug!("ACP channel terminating for channel_id: {}", channel_id);
 
     state.channel_senders.remove(&channel_id);
