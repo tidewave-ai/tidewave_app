@@ -192,6 +192,22 @@ async fn handle_incoming_message(
     }
 }
 
+/// Handles the result of a channel init: sends `phx_close` on success, `phx_reply` error on failure.
+fn reply_init(
+    result: Result<(), String>,
+    msg: PhxMessage,
+    outgoing_tx: &UnboundedSender<PhxMessage>,
+) {
+    match result {
+        Ok(()) => {
+            let _ = outgoing_tx.send(PhxMessage::close(msg.topic, msg.join_ref));
+        }
+        Err(reason) => {
+            let _ = outgoing_tx.send(PhxMessage::error(msg.topic, msg.join_ref, reason));
+        }
+    }
+}
+
 /// Dispatch a phx_join to the appropriate channel handler based on topic prefix.
 /// Spawns the channel handler task and returns its JoinHandle, or None for unknown topics.
 fn dispatch_join(
@@ -203,14 +219,11 @@ fn dispatch_join(
     if msg.topic.starts_with("watch:") {
         let watch_state = state.watch.clone();
         Some(tokio::spawn(async move {
-            match super::watch::init(&watch_state, &msg, outgoing_tx.clone(), incoming_rx).await {
-                Ok(()) => {
-                    let _ = outgoing_tx.send(PhxMessage::close(msg.topic, msg.join_ref));
-                }
-                Err(reason) => {
-                    let _ = outgoing_tx.send(PhxMessage::error(msg.topic, msg.join_ref, reason));
-                }
-            }
+            reply_init(
+                super::watch::init(&watch_state, &msg, outgoing_tx.clone(), incoming_rx).await,
+                msg,
+                &outgoing_tx,
+            );
         }))
     } else {
         let _ = outgoing_tx.send(PhxMessage::error(msg.topic, msg.join_ref, "unknown topic"));
