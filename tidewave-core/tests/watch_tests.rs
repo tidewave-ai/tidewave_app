@@ -1,77 +1,12 @@
+mod common;
+use common::{create_fake_phoenix_socket, send_phoenix_msg, wait_for_event, wait_for_reply};
+
 use futures::channel::mpsc as futures_mpsc;
-use futures::StreamExt;
 use serde_json::json;
 use std::time::Duration;
 use tidewave_core::phoenix::{events, PhxMessage};
 use tidewave_core::ws::connection::unit_testable_ws_handler;
 use tidewave_core::ws::WsState;
-
-// ============================================================================
-// Test Helpers
-// ============================================================================
-
-/// Creates fake WebSocket streams for testing
-fn create_fake_websocket() -> (
-    futures_mpsc::UnboundedSender<axum::extract::ws::Message>,
-    futures_mpsc::UnboundedReceiver<axum::extract::ws::Message>,
-    futures_mpsc::UnboundedSender<Result<axum::extract::ws::Message, axum::Error>>,
-    futures_mpsc::UnboundedReceiver<Result<axum::extract::ws::Message, axum::Error>>,
-) {
-    let (ws_sender_tx, ws_sender_rx) = futures_mpsc::unbounded();
-    let (ws_receiver_tx, ws_receiver_rx) = futures_mpsc::unbounded();
-    (ws_sender_tx, ws_sender_rx, ws_receiver_tx, ws_receiver_rx)
-}
-
-fn send_phx(
-    tx: &futures_mpsc::UnboundedSender<Result<axum::extract::ws::Message, axum::Error>>,
-    msg: PhxMessage,
-) {
-    tx.unbounded_send(Ok(axum::extract::ws::Message::Text(msg.encode().into())))
-        .unwrap();
-}
-
-fn parse_phx(msg: axum::extract::ws::Message) -> Option<PhxMessage> {
-    match msg {
-        axum::extract::ws::Message::Text(text) => PhxMessage::decode(&text).ok(),
-        _ => None,
-    }
-}
-
-/// Wait for a Phoenix message with a specific event type
-async fn wait_for_phx_event(
-    rx: &mut futures_mpsc::UnboundedReceiver<axum::extract::ws::Message>,
-    event_type: &str,
-    timeout_ms: u64,
-) -> Option<PhxMessage> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-
-        match tokio::time::timeout(remaining, rx.next()).await {
-            Ok(Some(msg)) => {
-                if let Some(phx) = parse_phx(msg) {
-                    if phx.event == event_type {
-                        return Some(phx);
-                    }
-                }
-            }
-            Ok(None) => return None,
-            Err(_) => return None,
-        }
-    }
-}
-
-/// Wait for a phx_reply message
-async fn wait_for_reply(
-    rx: &mut futures_mpsc::UnboundedReceiver<axum::extract::ws::Message>,
-    timeout_ms: u64,
-) -> Option<PhxMessage> {
-    wait_for_phx_event(rx, events::PHX_REPLY, timeout_ms).await
-}
 
 /// Send a phx_join for a watch topic and wait for the reply
 async fn join_watch(
@@ -80,9 +15,9 @@ async fn join_watch(
     reference: &str,
     path: &str,
 ) -> PhxMessage {
-    send_phx(
+    send_phoenix_msg(
         ws_in_tx,
-        PhxMessage::new(
+        &PhxMessage::new(
             format!("watch:{}", reference),
             events::PHX_JOIN,
             json!({"path": path}),
@@ -102,7 +37,7 @@ async fn join_watch(
 #[tokio::test]
 async fn test_watch_subscribe_success() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory for watching
@@ -124,7 +59,7 @@ async fn test_watch_subscribe_success() {
 #[tokio::test]
 async fn test_watch_subscribe_relative_path_error() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Start the handler in background
@@ -144,7 +79,7 @@ async fn test_watch_subscribe_relative_path_error() {
 #[tokio::test]
 async fn test_watch_subscribe_nonexistent_path_error() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Start the handler in background
@@ -171,7 +106,7 @@ async fn test_watch_subscribe_nonexistent_path_error() {
 #[tokio::test]
 async fn test_watch_file_created() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory for watching
@@ -195,7 +130,7 @@ async fn test_watch_file_created() {
     tokio::fs::write(&file_path, "hello").await.unwrap();
 
     // Should receive created event as Phoenix push
-    let event = wait_for_phx_event(&mut ws_out_rx, "created", 2000).await;
+    let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:mywatch");
@@ -205,7 +140,7 @@ async fn test_watch_file_created() {
 #[tokio::test]
 async fn test_watch_file_modified() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory and file
@@ -235,7 +170,7 @@ async fn test_watch_file_modified() {
         .unwrap();
 
     // Should receive modified event with relative path
-    let event = wait_for_phx_event(&mut ws_out_rx, "modified", 2000).await;
+    let event = wait_for_event(&mut ws_out_rx, "modified", 2000).await;
     assert!(event.is_some(), "Expected modified event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:modwatch");
@@ -245,7 +180,7 @@ async fn test_watch_file_modified() {
 #[tokio::test]
 async fn test_watch_file_deleted() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory and file
@@ -270,7 +205,7 @@ async fn test_watch_file_deleted() {
     tokio::fs::remove_file(&file_path).await.unwrap();
 
     // Should receive deleted event with relative path
-    let event = wait_for_phx_event(&mut ws_out_rx, "deleted", 2000).await;
+    let event = wait_for_event(&mut ws_out_rx, "deleted", 2000).await;
     assert!(event.is_some(), "Expected deleted event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:delwatch");
@@ -283,7 +218,7 @@ async fn test_watch_file_deleted() {
 #[tokio::test]
 async fn test_watch_unsubscribe() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory
@@ -300,9 +235,9 @@ async fn test_watch_unsubscribe() {
     assert_eq!(reply.payload["status"], "ok");
 
     // Leave
-    send_phx(
+    send_phoenix_msg(
         &ws_in_tx,
-        PhxMessage::new("watch:unsub_test", events::PHX_LEAVE, json!({})).with_ref("2"),
+        &PhxMessage::new("watch:unsub_test", events::PHX_LEAVE, json!({})).with_ref("2"),
     );
 
     let reply = wait_for_reply(&mut ws_out_rx, 1000).await;
@@ -315,7 +250,7 @@ async fn test_watch_unsubscribe() {
 #[tokio::test]
 async fn test_watch_heartbeat() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Start the handler in background
@@ -324,9 +259,9 @@ async fn test_watch_heartbeat() {
     });
 
     // Send heartbeat
-    send_phx(
+    send_phoenix_msg(
         &ws_in_tx,
-        PhxMessage::new("phoenix", events::HEARTBEAT, json!({})).with_ref("3"),
+        &PhxMessage::new("phoenix", events::HEARTBEAT, json!({})).with_ref("3"),
     );
 
     let reply = wait_for_reply(&mut ws_out_rx, 1000).await;
@@ -346,8 +281,8 @@ async fn test_watch_concurrent_subscribers() {
     let watch_path = temp_dir.path().to_string_lossy().to_string();
 
     // Create two websocket connections
-    let (ws1_out_tx, mut ws1_out_rx, ws1_in_tx, ws1_in_rx) = create_fake_websocket();
-    let (ws2_out_tx, mut ws2_out_rx, ws2_in_tx, ws2_in_rx) = create_fake_websocket();
+    let (ws1_out_tx, mut ws1_out_rx, ws1_in_tx, ws1_in_rx) = create_fake_phoenix_socket();
+    let (ws2_out_tx, mut ws2_out_rx, ws2_in_tx, ws2_in_rx) = create_fake_phoenix_socket();
 
     let websocket_id1 = uuid::Uuid::new_v4();
     let websocket_id2 = uuid::Uuid::new_v4();
@@ -377,8 +312,8 @@ async fn test_watch_concurrent_subscribers() {
     tokio::fs::write(&file_path, "content").await.unwrap();
 
     // Both should receive the created event on their respective topics
-    let event1 = wait_for_phx_event(&mut ws1_out_rx, "created", 2000).await;
-    let event2 = wait_for_phx_event(&mut ws2_out_rx, "created", 2000).await;
+    let event1 = wait_for_event(&mut ws1_out_rx, "created", 2000).await;
+    let event2 = wait_for_event(&mut ws2_out_rx, "created", 2000).await;
 
     assert!(event1.is_some(), "WebSocket 1 should receive created event");
     assert!(event2.is_some(), "WebSocket 2 should receive created event");
@@ -389,7 +324,7 @@ async fn test_watch_concurrent_subscribers() {
 #[tokio::test]
 async fn test_watch_subdirectory_events() {
     let state = WsState::new();
-    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_websocket();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
     let websocket_id = uuid::Uuid::new_v4();
 
     // Create a temp directory with subdirectory
@@ -418,7 +353,7 @@ async fn test_watch_subdirectory_events() {
         .unwrap();
 
     // Should receive created event for nested file with relative path (recursive watching)
-    let event = wait_for_phx_event(&mut ws_out_rx, "created", 2000).await;
+    let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event for nested file");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:recursive_watch");
