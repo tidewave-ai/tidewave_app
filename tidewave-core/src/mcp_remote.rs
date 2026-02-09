@@ -1,3 +1,5 @@
+// TODO: delete for 0.4.0 release
+
 /// The idea behind the MCP-Remote socket is to provide a kind of "reverse proxy"
 /// for ACP agents to connect to the Tidewave Web tools (browser_eval, restart_app_server).
 ///

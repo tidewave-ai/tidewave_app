@@ -291,6 +291,7 @@ async fn serve_http_server_inner(
     };
 
     // Create the MCP routes that need state
+    // TODO: remove on 0.4.0
     let mcp_routes = Router::new()
         .route(
             "/acp/mcp-remote",
@@ -303,6 +304,7 @@ async fn serve_http_server_inner(
         .with_state(mcp_state);
 
     // Create ACP routes
+    // TODO: remove on 0.4.0
     let acp_routes = Router::new()
         .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
         .with_state(acp_state.clone());
@@ -319,8 +321,20 @@ async fn serve_http_server_inner(
         )
         .with_state(download_state);
 
-    // Create WebSocket routes
-    let ws_state = crate::ws::WsState::new();
+    // Create WebSocket channel states and routes
+    let acp_channel_state = crate::ws::acp::AcpChannelState::new();
+    let mcp_channel_state = crate::ws::mcp::McpChannelState::new();
+    let ws_state = crate::ws::WsState::new()
+        .with_acp_state(acp_channel_state)
+        .with_mcp_state(mcp_channel_state);
+
+    let mcp_channel_post_routes = Router::new()
+        .route(
+            "/socket/mcp-remote-client",
+            post(crate::ws::mcp::mcp_channel_client_handler),
+        )
+        .with_state(ws_state.mcp.clone());
+
     let ws_routes = Router::new()
         .route("/socket/websocket", get(crate::ws::ws_handler))
         .with_state(ws_state.clone());
@@ -346,10 +360,11 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
-        .merge(mcp_routes)
-        .merge(acp_routes)
+        .merge(mcp_routes) // TODO: remove on 0.4.0
+        .merge(acp_routes) // TODO: remove on 0.4.0
         .merge(download_routes)
-        .merge(ws_routes);
+        .merge(ws_routes)
+        .merge(mcp_channel_post_routes);
 
     // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
     // TIDEWAVE_CLIENT_URL is set
@@ -450,6 +465,7 @@ async fn serve_http_server_inner(
     }
     http_result??;
 
+    // TODO: remove on 0.4.0 since ACP cleanup is handled in ws_state.clear()
     // Kill all ACP processes via their exit channels.
     // Note: We use the exit_tx channel instead of directly killing, because
     // the exit monitor task holds the child write lock while waiting.
@@ -463,8 +479,8 @@ async fn serve_http_server_inner(
         }
     }
 
-    // Clear all WebSocket state
-    ws_state.clear();
+    // Clear all WebSocket state (includes ACP channel process cleanup)
+    ws_state.clear().await;
 
     Ok(())
 }
