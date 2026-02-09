@@ -25,13 +25,8 @@
 pub mod connection;
 pub mod watch;
 
-use dashmap::DashMap;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
-
-use crate::phoenix::PhxMessage;
 
 pub use connection::ws_handler;
 pub use watch::WatchFeatureState;
@@ -45,8 +40,6 @@ pub type WebSocketId = Uuid;
 /// Global WebSocket state
 #[derive(Clone, Default)]
 pub struct WsState {
-    /// WebSocket connections (websocket_id → sender)
-    pub websocket_senders: Arc<DashMap<WebSocketId, UnboundedSender<PhxMessage>>>,
     /// Watch feature state
     pub watch: WatchFeatureState,
 }
@@ -54,7 +47,6 @@ pub struct WsState {
 impl WsState {
     pub fn new() -> Self {
         Self {
-            websocket_senders: Arc::new(DashMap::new()),
             watch: WatchFeatureState::new(),
         }
     }

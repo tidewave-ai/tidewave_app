@@ -11,7 +11,6 @@ use dashmap::DashMap;
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,13 +18,13 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tracing::{debug, warn};
 
 use crate::phoenix::PhxMessage;
 use crate::utils::normalize_path;
 
-use super::{WebSocketId, WsState};
+use super::WsState;
 
 // ============================================================================
 // Types
@@ -99,15 +98,12 @@ pub struct ActiveWatch {
 pub struct WatchFeatureState {
     /// Active watchers (canonical_path → active_watch)
     pub watchers: Arc<DashMap<String, Arc<ActiveWatch>>>,
-    /// Subscriptions per WebSocket (websocket_id → (topic → canonical_path))
-    pub subscriptions: Arc<DashMap<WebSocketId, HashMap<String, String>>>,
 }
 
 impl WatchFeatureState {
     pub fn new() -> Self {
         Self {
             watchers: Arc::new(DashMap::new()),
-            subscriptions: Arc::new(DashMap::new()),
         }
     }
 }
@@ -124,53 +120,58 @@ struct JoinPayload {
 }
 
 /// Handle a phx_join on a `watch:<ref>` topic.
+///
+/// Returns the reply message and an optional sender for forwarding incoming
+/// messages to this channel. The connection stores the sender per topic and
+/// drops it on leave/disconnect to signal cleanup.
 pub async fn handle_join(
     state: &WsState,
-    websocket_id: WebSocketId,
     msg: &PhxMessage,
-) -> PhxMessage {
+    outgoing_tx: UnboundedSender<PhxMessage>,
+) -> (PhxMessage, Option<UnboundedSender<PhxMessage>>) {
     let payload: JoinPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            return PhxMessage::reply(msg, "error", serde_json::json!({ "reason": e.to_string() }));
+            return (
+                PhxMessage::reply(msg, "error", serde_json::json!({ "reason": e.to_string() })),
+                None,
+            );
         }
     };
 
+    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<PhxMessage>();
+
     match handle_subscribe(
         state,
-        websocket_id,
         &payload.path,
         payload.is_wsl,
         msg.topic.clone(),
         msg.join_ref.clone(),
+        outgoing_tx,
+        incoming_rx,
     )
     .await
     {
-        Ok(canonical_path) => {
-            PhxMessage::reply(msg, "ok", serde_json::json!({ "path": canonical_path }))
-        }
-        Err(reason) => PhxMessage::reply(msg, "error", serde_json::json!({ "reason": reason })),
+        Ok(canonical_path) => (
+            PhxMessage::reply(msg, "ok", serde_json::json!({ "path": canonical_path })),
+            Some(incoming_tx),
+        ),
+        Err(reason) => (
+            PhxMessage::reply(msg, "error", serde_json::json!({ "reason": reason })),
+            None,
+        ),
     }
-}
-
-/// Handle a phx_leave on a `watch:<ref>` topic.
-pub async fn handle_leave(
-    state: &WsState,
-    websocket_id: WebSocketId,
-    msg: &PhxMessage,
-) -> PhxMessage {
-    handle_unsubscribe(state, websocket_id, msg.topic.clone()).await;
-    PhxMessage::reply(msg, "ok", serde_json::json!({}))
 }
 
 /// Subscribe to file watching. Returns Ok(canonical_path) on success.
 async fn handle_subscribe(
     state: &WsState,
-    websocket_id: WebSocketId,
     path: &str,
     is_wsl: bool,
     topic: String,
     join_ref: Option<String>,
+    outgoing_tx: UnboundedSender<PhxMessage>,
+    mut incoming_rx: tokio::sync::mpsc::UnboundedReceiver<PhxMessage>,
 ) -> Result<String, String> {
     // Normalize path (handles WSL path conversion on Windows)
     let normalized_path = normalize_path(path, is_wsl)
@@ -194,11 +195,6 @@ async fn handle_subscribe(
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
 
-    // Add to this websocket's subscriptions (topic -> canonical_path)
-    if let Some(mut subs) = state.watch.subscriptions.get_mut(&websocket_id) {
-        subs.insert(topic.clone(), canonical_path.clone());
-    }
-
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
         .watch
@@ -213,52 +209,45 @@ async fn handle_subscribe(
         })
         .clone();
 
-    // Subscribe this websocket to the watch events
+    // Subscribe this channel to the watch events
     let mut rx = active_watch.tx.subscribe();
-    let state_for_forward = state.clone();
-    let canonical_path_for_forward = canonical_path.clone();
     let topic_for_forward = topic.clone();
 
-    // Spawn task to forward events to this websocket
+    // Spawn task to forward events to this channel's outgoing_tx.
+    // The task exits when incoming_rx closes (sender dropped on leave/disconnect).
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let is_unsubscribed = matches!(&event, WatchEvent::Unsubscribed { .. });
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            let is_unsubscribed = matches!(&event, WatchEvent::Unsubscribed { .. });
+                            let phx = event.into_phx(&topic_for_forward, &join_ref);
+                            let _ = outgoing_tx.send(phx);
 
-                    // Check if this websocket is still subscribed with this ref
-                    let still_subscribed = state_for_forward
-                        .watch
-                        .subscriptions
-                        .get(&websocket_id)
-                        .map(|subs| {
-                            subs.get(&topic_for_forward) == Some(&canonical_path_for_forward)
-                        })
-                        .unwrap_or(false);
-
-                    if still_subscribed {
-                        let phx = event.into_phx(&topic, &join_ref);
-                        if let Some(tx) = state_for_forward.websocket_senders.get(&websocket_id) {
-                            let _ = tx.send(phx);
+                            if is_unsubscribed {
+                                break;
+                            }
                         }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            let phx = WatchEvent::Unsubscribed {
+                                error: Some("watcher closed".to_string()),
+                            }
+                            .into_phx(&topic_for_forward, &join_ref);
+                            let _ = outgoing_tx.send(phx);
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     }
-
-                    if is_unsubscribed || !still_subscribed {
+                }
+                // When incoming_rx is closed (sender dropped), the channel was left/disconnected
+                msg = incoming_rx.recv() => {
+                    if msg.is_none() {
+                        // Sender was dropped — leave/disconnect
                         break;
                     }
+                    // Future: handle incoming channel messages here
                 }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Watcher died - notify client so they can resubscribe if needed
-                    let phx = WatchEvent::Unsubscribed {
-                        error: Some("watcher closed".to_string()),
-                    }
-                    .into_phx(&topic, &join_ref);
-                    if let Some(tx) = state_for_forward.websocket_senders.get(&websocket_id) {
-                        let _ = tx.send(phx);
-                    }
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
     });
@@ -431,13 +420,6 @@ async fn handle_subscribe(
     }
 
     Ok(canonical_path)
-}
-
-async fn handle_unsubscribe(state: &WsState, websocket_id: WebSocketId, topic: String) {
-    // Remove from this websocket's subscriptions
-    if let Some(mut subs) = state.watch.subscriptions.get_mut(&websocket_id) {
-        subs.remove(&topic);
-    }
 }
 
 /// Convert an absolute path to a relative path (relative to watched_path).
