@@ -45,7 +45,11 @@ impl PhxMessage {
         self
     }
 
-    pub fn error(topic: impl Into<String>, join_ref: Option<String>, reason: impl Into<String>) -> Self {
+    pub fn error(
+        topic: impl Into<String>,
+        join_ref: Option<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             join_ref,
             ref_: None,

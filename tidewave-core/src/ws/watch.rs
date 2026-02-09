@@ -24,7 +24,6 @@ use tracing::{debug, warn};
 use crate::phoenix::PhxMessage;
 use crate::utils::normalize_path;
 
-
 // ============================================================================
 // Types
 // ============================================================================
@@ -59,21 +58,17 @@ impl WatchEvent {
     /// Convert into a Phoenix push message on the given topic.
     fn into_phx(self, topic: &str, join_ref: &Option<String>) -> PhxMessage {
         if let WatchEvent::Unsubscribed { error } = &self {
-            let mut phx = PhxMessage::new(topic, crate::phoenix::events::PHX_ERROR, serde_json::json!({"reason": error}));
+            let mut phx = PhxMessage::new(
+                topic,
+                crate::phoenix::events::PHX_ERROR,
+                serde_json::json!({"reason": error}),
+            );
             phx.join_ref = join_ref.clone();
             return phx;
         }
 
-        let mut val = serde_json::to_value(&self).unwrap_or_default();
-        let event_name = val
-            .get("event")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        if let Some(map) = val.as_object_mut() {
-            map.remove("event");
-        }
-        let mut phx = PhxMessage::new(topic, event_name, val);
+        let msg = serde_json::to_value(self).unwrap_or_default();
+        let mut phx = PhxMessage::new(topic, "watch_event", msg);
         phx.join_ref = join_ref.clone();
         phx
     }
@@ -241,17 +236,17 @@ fn init_watcher(
             tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(256);
 
         // Helper to create poll watcher
-        let create_poll_watcher =
-            |notify_tx: tokio::sync::mpsc::Sender<notify::Result<notify::Event>>| {
-                let poll_config =
-                    notify::Config::default().with_poll_interval(Duration::from_secs(2));
-                PollWatcher::new(
-                    move |res| {
-                        let _ = notify_tx.blocking_send(res);
-                    },
-                    poll_config,
-                )
-            };
+        let create_poll_watcher = |notify_tx: tokio::sync::mpsc::Sender<
+            notify::Result<notify::Event>,
+        >| {
+            let poll_config = notify::Config::default().with_poll_interval(Duration::from_secs(2));
+            PollWatcher::new(
+                move |res| {
+                    let _ = notify_tx.blocking_send(res);
+                },
+                poll_config,
+            )
+        };
 
         // Box the watcher to allow different types
         let mut watcher: Box<dyn Watcher + Send> = if use_poll_watcher {
@@ -312,10 +307,7 @@ fn init_watcher(
             }
         };
 
-        if let Err(e) = watcher.watch(
-            Path::new(&canonical_path),
-            RecursiveMode::Recursive,
-        ) {
+        if let Err(e) = watcher.watch(Path::new(&canonical_path), RecursiveMode::Recursive) {
             let _ = tx.send(WatchEvent::Unsubscribed {
                 error: format!("Failed to watch path: {}", e),
             });
