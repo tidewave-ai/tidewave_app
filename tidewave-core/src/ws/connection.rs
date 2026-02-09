@@ -238,6 +238,24 @@ fn dispatch_join(
                 &outgoing_tx,
             );
         }))
+    } else if msg.topic.starts_with("acp:") {
+        let acp_state = state.acp.clone();
+        Some(tokio::spawn(async move {
+            reply_init(
+                super::acp::init(&acp_state, &msg, outgoing_tx.clone(), incoming_rx).await,
+                msg,
+                &outgoing_tx,
+            );
+        }))
+    } else if msg.topic.starts_with("mcp:") {
+        let mcp_state = state.mcp.clone();
+        Some(tokio::spawn(async move {
+            reply_init(
+                super::mcp::init(&mcp_state, &msg, outgoing_tx.clone(), incoming_rx).await,
+                msg,
+                &outgoing_tx,
+            );
+        }))
     } else {
         let _ = outgoing_tx.send(PhxMessage::error_reply(&msg, "unknown topic"));
         None
