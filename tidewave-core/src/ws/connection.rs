@@ -6,7 +6,8 @@
 //! function spawned in its own task when the client sends `phx_join`. A channel
 //! receives four arguments:
 //!
-//! - `state: &WsState` — shared server state.
+//! - `state` — the channel's own feature state (e.g. `&WatchFeatureState`),
+//!   extracted from `WsState` by [`dispatch_join`].
 //! - `msg: &PhxMessage` — the original `phx_join` message (contains topic, join_ref,
 //!   and the join payload sent by the client).
 //! - `outgoing_tx: UnboundedSender<PhxMessage>` — send messages to the client.
@@ -196,9 +197,9 @@ fn dispatch_join(
     incoming_rx: mpsc::UnboundedReceiver<PhxMessage>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if msg.topic.starts_with("watch:") {
-        let state = state.clone();
+        let watch_state = state.watch.clone();
         Some(tokio::spawn(async move {
-            match super::watch::init(&state, &msg, outgoing_tx.clone(), incoming_rx).await {
+            match super::watch::init(&watch_state, &msg, outgoing_tx.clone(), incoming_rx).await {
                 Ok(()) => {
                     let _ = outgoing_tx.send(PhxMessage::close(msg.topic, msg.join_ref));
                 }

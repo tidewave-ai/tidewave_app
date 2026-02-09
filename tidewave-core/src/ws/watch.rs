@@ -24,7 +24,6 @@ use tracing::{debug, warn};
 use crate::phoenix::PhxMessage;
 use crate::utils::normalize_path;
 
-use super::WsState;
 
 // ============================================================================
 // Types
@@ -121,7 +120,7 @@ struct JoinPayload {
 ///
 /// Intended to be called inside a spawned task.
 pub async fn init(
-    state: &WsState,
+    state: &WatchFeatureState,
     msg: &PhxMessage,
     outgoing_tx: UnboundedSender<PhxMessage>,
     mut incoming_rx: tokio::sync::mpsc::UnboundedReceiver<PhxMessage>,
@@ -153,7 +152,6 @@ pub async fn init(
 
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
-        .watch
         .watchers
         .entry(canonical_path.clone())
         .or_insert_with(|| {
@@ -175,7 +173,7 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(state, &active_watch, &canonical_path, payload.is_wsl);
+        init_watcher(&state, &active_watch, &canonical_path, payload.is_wsl);
     }
 
     // Send success reply
@@ -218,7 +216,7 @@ pub async fn init(
 /// Broadcasts `WatchEvent`s to all subscribers via the `ActiveWatch` broadcast channel.
 /// Cleans itself up from `state.watch.watchers` when done.
 fn init_watcher(
-    state: &WsState,
+    state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
     canonical_path: &str,
     is_wsl: bool,
@@ -264,7 +262,7 @@ fn init_watcher(
                     let _ = tx.send(WatchEvent::Unsubscribed {
                         error: format!("Failed to create poll watcher: {}", e),
                     });
-                    state.watch.watchers.remove(&canonical_path);
+                    state.watchers.remove(&canonical_path);
                     return;
                 }
             }
@@ -306,7 +304,7 @@ fn init_watcher(
                                     e, poll_err
                                 ),
                             });
-                            state.watch.watchers.remove(&canonical_path);
+                            state.watchers.remove(&canonical_path);
                             return;
                         }
                     }
@@ -321,7 +319,7 @@ fn init_watcher(
             let _ = tx.send(WatchEvent::Unsubscribed {
                 error: format!("Failed to watch path: {}", e),
             });
-            state.watch.watchers.remove(&canonical_path);
+            state.watchers.remove(&canonical_path);
             return;
         }
 
@@ -345,7 +343,7 @@ fn init_watcher(
                                 let _ = tx.send(watch_event);
 
                                 if is_unsubscribed {
-                                    state.watch.watchers.remove(&canonical_path);
+                                    state.watchers.remove(&canonical_path);
                                     return;
                                 }
                             }
@@ -354,11 +352,11 @@ fn init_watcher(
                             let _ = tx.send(WatchEvent::Unsubscribed {
                                 error: format!("Watch error: {}", e),
                             });
-                            state.watch.watchers.remove(&canonical_path);
+                            state.watchers.remove(&canonical_path);
                             return;
                         }
                         None => {
-                            state.watch.watchers.remove(&canonical_path);
+                            state.watchers.remove(&canonical_path);
                             return;
                         }
                     }
@@ -366,7 +364,7 @@ fn init_watcher(
                 _ = tokio::time::sleep(cleanup_check_interval) => {
                     if tx.receiver_count() == 0 {
                         debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path);
-                        state.watch.watchers.remove(&canonical_path);
+                        state.watchers.remove(&canonical_path);
                         return;
                     }
                 }
