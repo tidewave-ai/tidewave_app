@@ -172,7 +172,11 @@ async fn handle_incoming_message(
                 channels.insert(topic.clone(), incoming_tx);
                 channel_tasks.spawn(async move {
                     let panicked = handle.await.is_err();
-                    ChannelExit { topic, join_ref, panicked }
+                    ChannelExit {
+                        topic,
+                        join_ref,
+                        panicked,
+                    }
                 });
             }
         }
@@ -195,11 +199,7 @@ async fn handle_incoming_message(
 /// - `Done` → `phx_close` (clean exit)
 /// - `Error` → `phx_reply` with error status (join validation failure)
 /// - `Shutdown` → `phx_error` (out-of-band runtime error, triggers client rejoin)
-fn reply_init(
-    result: InitResult,
-    msg: PhxMessage,
-    outgoing_tx: &UnboundedSender<PhxMessage>,
-) {
+fn reply_init(result: InitResult, msg: PhxMessage, outgoing_tx: &UnboundedSender<PhxMessage>) {
     match result {
         InitResult::Done => {
             let _ = outgoing_tx.send(PhxMessage::close(msg.topic, msg.join_ref));
