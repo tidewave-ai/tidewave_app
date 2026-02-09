@@ -45,6 +45,20 @@ impl PhxMessage {
         self
     }
 
+    pub fn error(topic: impl Into<String>, join_ref: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            join_ref,
+            ref_: None,
+            topic: topic.into(),
+            event: events::PHX_REPLY.to_string(),
+            payload: serde_json::json!({ "status": "error", "response": { "reason": reason.into() } }),
+        }
+    }
+
+    pub fn ok_reply(request: &PhxMessage, response: Value) -> Self {
+        Self::reply(request, "ok", response)
+    }
+
     pub fn reply(request: &PhxMessage, status: &str, response: Value) -> Self {
         Self {
             join_ref: request.join_ref.clone(),
@@ -52,6 +66,16 @@ impl PhxMessage {
             topic: request.topic.clone(),
             event: events::PHX_REPLY.to_string(),
             payload: serde_json::json!({ "status": status, "response": response }),
+        }
+    }
+
+    pub fn close(topic: impl Into<String>, join_ref: Option<String>) -> Self {
+        Self {
+            join_ref,
+            ref_: None,
+            topic: topic.into(),
+            event: events::PHX_CLOSE.to_string(),
+            payload: serde_json::json!({}),
         }
     }
 

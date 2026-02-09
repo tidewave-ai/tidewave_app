@@ -51,22 +51,16 @@ pub enum WatchEvent {
         message: String,
     },
     /// Internal signal: watcher died or watched path was removed.
-    /// Converted to `phx_error` in `into_phx` to trigger client rejoin.
     Unsubscribed {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        error: String,
     },
 }
 
 impl WatchEvent {
     /// Convert into a Phoenix push message on the given topic.
     fn into_phx(self, topic: &str, join_ref: &Option<String>) -> PhxMessage {
-        if let WatchEvent::Unsubscribed { error, .. } = &self {
-            let payload = match error {
-                Some(reason) => serde_json::json!({"reason": reason}),
-                None => serde_json::json!({}),
-            };
-            let mut phx = PhxMessage::new(topic, crate::phoenix::events::PHX_ERROR, payload);
+        if let WatchEvent::Unsubscribed { error } = &self {
+            let mut phx = PhxMessage::new(topic, crate::phoenix::events::PHX_ERROR, serde_json::json!({"reason": error}));
             phx.join_ref = join_ref.clone();
             return phx;
         }
@@ -119,62 +113,24 @@ struct JoinPayload {
     is_wsl: bool,
 }
 
-/// Handle a phx_join on a `watch:<ref>` topic.
+/// Initialize a `watch:<ref>` channel.
 ///
-/// Returns the reply message and an optional sender for forwarding incoming
-/// messages to this channel. The connection stores the sender per topic and
-/// drops it on leave/disconnect to signal cleanup.
-pub async fn handle_join(
+/// On success, sends the ok reply via `outgoing_tx` and runs the forwarding
+/// loop until the channel is left (incoming_rx closed) or the watcher errors out.
+/// Returns `Err(reason)` if the join fails; the caller sends the error reply.
+///
+/// Intended to be called inside a spawned task.
+pub async fn init(
     state: &WsState,
     msg: &PhxMessage,
     outgoing_tx: UnboundedSender<PhxMessage>,
-) -> (PhxMessage, Option<UnboundedSender<PhxMessage>>) {
-    let payload: JoinPayload = match serde_json::from_value(msg.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                PhxMessage::reply(msg, "error", serde_json::json!({ "reason": e.to_string() })),
-                None,
-            );
-        }
-    };
-
-    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<PhxMessage>();
-
-    match handle_subscribe(
-        state,
-        &payload.path,
-        payload.is_wsl,
-        msg.topic.clone(),
-        msg.join_ref.clone(),
-        outgoing_tx,
-        incoming_rx,
-    )
-    .await
-    {
-        Ok(canonical_path) => (
-            PhxMessage::reply(msg, "ok", serde_json::json!({ "path": canonical_path })),
-            Some(incoming_tx),
-        ),
-        Err(reason) => (
-            PhxMessage::reply(msg, "error", serde_json::json!({ "reason": reason })),
-            None,
-        ),
-    }
-}
-
-/// Subscribe to file watching. Returns Ok(canonical_path) on success.
-async fn handle_subscribe(
-    state: &WsState,
-    path: &str,
-    is_wsl: bool,
-    topic: String,
-    join_ref: Option<String>,
-    outgoing_tx: UnboundedSender<PhxMessage>,
     mut incoming_rx: tokio::sync::mpsc::UnboundedReceiver<PhxMessage>,
-) -> Result<String, String> {
+) -> Result<(), String> {
+    let payload: JoinPayload =
+        serde_json::from_value(msg.payload.clone()).map_err(|e| e.to_string())?;
+
     // Normalize path (handles WSL path conversion on Windows)
-    let normalized_path = normalize_path(path, is_wsl)
+    let normalized_path = normalize_path(&payload.path, payload.is_wsl)
         .await
         .map_err(|e| format!("Failed to normalize path: {}", e))?;
 
@@ -209,48 +165,8 @@ async fn handle_subscribe(
         })
         .clone();
 
-    // Subscribe this channel to the watch events
-    let mut rx = active_watch.tx.subscribe();
-    let topic_for_forward = topic.clone();
-
-    // Spawn task to forward events to this channel's outgoing_tx.
-    // The task exits when incoming_rx closes (sender dropped on leave/disconnect).
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = rx.recv() => {
-                    match result {
-                        Ok(event) => {
-                            let is_unsubscribed = matches!(&event, WatchEvent::Unsubscribed { .. });
-                            let phx = event.into_phx(&topic_for_forward, &join_ref);
-                            let _ = outgoing_tx.send(phx);
-
-                            if is_unsubscribed {
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            let phx = WatchEvent::Unsubscribed {
-                                error: Some("watcher closed".to_string()),
-                            }
-                            .into_phx(&topic_for_forward, &join_ref);
-                            let _ = outgoing_tx.send(phx);
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    }
-                }
-                // When incoming_rx is closed (sender dropped), the channel was left/disconnected
-                msg = incoming_rx.recv() => {
-                    if msg.is_none() {
-                        // Sender was dropped — leave/disconnect
-                        break;
-                    }
-                    // Future: handle incoming channel messages here
-                }
-            }
-        }
-    });
+    // Subscribe to the broadcast channel
+    let mut broadcast_rx = active_watch.tx.subscribe();
 
     // Atomically check if we should start the watcher
     let should_start_watcher = active_watch
@@ -259,167 +175,206 @@ async fn handle_subscribe(
         .is_ok();
 
     if should_start_watcher {
-        let tx = active_watch.tx.clone();
-        let canonical_path_for_task = canonical_path.clone();
-        let state_for_task = state.clone();
+        init_watcher(state, &active_watch, &canonical_path, payload.is_wsl);
+    }
 
-        // On Windows with WSL, use poll watcher directly since native watcher
-        // doesn't work well with WSL paths
-        #[cfg(target_os = "windows")]
-        let use_poll_watcher = is_wsl;
-        #[cfg(not(target_os = "windows"))]
-        let use_poll_watcher = false;
+    // Send success reply
+    let _ = outgoing_tx.send(PhxMessage::ok_reply(
+        msg,
+        serde_json::json!({ "path": canonical_path }),
+    ));
 
-        tokio::spawn(async move {
-            // Create a channel to receive notify events
-            let (notify_tx, mut notify_rx) =
-                tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(256);
-
-            // Helper to create poll watcher
-            let create_poll_watcher =
-                |notify_tx: tokio::sync::mpsc::Sender<notify::Result<notify::Event>>| {
-                    let poll_config =
-                        notify::Config::default().with_poll_interval(Duration::from_secs(2));
-                    PollWatcher::new(
-                        move |res| {
-                            let _ = notify_tx.blocking_send(res);
-                        },
-                        poll_config,
-                    )
-                };
-
-            // Box the watcher to allow different types
-            let mut watcher: Box<dyn Watcher + Send> = if use_poll_watcher {
-                // Use poll watcher directly (e.g., for WSL on Windows)
-                match create_poll_watcher(notify_tx.clone()) {
-                    Ok(w) => Box::new(w),
-                    Err(e) => {
-                        let _ = tx.send(WatchEvent::Unsubscribed {
-                            error: Some(format!("Failed to create poll watcher: {}", e)),
-                        });
-                        state_for_task
-                            .watch
-                            .watchers
-                            .remove(&canonical_path_for_task);
-                        return;
+    // Run forwarding loop until channel exits
+    let topic = &msg.topic;
+    let join_ref = &msg.join_ref;
+    loop {
+        tokio::select! {
+            result = broadcast_rx.recv() => {
+                match result {
+                    Ok(WatchEvent::Unsubscribed { error }) => {
+                        return Err(error);
                     }
+                    Ok(event) => {
+                        let phx = event.into_phx(topic, join_ref);
+                        let _ = outgoing_tx.send(phx);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("watcher closed".to_string());
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
-            } else {
-                // Try native watcher first, fall back to poll watcher if it fails
-                let notify_tx_clone = notify_tx.clone();
-                let watcher_result = RecommendedWatcher::new(
+            }
+            // When incoming_rx is closed (sender dropped), the channel was left/disconnected
+            msg = incoming_rx.recv() => {
+                if msg.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Spawn the filesystem watcher task for a canonical path.
+/// Broadcasts `WatchEvent`s to all subscribers via the `ActiveWatch` broadcast channel.
+/// Cleans itself up from `state.watch.watchers` when done.
+fn init_watcher(
+    state: &WsState,
+    active_watch: &Arc<ActiveWatch>,
+    canonical_path: &str,
+    is_wsl: bool,
+) {
+    let tx = active_watch.tx.clone();
+    let canonical_path = canonical_path.to_string();
+    let state = state.clone();
+
+    // On Windows with WSL, use poll watcher directly since native watcher
+    // doesn't work well with WSL paths
+    #[cfg(target_os = "windows")]
+    let use_poll_watcher = is_wsl;
+    #[cfg(not(target_os = "windows"))]
+    let use_poll_watcher = {
+        let _ = is_wsl;
+        false
+    };
+
+    tokio::spawn(async move {
+        // Create a channel to receive notify events
+        let (notify_tx, mut notify_rx) =
+            tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(256);
+
+        // Helper to create poll watcher
+        let create_poll_watcher =
+            |notify_tx: tokio::sync::mpsc::Sender<notify::Result<notify::Event>>| {
+                let poll_config =
+                    notify::Config::default().with_poll_interval(Duration::from_secs(2));
+                PollWatcher::new(
                     move |res| {
-                        let _ = notify_tx_clone.blocking_send(res);
+                        let _ = notify_tx.blocking_send(res);
                     },
-                    notify::Config::default(),
-                );
-
-                match watcher_result {
-                    Ok(w) => Box::new(w),
-                    Err(e) => {
-                        // Native watcher failed, try poll watcher as fallback
-                        warn!(
-                            "Native file watcher failed for {}: {}. Falling back to poll watcher.",
-                            canonical_path_for_task, e
-                        );
-
-                        match create_poll_watcher(notify_tx.clone()) {
-                            Ok(w) => {
-                                // Send warning to client about poll watcher fallback
-                                let _ = tx.send(WatchEvent::Warning {
-                                    message: format!(
-                                        "Using poll-based file watching (native watcher unavailable: {}). \
-                                         File change detection may be slower.",
-                                        e
-                                    ),
-                                });
-                                Box::new(w)
-                            }
-                            Err(poll_err) => {
-                                let _ = tx.send(WatchEvent::Unsubscribed {
-                                    error: Some(format!(
-                                        "Failed to create watcher: {} (poll fallback also failed: {})",
-                                        e, poll_err
-                                    )),
-                                });
-                                state_for_task
-                                    .watch
-                                    .watchers
-                                    .remove(&canonical_path_for_task);
-                                return;
-                            }
-                        }
-                    }
-                }
+                    poll_config,
+                )
             };
 
-            if let Err(e) = watcher.watch(
-                Path::new(&canonical_path_for_task),
-                RecursiveMode::Recursive,
-            ) {
-                let _ = tx.send(WatchEvent::Unsubscribed {
-                    error: Some(format!("Failed to watch path: {}", e)),
-                });
-                state_for_task
-                    .watch
-                    .watchers
-                    .remove(&canonical_path_for_task);
-                return;
+        // Box the watcher to allow different types
+        let mut watcher: Box<dyn Watcher + Send> = if use_poll_watcher {
+            // Use poll watcher directly (e.g., for WSL on Windows)
+            match create_poll_watcher(notify_tx.clone()) {
+                Ok(w) => Box::new(w),
+                Err(e) => {
+                    let _ = tx.send(WatchEvent::Unsubscribed {
+                        error: format!("Failed to create poll watcher: {}", e),
+                    });
+                    state.watch.watchers.remove(&canonical_path);
+                    return;
+                }
             }
+        } else {
+            // Try native watcher first, fall back to poll watcher if it fails
+            let notify_tx_clone = notify_tx.clone();
+            let watcher_result = RecommendedWatcher::new(
+                move |res| {
+                    let _ = notify_tx_clone.blocking_send(res);
+                },
+                notify::Config::default(),
+            );
 
-            let mut pending_rename_from: Option<String> = None;
-            let cleanup_check_interval = Duration::from_secs(30);
+            match watcher_result {
+                Ok(w) => Box::new(w),
+                Err(e) => {
+                    // Native watcher failed, try poll watcher as fallback
+                    warn!(
+                        "Native file watcher failed for {}: {}. Falling back to poll watcher.",
+                        canonical_path, e
+                    );
 
-            loop {
-                tokio::select! {
-                    // Handle notify events
-                    res = notify_rx.recv() => {
-                        match res {
-                            Some(Ok(event)) => {
-                                let watch_events = convert_notify_event(
-                                    event,
-                                    &canonical_path_for_task,
-                                    &mut pending_rename_from,
-                                );
-
-                                for watch_event in watch_events {
-                                    let is_unsubscribed = matches!(&watch_event, WatchEvent::Unsubscribed { .. });
-
-                                    let _ = tx.send(watch_event);
-
-                                    if is_unsubscribed {
-                                        state_for_task.watch.watchers.remove(&canonical_path_for_task);
-                                        return;
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                let _ = tx.send(WatchEvent::Unsubscribed {
-                                    error: Some(format!("Watch error: {}", e)),
-                                });
-                                state_for_task.watch.watchers.remove(&canonical_path_for_task);
-                                return;
-                            }
-                            None => {
-                                state_for_task.watch.watchers.remove(&canonical_path_for_task);
-                                return;
-                            }
+                    match create_poll_watcher(notify_tx.clone()) {
+                        Ok(w) => {
+                            // Send warning to client about poll watcher fallback
+                            let _ = tx.send(WatchEvent::Warning {
+                                message: format!(
+                                    "Using poll-based file watching (native watcher unavailable: {}). \
+                                     File change detection may be slower.",
+                                    e
+                                ),
+                            });
+                            Box::new(w)
                         }
-                    }
-                    // Periodic subscriber check for cleanup (no event sent to clients)
-                    _ = tokio::time::sleep(cleanup_check_interval) => {
-                        if tx.receiver_count() == 0 {
-                            debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path_for_task);
-                            state_for_task.watch.watchers.remove(&canonical_path_for_task);
+                        Err(poll_err) => {
+                            let _ = tx.send(WatchEvent::Unsubscribed {
+                                error: format!(
+                                    "Failed to create watcher: {} (poll fallback also failed: {})",
+                                    e, poll_err
+                                ),
+                            });
+                            state.watch.watchers.remove(&canonical_path);
                             return;
                         }
                     }
                 }
             }
-        });
-    }
+        };
 
-    Ok(canonical_path)
+        if let Err(e) = watcher.watch(
+            Path::new(&canonical_path),
+            RecursiveMode::Recursive,
+        ) {
+            let _ = tx.send(WatchEvent::Unsubscribed {
+                error: format!("Failed to watch path: {}", e),
+            });
+            state.watch.watchers.remove(&canonical_path);
+            return;
+        }
+
+        let mut pending_rename_from: Option<String> = None;
+        let cleanup_check_interval = Duration::from_secs(30);
+
+        loop {
+            tokio::select! {
+                res = notify_rx.recv() => {
+                    match res {
+                        Some(Ok(event)) => {
+                            let watch_events = convert_notify_event(
+                                event,
+                                &canonical_path,
+                                &mut pending_rename_from,
+                            );
+
+                            for watch_event in watch_events {
+                                let is_unsubscribed = matches!(&watch_event, WatchEvent::Unsubscribed { .. });
+
+                                let _ = tx.send(watch_event);
+
+                                if is_unsubscribed {
+                                    state.watch.watchers.remove(&canonical_path);
+                                    return;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = tx.send(WatchEvent::Unsubscribed {
+                                error: format!("Watch error: {}", e),
+                            });
+                            state.watch.watchers.remove(&canonical_path);
+                            return;
+                        }
+                        None => {
+                            state.watch.watchers.remove(&canonical_path);
+                            return;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(cleanup_check_interval) => {
+                    if tx.receiver_count() == 0 {
+                        debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path);
+                        state.watch.watchers.remove(&canonical_path);
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Convert an absolute path to a relative path (relative to watched_path).
@@ -524,7 +479,7 @@ fn convert_notify_event(
                 if path_str == watched_path {
                     // Watched directory was removed - send unsubscribed
                     results.push(WatchEvent::Unsubscribed {
-                        error: Some("watched path was removed".to_string()),
+                        error: "watched path was removed".to_string(),
                     });
                 } else if let Some(relative_path) = to_relative_path(path, watched_path) {
                     results.push(WatchEvent::Deleted {
