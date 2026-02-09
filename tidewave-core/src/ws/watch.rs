@@ -207,13 +207,11 @@ pub async fn init(
             // When incoming_rx is closed (sender dropped), the channel was left/disconnected
             msg = incoming_rx.recv() => {
                 if msg.is_none() {
-                    break;
+                    return Ok(());
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Spawn the filesystem watcher task for a canonical path.
