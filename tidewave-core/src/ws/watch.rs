@@ -21,7 +21,7 @@ use std::{
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tracing::{debug, warn};
 
-use crate::phoenix::PhxMessage;
+use crate::phoenix::{InitResult, PhxMessage};
 use crate::utils::normalize_path;
 
 // ============================================================================
@@ -119,31 +119,36 @@ pub async fn init(
     msg: &PhxMessage,
     outgoing_tx: UnboundedSender<PhxMessage>,
     mut incoming_rx: tokio::sync::mpsc::UnboundedReceiver<PhxMessage>,
-) -> Result<(), String> {
-    let payload: JoinPayload =
-        serde_json::from_value(msg.payload.clone()).map_err(|e| e.to_string())?;
+) -> InitResult {
+    let payload: JoinPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => return InitResult::Error(e.to_string()),
+    };
 
     // Normalize path (handles WSL path conversion on Windows)
-    let normalized_path = normalize_path(&payload.path, payload.is_wsl)
-        .await
-        .map_err(|e| format!("Failed to normalize path: {}", e))?;
+    let normalized_path = match normalize_path(&payload.path, payload.is_wsl).await {
+        Ok(p) => p,
+        Err(e) => return InitResult::Error(format!("Failed to normalize path: {}", e)),
+    };
 
     // Validate path is absolute
     if !Path::new(&normalized_path).is_absolute() {
-        return Err("Path must be absolute".to_string());
+        return InitResult::Error("Path must be absolute".to_string());
     }
 
     // Check if path exists
     let path_obj = Path::new(&normalized_path);
     if !path_obj.exists() {
-        return Err("Path does not exist".to_string());
+        return InitResult::Error("Path does not exist".to_string());
     }
 
     // Get canonical path for deduplication
-    let canonical_path = path_obj
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+    let canonical_path = match path_obj.canonicalize() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(e) => {
+            return InitResult::Error(format!("Failed to canonicalize path: {}", e))
+        }
+    };
 
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
@@ -185,14 +190,14 @@ pub async fn init(
             result = broadcast_rx.recv() => {
                 match result {
                     Ok(WatchEvent::Unsubscribed { error }) => {
-                        return Err(error);
+                        return InitResult::Shutdown(error);
                     }
                     Ok(event) => {
                         let phx = event.into_phx(topic, join_ref);
                         let _ = outgoing_tx.send(phx);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        return Err("watcher closed".to_string());
+                        return InitResult::Shutdown("watcher closed".to_string());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
@@ -200,7 +205,7 @@ pub async fn init(
             // When incoming_rx is closed (sender dropped), the channel was left/disconnected
             msg = incoming_rx.recv() => {
                 if msg.is_none() {
-                    return Ok(());
+                    return InitResult::Done;
                 }
             }
         }

@@ -2,6 +2,17 @@
 
 use serde_json::Value;
 
+/// Result of a channel init function.
+///
+/// - `Done` — clean exit (client left or disconnected).
+/// - `Error(reason)` — join validation failure (before entering the main loop).
+/// - `Shutdown(reason)` — runtime error (watcher died, watched path removed, etc.).
+pub enum InitResult {
+    Done,
+    Error(String),
+    Shutdown(String),
+}
+
 // ============================================================================
 // Message Types & Wire Format
 // ============================================================================
@@ -54,13 +65,17 @@ impl PhxMessage {
             join_ref,
             ref_: None,
             topic: topic.into(),
-            event: events::PHX_REPLY.to_string(),
-            payload: serde_json::json!({ "status": "error", "response": { "reason": reason.into() } }),
+            event: events::PHX_ERROR.to_string(),
+            payload: serde_json::json!({ "reason": reason.into() }),
         }
     }
 
     pub fn ok_reply(request: &PhxMessage, response: Value) -> Self {
         Self::reply(request, "ok", response)
+    }
+
+    pub fn error_reply(request: &PhxMessage, reason: impl Into<String>) -> Self {
+        Self::reply(request, "error", serde_json::json!({ "reason": reason.into() }))
     }
 
     pub fn reply(request: &PhxMessage, status: &str, response: Value) -> Self {

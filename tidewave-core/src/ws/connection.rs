@@ -17,12 +17,14 @@
 //!   for this topic. When the client sends `phx_leave` or disconnects, this channel
 //!   closes (`recv()` returns `None`), signaling the handler to exit.
 //!
-//! The return type is `Result<(), String>`:
+//! The return type is [`InitResult`](crate::phoenix::InitResult):
 //!
-//! - `Ok(())` — clean exit. The connection sends `phx_close` to the client.
-//! - `Err(reason)` — error. The connection sends `phx_reply` with error status.
-//!   Use this for join validation failures (bad path, missing params) by returning
-//!   early with `?` or `return Err(...)` before entering the main loop.
+//! - `Done` — clean exit. The connection sends `phx_close` to the client.
+//! - `Error(reason)` — join validation failure. The connection sends `phx_reply`
+//!   with error status. Use this for join validation failures (bad path, missing
+//!   params) by returning early before entering the main loop.
+//! - `Shutdown(reason)` — runtime error (watcher died, watched path removed, etc.).
+//!   The connection sends `phx_error`, which causes Phoenix clients to attempt to rejoin.
 //!
 //! To add a new channel, add a match arm in [`dispatch_join`] for your topic prefix.
 //! See [`super::watch::init`] for a complete example.
@@ -43,7 +45,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{WebSocketId, WsState};
-use crate::phoenix::{events, PhxMessage};
+use crate::phoenix::{events, InitResult, PhxMessage};
 
 // ============================================================================
 // WebSocket Handler
@@ -192,17 +194,24 @@ async fn handle_incoming_message(
     }
 }
 
-/// Handles the result of a channel init: sends `phx_close` on success, `phx_reply` error on failure.
+/// Handles the result of a channel init.
+///
+/// - `Done` → `phx_close` (clean exit)
+/// - `Error` → `phx_reply` with error status (join validation failure)
+/// - `Shutdown` → `phx_error` (out-of-band runtime error, triggers client rejoin)
 fn reply_init(
-    result: Result<(), String>,
+    result: InitResult,
     msg: PhxMessage,
     outgoing_tx: &UnboundedSender<PhxMessage>,
 ) {
     match result {
-        Ok(()) => {
+        InitResult::Done => {
             let _ = outgoing_tx.send(PhxMessage::close(msg.topic, msg.join_ref));
         }
-        Err(reason) => {
+        InitResult::Error(reason) => {
+            let _ = outgoing_tx.send(PhxMessage::error_reply(&msg, reason));
+        }
+        InitResult::Shutdown(reason) => {
             let _ = outgoing_tx.send(PhxMessage::error(msg.topic, msg.join_ref, reason));
         }
     }
@@ -226,7 +235,7 @@ fn dispatch_join(
             );
         }))
     } else {
-        let _ = outgoing_tx.send(PhxMessage::error(msg.topic, msg.join_ref, "unknown topic"));
+        let _ = outgoing_tx.send(PhxMessage::error_reply(&msg, "unknown topic"));
         None
     }
 }
