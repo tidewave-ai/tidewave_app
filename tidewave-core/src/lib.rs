@@ -3,6 +3,7 @@ mod command;
 pub mod config;
 mod http_handlers;
 mod mcp_remote;
+pub mod phoenix;
 pub mod server;
 pub mod utils;
 pub mod ws;
