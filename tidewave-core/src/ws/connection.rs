@@ -1,4 +1,30 @@
 //! WebSocket connection management using Phoenix V2 wire format.
+//!
+//! # Channel abstraction
+//!
+//! Each Phoenix topic (e.g. `watch:<ref>`) is handled by a **channel** — an async
+//! function spawned in its own task when the client sends `phx_join`. A channel
+//! receives four arguments:
+//!
+//! - `state: &WsState` — shared server state.
+//! - `msg: &PhxMessage` — the original `phx_join` message (contains topic, join_ref,
+//!   and the join payload sent by the client).
+//! - `outgoing_tx: UnboundedSender<PhxMessage>` — send messages to the client.
+//!   The channel should use this to send the `ok_reply` for the join and any
+//!   subsequent push events.
+//! - `incoming_rx: UnboundedReceiver<PhxMessage>` — receive messages from the client
+//!   for this topic. When the client sends `phx_leave` or disconnects, this channel
+//!   closes (`recv()` returns `None`), signaling the handler to exit.
+//!
+//! The return type is `Result<(), String>`:
+//!
+//! - `Ok(())` — clean exit. The connection sends `phx_close` to the client.
+//! - `Err(reason)` — error. The connection sends `phx_reply` with error status.
+//!   Use this for join validation failures (bad path, missing params) by returning
+//!   early with `?` or `return Err(...)` before entering the main loop.
+//!
+//! To add a new channel, add a match arm in [`dispatch_join`] for your topic prefix.
+//! See [`super::watch::init`] for a complete example.
 
 use std::collections::HashMap;
 
