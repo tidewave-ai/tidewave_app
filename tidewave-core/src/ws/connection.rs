@@ -172,11 +172,7 @@ async fn handle_incoming_message(
                 channels.insert(topic.clone(), incoming_tx);
                 channel_tasks.spawn(async move {
                     let panicked = handle.await.is_err();
-                    ChannelExit {
-                        topic,
-                        join_ref,
-                        panicked,
-                    }
+                    ChannelExit { topic, join_ref, panicked }
                 });
             }
         }

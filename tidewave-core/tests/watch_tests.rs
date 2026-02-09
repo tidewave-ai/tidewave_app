@@ -195,12 +195,11 @@ async fn test_watch_file_created() {
     tokio::fs::write(&file_path, "hello").await.unwrap();
 
     // Should receive created event as Phoenix push
-    let event = wait_for_phx_event(&mut ws_out_rx, "watch_event", 2000).await;
+    let event = wait_for_phx_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:mywatch");
-    assert_eq!(event.payload["event"], "created");
-    assert_eq!(event.payload["path"], "test_file.txt");
+    assert_eq!(event.payload["path"].as_str().unwrap(), "test_file.txt");
 }
 
 #[tokio::test]
@@ -236,12 +235,11 @@ async fn test_watch_file_modified() {
         .unwrap();
 
     // Should receive modified event with relative path
-    let event = wait_for_phx_event(&mut ws_out_rx, "watch_event", 2000).await;
+    let event = wait_for_phx_event(&mut ws_out_rx, "modified", 2000).await;
     assert!(event.is_some(), "Expected modified event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:modwatch");
-    assert_eq!(event.payload["event"], "modified");
-    assert_eq!(event.payload["path"], "existing_file.txt");
+    assert_eq!(event.payload["path"].as_str().unwrap(), "existing_file.txt");
 }
 
 #[tokio::test]
@@ -272,12 +270,14 @@ async fn test_watch_file_deleted() {
     tokio::fs::remove_file(&file_path).await.unwrap();
 
     // Should receive deleted event with relative path
-    let event = wait_for_phx_event(&mut ws_out_rx, "watch_event", 2000).await;
+    let event = wait_for_phx_event(&mut ws_out_rx, "deleted", 2000).await;
     assert!(event.is_some(), "Expected deleted event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:delwatch");
-    assert_eq!(event.payload["event"], "deleted");
-    assert_eq!(event.payload["path"], "file_to_delete.txt");
+    assert_eq!(
+        event.payload["path"].as_str().unwrap(),
+        "file_to_delete.txt"
+    );
 }
 
 #[tokio::test]
@@ -377,8 +377,8 @@ async fn test_watch_concurrent_subscribers() {
     tokio::fs::write(&file_path, "content").await.unwrap();
 
     // Both should receive the created event on their respective topics
-    let event1 = wait_for_phx_event(&mut ws1_out_rx, "watch_event", 2000).await;
-    let event2 = wait_for_phx_event(&mut ws2_out_rx, "watch_event", 2000).await;
+    let event1 = wait_for_phx_event(&mut ws1_out_rx, "created", 2000).await;
+    let event2 = wait_for_phx_event(&mut ws2_out_rx, "created", 2000).await;
 
     assert!(event1.is_some(), "WebSocket 1 should receive created event");
     assert!(event2.is_some(), "WebSocket 2 should receive created event");
@@ -418,10 +418,12 @@ async fn test_watch_subdirectory_events() {
         .unwrap();
 
     // Should receive created event for nested file with relative path (recursive watching)
-    let event = wait_for_phx_event(&mut ws_out_rx, "watch_event", 2000).await;
+    let event = wait_for_phx_event(&mut ws_out_rx, "created", 2000).await;
     assert!(event.is_some(), "Expected created event for nested file");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:recursive_watch");
-    assert_eq!(event.payload["event"], "created");
-    assert_eq!(event.payload["path"], "subdir/nested_file.txt");
+    assert_eq!(
+        event.payload["path"].as_str().unwrap(),
+        "subdir/nested_file.txt"
+    );
 }
