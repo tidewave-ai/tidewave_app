@@ -2,10 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     Manager,
 };
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
@@ -51,6 +52,10 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|_app, args, _cwd| {
             debug!("a new app instance was opened with {args:?} and the deep link event was already triggered");
         }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| tauri::async_runtime::block_on(async move {
             let mut config = match tidewave_core::load_config() {
@@ -153,13 +158,17 @@ pub fn run() {
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, maybe_hotkey("Command+O"))?;
             let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, maybe_hotkey("Command+,"))?;
+            let is_autostart = app.autolaunch().is_enabled().unwrap_or(false);
+            let launch_at_login_i = CheckMenuItem::with_id(app, "launch_at_login", "Launch at Login", true, is_autostart, None::<&str>)?;
             let view_logs_i = MenuItem::with_id(app, "view_logs", "View Logs", true, maybe_hotkey("Command+L"))?;
             let check_for_updates_i = MenuItem::with_id(app, "check_for_updates", "Check for Updates…", true, None::<&str>)?;
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
+            let separator2 = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, maybe_hotkey("Command+Q"))?;
-            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &view_logs_i, &check_for_updates_i, &restart_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &view_logs_i, &separator2, &launch_at_login_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
+            let launch_at_login_item = launch_at_login_i.clone();
             TrayIconBuilder::new()
             .menu(&menu)
             .icon(app.default_window_icon().unwrap().clone())
@@ -205,6 +214,20 @@ pub fn run() {
                         Err(e) => {
                             error!("Failed to reload config: {}", e);
                             config_error_dialog(app, e.to_string());
+                        }
+                    }
+                }
+                "launch_at_login" => {
+                    let manager = app.autolaunch();
+                    let enabled = manager.is_enabled().unwrap_or(false);
+                    let result = if enabled { manager.disable() } else { manager.enable() };
+                    match result {
+                        Ok(()) => {
+                            let _ = launch_at_login_item.set_checked(!enabled);
+                        }
+                        Err(e) => {
+                            error!("Failed to toggle autostart: {}", e);
+                            error_dialog(app, "Error", format!("Failed to toggle Launch at Login: {}", e));
                         }
                     }
                 }
