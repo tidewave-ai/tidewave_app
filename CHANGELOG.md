@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4 (2026-02-10)
+
+* Add file system watching endpoint
+* Add /delete, /mmkdir, and /listdir endpoints
+
 ## v0.3.3 (2026-01-26)
 
 * Handle WSL for /download endpoint
