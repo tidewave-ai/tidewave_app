@@ -23,6 +23,7 @@
 //! ```
 
 pub mod connection;
+pub mod terminal;
 pub mod watch;
 
 use tracing::debug;

@@ -230,6 +230,14 @@ fn dispatch_join(
                 &outgoing_tx,
             );
         }))
+    } else if msg.topic.starts_with("terminal:") {
+        Some(tokio::spawn(async move {
+            reply_init(
+                super::terminal::init(&msg, outgoing_tx.clone(), incoming_rx).await,
+                msg,
+                &outgoing_tx,
+            );
+        }))
     } else {
         let _ = outgoing_tx.send(PhxMessage::error_reply(&msg, "unknown topic"));
         None
