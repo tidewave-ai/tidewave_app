@@ -52,18 +52,25 @@ fn load_tls_config(
 }
 
 /// Converts a WSL path to a Windows path using wslpath.
-#[cfg(target_os = "windows")]
-async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+pub async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
     use std::process::Stdio;
     use tokio::process::Command;
-    let mut command = Command::new("wsl.exe");
-    command
-        .arg("-e")
-        .arg("wslpath")
-        .arg("-w")
-        .arg(wsl_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("wsl.exe");
+        cmd.arg("-e").arg("wslpath").arg("-w").arg(wsl_path);
+        cmd
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut cmd = Command::new("wslpath");
+        cmd.arg("-w").arg(wsl_path);
+        cmd
+    };
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = command
         .output()
