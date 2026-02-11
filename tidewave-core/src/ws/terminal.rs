@@ -44,10 +44,8 @@ struct JoinPayload {
     cols: u16,
     #[serde(default = "default_rows")]
     rows: u16,
-    #[serde(default)]
-    env: Option<HashMap<String, String>>,
-    cwd: Option<String>,
-    #[serde(default)]
+    env: HashMap<String, String>,
+    cwd: String,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     is_wsl: bool,
 }
@@ -68,26 +66,17 @@ fn default_rows() -> u16 {
 fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
     #[cfg(target_os = "windows")]
     if payload.is_wsl {
-        let shell = payload
-            .env
-            .as_ref()
-            .and_then(|env| env.get("SHELL"))
-            .map(|s| s.as_str())
-            .unwrap_or("sh");
+        let shell = payload.env.get("SHELL").map(|s| s.as_str()).unwrap_or("sh");
 
         // Build env assignments string: VAR1='value1' VAR2='value2' ...
         let env_assignments: Vec<String> = payload
             .env
-            .as_ref()
-            .map(|env| {
-                env.iter()
-                    .map(|(k, v)| {
-                        let escaped_value = v.replace("'", "'\\''");
-                        format!("{}='{}'", k, escaped_value)
-                    })
-                    .collect()
+            .iter()
+            .map(|(k, v)| {
+                let escaped_value = v.replace("'", "'\\''");
+                format!("{}='{}'", k, escaped_value)
             })
-            .unwrap_or_default();
+            .collect();
 
         let shell_cmd = format!("exec {} -l", shell);
         let full_command = if env_assignments.is_empty() {
@@ -97,12 +86,8 @@ fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
         };
 
         let mut cmd = CommandBuilder::new("wsl.exe");
-
-        if let Some(ref cwd) = payload.cwd {
-            cmd.arg("--cd");
-            cmd.arg(cwd);
-        }
-
+        cmd.arg("--cd");
+        cmd.arg(&payload.cwd);
         cmd.arg("sh");
         cmd.arg("-c");
         cmd.arg(full_command);
@@ -111,15 +96,10 @@ fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
     }
 
     let mut cmd = CommandBuilder::new_default_prog();
+    cmd.cwd(&payload.cwd);
 
-    if let Some(ref cwd) = payload.cwd {
-        cmd.cwd(cwd);
-    }
-
-    if let Some(ref env) = payload.env {
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+    for (k, v) in &payload.env {
+        cmd.env(k, v);
     }
 
     cmd
