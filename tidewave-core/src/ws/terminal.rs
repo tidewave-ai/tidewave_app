@@ -16,6 +16,7 @@
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
@@ -43,6 +44,12 @@ struct JoinPayload {
     cols: u16,
     #[serde(default = "default_rows")]
     rows: u16,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    cwd: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    is_wsl: bool,
 }
 
 fn default_cols() -> u16 {
@@ -51,6 +58,71 @@ fn default_cols() -> u16 {
 
 fn default_rows() -> u16 {
     24
+}
+
+/// Build the PTY command based on the join payload.
+///
+/// On Windows with `is_wsl`, spawns `wsl.exe` with the user's shell (from the
+/// `SHELL` env var, falling back to `sh`). Otherwise uses the default program
+/// (the user's native shell).
+fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
+    #[cfg(target_os = "windows")]
+    if payload.is_wsl {
+        let shell = payload
+            .env
+            .as_ref()
+            .and_then(|env| env.get("SHELL"))
+            .map(|s| s.as_str())
+            .unwrap_or("sh");
+
+        // Build env assignments string: VAR1='value1' VAR2='value2' ...
+        let env_assignments: Vec<String> = payload
+            .env
+            .as_ref()
+            .map(|env| {
+                env.iter()
+                    .map(|(k, v)| {
+                        let escaped_value = v.replace("'", "'\\''");
+                        format!("{}='{}'", k, escaped_value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let shell_cmd = format!("exec {} -l", shell);
+        let full_command = if env_assignments.is_empty() {
+            shell_cmd
+        } else {
+            format!("{} {}", env_assignments.join(" "), shell_cmd)
+        };
+
+        let mut cmd = CommandBuilder::new("wsl.exe");
+
+        if let Some(ref cwd) = payload.cwd {
+            cmd.arg("--cd");
+            cmd.arg(cwd);
+        }
+
+        cmd.arg("sh");
+        cmd.arg("-c");
+        cmd.arg(full_command);
+
+        return cmd;
+    }
+
+    let mut cmd = CommandBuilder::new_default_prog();
+
+    if let Some(ref cwd) = payload.cwd {
+        cmd.cwd(cwd);
+    }
+
+    if let Some(ref env) = payload.env {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+
+    cmd
 }
 
 // ============================================================================
@@ -88,8 +160,8 @@ pub async fn init(
         Err(e) => return InitResult::Error(format!("Failed to open PTY: {}", e)),
     };
 
-    // Spawn default shell
-    let cmd = CommandBuilder::new_default_prog();
+    // Build shell command
+    let cmd = build_shell_command(&join_payload);
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(e) => return InitResult::Error(format!("Failed to spawn shell: {}", e)),
