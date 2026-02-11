@@ -71,9 +71,13 @@
 //!
 //! ### 5. Extract a file from an archive
 //! ```bash
-//! # Download an archive and extract a specific file (specify full path inside archive)
+//! # Download a tar.gz archive and extract a specific file
 //! curl "http://localhost:9832/download?key=codex&url=https://registry.npmjs.org/@zed-industries/codex-acp-linux-x64/-/codex-acp-linux-x64-0.8.2.tgz&extract=package/bin/codex&executable=true"
 //! # Returns: {"status":"done","path":"/path/to/cached/codex"}
+//!
+//! # Download a zip archive and extract a specific file
+//! curl "http://localhost:9832/download?key=myzip&url=https://example.com/archive.zip&extract=path/inside/zip"
+//! # Returns: {"status":"done","path":"/path/to/cached/file"}
 //! ```
 
 use axum::body::{Body, Bytes};
@@ -599,10 +603,15 @@ async fn perform_download(
         let temp_path_clone = temp_path.clone();
         let extract_path_clone = extract_path.clone();
         let file_path_clone = file_path.clone();
+        let is_zip = url.ends_with(".zip");
 
-        // Run extraction in a blocking task since tar/flate2 are synchronous
+        // Run extraction in a blocking task since tar/flate2/zip are synchronous
         let extract_result = tokio::task::spawn_blocking(move || {
-            extract_from_tarball(&temp_path_clone, &extract_path_clone, &file_path_clone)
+            if is_zip {
+                extract_from_zip(&temp_path_clone, &extract_path_clone, &file_path_clone)
+            } else {
+                extract_from_tarball(&temp_path_clone, &extract_path_clone, &file_path_clone)
+            }
         })
         .await
         .map_err(|e| format!("Extraction task failed: {}", e))?;
@@ -689,6 +698,68 @@ fn extract_from_tarball(
             .to_string_lossy()
             .trim_start_matches("./")
             .to_string();
+
+        if entry_path_str == extract_path {
+            debug!("Found matching entry: {}", entry_path_str);
+
+            // Ensure parent directory exists
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+            }
+
+            // Extract the file
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|e| format!("Failed to read entry contents: {}", e))?;
+
+            std::fs::write(dest_path, &contents)
+                .map_err(|e| format!("Failed to write extracted file: {}", e))?;
+
+            return Ok(());
+        }
+
+        // Collect entry paths for error message (limit to first 20)
+        if found_entries.len() < 20 {
+            found_entries.push(entry_path_str);
+        }
+    }
+
+    Err(format!(
+        "File '{}' not found in archive. Found entries: {:?}",
+        extract_path, found_entries
+    ))
+}
+
+/// Extract a specific file from a zip archive
+fn extract_from_zip(
+    archive_path: &std::path::Path,
+    extract_path: &str,
+    dest_path: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
+
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
+
+    // Normalize the extract path (remove leading ./ or /)
+    let extract_path = extract_path
+        .trim_start_matches("./")
+        .trim_start_matches('/');
+
+    let mut found_entries = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+
+        // Normalize entry path the same way
+        let entry_path_str = entry.name().trim_start_matches("./").to_string();
 
         if entry_path_str == extract_path {
             debug!("Found matching entry: {}", entry_path_str);

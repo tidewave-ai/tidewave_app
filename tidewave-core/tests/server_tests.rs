@@ -94,6 +94,25 @@ fn create_test_tarball(path: &str, content: &[u8]) -> Vec<u8> {
     archive_data
 }
 
+/// Create a zip archive in memory with a single file
+fn create_test_zip(path: &str, content: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mut archive_data = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(&mut archive_data));
+
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o755);
+
+    writer.start_file(path, options).unwrap();
+    writer.write_all(content).unwrap();
+    writer.finish().unwrap();
+    archive_data
+}
+
 // ============================================================================
 // Integration Tests
 // ============================================================================
@@ -1455,6 +1474,74 @@ async fn test_download_with_extract_file_not_found() {
     let response = reqwest::Client::new()
         .get(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.tar.gz&extract=nonexistent/path"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = parse_download_chunks(&response.bytes().await.unwrap());
+    assert!(!chunks.is_empty(), "Expected at least one chunk");
+
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "error", "Got: {:?}", last_chunk);
+
+    let message = last_chunk["message"].as_str().unwrap();
+    assert!(message.contains("not found"), "Error: {}", message);
+    assert!(
+        message.contains("other/path/file.txt"),
+        "Error: {}",
+        message
+    );
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_download_with_extract_from_zip() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+    let test_content = b"#!/bin/sh\necho 'Hello from zip'";
+    let archive = create_test_zip("package/bin/myexe", test_content);
+    let (file_port, file_shutdown_tx) = start_file_server("/archive.zip", archive).await;
+
+    let test_key = format!("extract_zip_test_{}", uuid::Uuid::new_v4());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract=package/bin/myexe&executable=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = parse_download_chunks(&response.bytes().await.unwrap());
+    assert!(!chunks.is_empty(), "Expected at least one chunk");
+
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "done", "Got: {:?}", last_chunk);
+
+    let path = last_chunk["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), test_content);
+    assert!(std::fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0);
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_download_with_extract_from_zip_not_found() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+    let archive = create_test_zip("other/path/file.txt", b"content");
+    let (file_port, file_shutdown_tx) = start_file_server("/archive.zip", archive).await;
+
+    let test_key = format!("extract_zip_notfound_{}", uuid::Uuid::new_v4());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract=nonexistent/path"
         ))
         .send()
         .await
