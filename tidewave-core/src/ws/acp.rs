@@ -286,9 +286,6 @@ pub struct AcpChannelState {
     /// Session to Channel mapping (session_id -> channel_id)
     /// Used when we need to forward an ACP message to the correct channel.
     pub session_to_channel: Arc<DashMap<SessionId, ChannelId>>,
-    /// Channel to Process mapping (channel_id -> process_key)
-    /// Used when we need to forward a channel message to the ACP process.
-    pub channel_to_process: Arc<DashMap<ChannelId, ProcessKey>>,
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
     /// Locks to prevent multiple concurrent process starts for the same process_key
@@ -306,16 +303,9 @@ impl AcpChannelState {
             channel_senders: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             session_to_channel: Arc::new(DashMap::new()),
-            channel_to_process: Arc::new(DashMap::new()),
             process_starter,
             process_start_locks: Arc::new(DashMap::new()),
         }
-    }
-}
-
-impl Default for AcpChannelState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -563,18 +553,16 @@ pub async fn init(
         join_ref: msg.join_ref.clone(),
     };
 
-    // Store the sender for this channel
-    state.channel_senders.insert(channel_id, sender);
-
     // Parse spawn options from join payload
     let spawn_opts: TidewaveSpawnOptions = match serde_json::from_value(msg.payload.clone()) {
         Ok(opts) => opts,
         Err(e) => {
-            state.channel_senders.remove(&channel_id);
             return InitResult::Error(format!("invalid spawn options: {}", e));
         }
     };
 
+    // Store the sender for this channel
+    state.channel_senders.insert(channel_id, sender);
     // Generate process key and start/reuse process
     let process_key = format!("{}:{}", &spawn_opts.command, &spawn_opts.cwd);
 
@@ -607,11 +595,6 @@ pub async fn init(
     drop(guard);
     state.process_start_locks.remove(&process_key);
 
-    // Map channel to process
-    state
-        .channel_to_process
-        .insert(channel_id, process_key.clone());
-
     // Subscribe to exit broadcast before entering the loop.
     // This must happen before the OK reply so we don't miss an exit that
     // occurs between reply and the first select! iteration.
@@ -622,7 +605,6 @@ pub async fn init(
             None => {
                 // Process already gone
                 state.channel_senders.remove(&channel_id);
-                state.channel_to_process.remove(&channel_id);
                 return InitResult::Error("process exited before channel init".to_string());
             }
         }
@@ -675,12 +657,12 @@ pub async fn init(
                                     message
                                 );
 
-                                if let Err(e) = handle_client_message(state, channel_id, message).await {
+                                if let Err(e) = handle_client_message(state, channel_id, message, &process_key).await {
                                     error!("Error handling client message: {}", e);
                                 }
                             }
                             "exit" => {
-                                if let Err(e) = handle_exit_request(state, channel_id).await {
+                                if let Err(e) = handle_exit_request(state, &process_key).await {
                                     error!("Error handling exit request: {}", e);
                                 }
                             }
@@ -702,7 +684,6 @@ pub async fn init(
     debug!("ACP channel terminating for channel_id: {}", channel_id);
 
     state.channel_senders.remove(&channel_id);
-    state.channel_to_process.remove(&channel_id);
 
     // Capture sessions for this channel and remove mappings.
     // We first collect all session IDs that map to this channel, then look up
@@ -785,22 +766,23 @@ async fn handle_client_message(
     state: &AcpChannelState,
     channel_id: ChannelId,
     message: JsonRpcMessage,
+    process_key: &ProcessKey,
 ) -> Result<()> {
     match &message {
         JsonRpcMessage::Request(req) => {
             debug!("Handling request: {} with method {}", req.id, req.method);
-            handle_client_request(state, channel_id, req).await
+            handle_client_request(state, channel_id, req, process_key).await
         }
         JsonRpcMessage::Notification(notif) => {
             debug!("Handling notification with method {}", notif.method);
-            handle_client_notification(state, channel_id, notif).await
+            handle_client_notification(state, channel_id, notif, process_key).await
         }
         JsonRpcMessage::Response(resp) => {
             // Forward client responses (e.g., permission responses) back to the process.
             // Note that we don't need to perform ID mapping here, because the process is
             // the one that generated the request ID, so it will necessarily be unique.
             debug!("Forwarding response for ID {} to process", resp.id);
-            forward_response_to_process(state, channel_id, resp).await
+            forward_response_to_process(state, resp, process_key).await
         }
     }
 }
@@ -809,20 +791,21 @@ async fn handle_client_request(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
+    process_key: &ProcessKey,
 ) -> Result<()> {
     match request.method.as_str() {
         // We handle init because we need to
         //   1. Start a new process in case there's no running one for the given parameters.
         //   2. In case we start, store the request ID to store the response later on.
-        "initialize" => handle_initialize_request(state, channel_id, request).await,
+        "initialize" => handle_initialize_request(state, channel_id, request, process_key).await,
         // Our custom session load handler
         "_tidewave.ai/session/load" => {
             handle_tidewave_session_load(state, channel_id, request).await
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
-        "session/load" => handle_acp_session_load(state, channel_id, request).await,
+        "session/load" => handle_acp_session_load(state, channel_id, request, process_key).await,
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
-        _ => handle_regular_request(state, channel_id, request).await,
+        _ => handle_regular_request(state, channel_id, request, process_key).await,
     }
 }
 
@@ -830,9 +813,10 @@ async fn handle_initialize_request(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
+    process_key: &ProcessKey,
 ) -> Result<()> {
     // Process was already started during channel join
-    let process_state = ensure_process_for_channel(state, channel_id)?;
+    let process_state = ensure_process(state, process_key)?;
 
     // Fast path: already have a cached init response
     if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
@@ -932,11 +916,6 @@ async fn handle_tidewave_session_load(
     let was_cancelled = session_state.cancelled.swap(false, Ordering::SeqCst);
 
     if let Some(sender) = state.channel_senders.get(&channel_id) {
-        // Map channel to process (needed for any requests during catchup)
-        state
-            .channel_to_process
-            .insert(channel_id, session_state.process_key.clone());
-
         // ATOMIC CATCHUP: Hold the buffer read lock for the entire operation
         // This prevents new messages from being added while we're catching up,
         // ensuring we don't miss any messages.
@@ -981,6 +960,7 @@ async fn handle_acp_session_load(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
+    process_key: &ProcessKey,
 ) -> Result<()> {
     let session_id = extract_session_id_from_request(request);
 
@@ -989,36 +969,20 @@ async fn handle_acp_session_load(
             return Ok(());
         }
 
-        let process_key = match state.sessions.get(&session_id) {
-            Some(session_state) => {
-                info!(
-                    "session/load for existing session {} on channel {}",
-                    session_id, channel_id
-                );
-                session_state.process_key.clone()
-            }
-            None => {
-                let process_key = match find_process_key_for_channel(state, channel_id) {
-                    Some(key) => key,
-                    None => {
-                        warn!(
-                            "session/load: no process mapping found for channel {}",
-                            channel_id
-                        );
-                        return handle_regular_request(state, channel_id, request).await;
-                    }
-                };
+        if state.sessions.contains_key(&session_id) {
+            info!(
+                "session/load for existing session {} on channel {}",
+                session_id, channel_id
+            );
+        } else {
+            let session_state = Arc::new(SessionState::new(process_key.clone()));
+            state.sessions.insert(session_id.clone(), session_state);
 
-                let session_state = Arc::new(SessionState::new(process_key.clone()));
-                state.sessions.insert(session_id.clone(), session_state);
-
-                info!(
-                    "Created new session {} for session/load on channel {}",
-                    session_id, channel_id
-                );
-                process_key
-            }
-        };
+            info!(
+                "Created new session {} for session/load on channel {}",
+                session_id, channel_id
+            );
+        }
 
         // Map this channel to the session BEFORE forwarding the request
         // This ensures that when the agent sends notifications during session/load,
@@ -1026,7 +990,6 @@ async fn handle_acp_session_load(
         state
             .session_to_channel
             .insert(session_id.clone(), channel_id);
-        state.channel_to_process.insert(channel_id, process_key);
 
         info!(
             "Mapped channel {} to session {} for session/load",
@@ -1035,22 +998,11 @@ async fn handle_acp_session_load(
     }
 
     // Forward the request to the agent as a regular request
-    handle_regular_request(state, channel_id, request).await
+    handle_regular_request(state, channel_id, request, process_key).await
 }
 
-async fn handle_exit_request(state: &AcpChannelState, channel_id: ChannelId) -> Result<()> {
-    let process_key = match state.channel_to_process.get(&channel_id) {
-        Some(key) => key.clone(),
-        None => {
-            warn!(
-                "Exit request for channel {} with no process mapping",
-                channel_id
-            );
-            return Ok(());
-        }
-    };
-
-    let process_state = match state.processes.get(&process_key) {
+async fn handle_exit_request(state: &AcpChannelState, process_key: &ProcessKey) -> Result<()> {
+    let process_state = match state.processes.get(process_key) {
         Some(process) => process.clone(),
         None => {
             warn!("Exit request for non-existent process: {}", process_key);
@@ -1082,8 +1034,9 @@ async fn handle_regular_request(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
+    process_key: &ProcessKey,
 ) -> Result<()> {
-    let process_state = ensure_process_for_channel(state, channel_id)?;
+    let process_state = ensure_process(state, process_key)?;
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
@@ -1135,10 +1088,11 @@ async fn handle_client_notification(
     state: &AcpChannelState,
     channel_id: ChannelId,
     notification: &JsonRpcNotification,
+    process_key: &ProcessKey,
 ) -> Result<()> {
     match notification.method.as_str() {
         "_tidewave.ai/ack" => handle_ack_notification(state, channel_id, notification).await,
-        _ => forward_notification_to_process(state, channel_id, notification).await,
+        _ => forward_notification_to_process(state, notification, process_key).await,
     }
 }
 
@@ -1173,10 +1127,10 @@ async fn handle_ack_notification(
 
 async fn forward_notification_to_process(
     state: &AcpChannelState,
-    channel_id: ChannelId,
     notification: &JsonRpcNotification,
+    process_key: &ProcessKey,
 ) -> Result<()> {
-    let process_state = ensure_process_for_channel(state, channel_id)?;
+    let process_state = ensure_process(state, process_key)?;
 
     process_state
         .send_to_process(JsonRpcMessage::Notification(notification.clone()))
@@ -1187,10 +1141,10 @@ async fn forward_notification_to_process(
 
 async fn forward_response_to_process(
     state: &AcpChannelState,
-    channel_id: ChannelId,
     response: &JsonRpcResponse,
+    process_key: &ProcessKey,
 ) -> Result<()> {
-    let process_state = ensure_process_for_channel(state, channel_id)?;
+    let process_state = ensure_process(state, process_key)?;
 
     // Forward response directly (no ID mapping needed for process -> client -> process flow)
     process_state
@@ -1461,39 +1415,12 @@ fn ensure_session_not_active(
     true
 }
 
-/// Looks up the process for the given channel ID.
-fn ensure_process_for_channel(
-    state: &AcpChannelState,
-    channel_id: ChannelId,
-) -> Result<Arc<ProcessState>> {
-    let process_key = match state.channel_to_process.get(&channel_id) {
-        Some(key) => key.clone(),
-        None => {
-            return Err(anyhow!(
-                "No process mapping found for channel: {}",
-                channel_id
-            ))
-        }
-    };
-
-    let process_state = match state.processes.get(&process_key) {
-        Some(process) => process.clone(),
-        None => {
-            return Err(anyhow!("Process not found for key: {}", process_key));
-        }
-    };
-
-    Ok(process_state)
-}
-
-fn find_process_key_for_channel(
-    state: &AcpChannelState,
-    channel_id: ChannelId,
-) -> Option<ProcessKey> {
-    state
-        .channel_to_process
-        .get(&channel_id)
-        .map(|key| key.clone())
+/// Looks up the process for the given process key.
+fn ensure_process(state: &AcpChannelState, process_key: &ProcessKey) -> Result<Arc<ProcessState>> {
+    match state.processes.get(process_key) {
+        Some(process) => Ok(process.clone()),
+        None => Err(anyhow!("Process not found for key: {}", process_key)),
+    }
 }
 
 // ============================================================================
@@ -1602,7 +1529,7 @@ async fn maybe_handle_session_load_resume(
                 session_id
             ));
         } else {
-            map_session_id_to_channel(state, session_id, channel_id).await;
+            map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
         }
     }
 
@@ -1628,7 +1555,13 @@ async fn maybe_handle_session_new_response(
             if let Ok(session_response) =
                 serde_json::from_value::<NewSessionResponse>(result.clone())
             {
-                map_session_id_to_channel(state, session_response.session_id, channel_id).await;
+                map_session_id_to_channel(
+                    state,
+                    session_response.session_id,
+                    channel_id,
+                    &process_state.key,
+                )
+                .await;
             }
         }
     }
@@ -1638,18 +1571,12 @@ async fn map_session_id_to_channel(
     state: &AcpChannelState,
     session_id: SessionId,
     channel_id: ChannelId,
+    process_key: &ProcessKey,
 ) {
     if !state.sessions.contains_key(&session_id) {
-        let process_key = state
-            .channel_to_process
-            .get(&channel_id)
-            .map(|key| key.clone());
-
-        if let Some(process_key) = process_key {
-            let session_state = Arc::new(SessionState::new(process_key));
-            state.sessions.insert(session_id.clone(), session_state);
-            state.session_to_channel.insert(session_id, channel_id);
-        }
+        let session_state = Arc::new(SessionState::new(process_key.clone()));
+        state.sessions.insert(session_id.clone(), session_state);
+        state.session_to_channel.insert(session_id, channel_id);
     } else {
         warn!(
             "Unexpectedly got new/load/fork session response for already known session! {}",

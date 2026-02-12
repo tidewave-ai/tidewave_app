@@ -35,10 +35,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use uuid::Uuid;
 
-pub use connection::ws_handler;
-pub use watch::WatchFeatureState;
-
 use crate::phoenix::PhxMessage;
+pub use connection::ws_handler;
 
 // ============================================================================
 // Types
@@ -70,23 +68,17 @@ impl ChannelSender {
 #[derive(Clone)]
 pub struct WsState {
     /// Watch feature state
-    pub watch: WatchFeatureState,
+    pub watch: watch::WatchFeatureState,
     /// ACP channel state
     pub acp: acp::AcpChannelState,
     /// MCP channel state
     pub mcp: mcp::McpChannelState,
 }
 
-impl Default for WsState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WsState {
     pub fn new() -> Self {
         Self {
-            watch: WatchFeatureState::new(),
+            watch: watch::WatchFeatureState::new(),
             acp: acp::AcpChannelState::new(),
             mcp: mcp::McpChannelState::new(),
         }
