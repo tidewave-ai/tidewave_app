@@ -9,6 +9,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+#[cfg(not(target_os = "linux"))]
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing::{debug, error, info};
@@ -284,7 +285,20 @@ fn open_tidewave(app: &tauri::AppHandle, port: u16, https_port: Option<u16>) {
     } else {
         format!("http://localhost:{}", port)
     };
-    if let Err(e) = app.opener().open_url(&url, None::<&str>) {
+    #[cfg(target_os = "linux")]
+    let result = command_with_limited_env("xdg-open")
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+
+    #[cfg(not(target_os = "linux"))]
+    let result = app
+        .opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string());
+
+    if let Err(e) = result {
         let message = format!(
             "Failed to open Tidewave: {}. Please open {} in your browser instead.",
             e, url
@@ -309,15 +323,21 @@ fn open_config_file(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
 
     #[cfg(target_os = "windows")]
     {
-        // silence unused variable warning
         let _ = app;
-
         std::process::Command::new("notepad.exe")
             .arg(&config_path)
             .spawn()?;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        command_with_limited_env("xdg-open")
+            .arg(&config_path)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "macos")]
     {
         app.opener()
             .open_path(config_path.to_str().unwrap(), None::<&str>)?;
@@ -515,8 +535,24 @@ fn init_tracing(
 
 fn open_log_file(app: &tauri::AppHandle) {
     if let Some(log_state) = app.try_state::<LogState>() {
-        let _ = app
-            .opener()
-            .open_path(log_state.log_path.display().to_string(), None::<&str>);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = command_with_limited_env("xdg-open")
+                .arg(log_state.log_path.display().to_string())
+                .spawn();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = app
+                .opener()
+                .open_path(log_state.log_path.display().to_string(), None::<&str>);
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn command_with_limited_env(program: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    tidewave_core::cleanup_appimage_env(&mut cmd);
+    cmd
 }
