@@ -1,7 +1,7 @@
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{load_tls_config_from_paths, normalize_path};
+use crate::utils::{load_tls_config_from_paths, normalize_path, wslpath_to_windows};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -112,6 +112,8 @@ enum StatResponse {
         mtime: u64,
         #[serde(rename = "type")]
         path_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        windows_path: Option<String>,
     },
     StatResponseErr {
         success: bool,
@@ -833,11 +835,19 @@ async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatRespon
     let result = fetch_stat(&file_path);
 
     match result {
-        Ok((mtime, path_type)) => Ok(Json(StatResponse::StatResponseOk {
-            success: true,
-            mtime,
-            path_type,
-        })),
+        Ok((mtime, path_type)) => {
+            let windows_path = if query.is_wsl {
+                wslpath_to_windows(&query.path).await.ok()
+            } else {
+                None
+            };
+            Ok(Json(StatResponse::StatResponseOk {
+                success: true,
+                mtime,
+                path_type,
+                windows_path,
+            }))
+        }
         Err(error) => Ok(Json(StatResponse::StatResponseErr {
             success: false,
             error,
