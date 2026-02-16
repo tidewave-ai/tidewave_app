@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.3.4"
 
 [patch.crates-io]
 # TODO: upstream
