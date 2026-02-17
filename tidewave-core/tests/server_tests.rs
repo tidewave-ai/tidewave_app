@@ -1323,7 +1323,7 @@ async fn test_download_basic() {
 #[tokio::test]
 async fn test_download_concurrent_with_throttle() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
-    let test_content: Vec<u8> = vec![b'x'; 102400]; // 100KB
+    let test_content: Vec<u8> = vec![b'x'; 20480]; // 20KB (~2s at 10KB/s throttle)
     let test_key = format!("concurrent_test_{}", uuid::Uuid::new_v4());
     let (file_port, file_shutdown_tx) = start_file_server("/large.txt", test_content.clone()).await;
 
