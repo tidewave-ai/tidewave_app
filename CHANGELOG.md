@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.5 (2026-02-17)
+
+* Fix `xdg-open` in appimage
+* Return Windows path information when running on WSL on Windows
+* Add "Launch at Login" feature
+* Add terminal support
+
 ## v0.3.4 (2026-02-10)
 
 * Add file system watching endpoint
