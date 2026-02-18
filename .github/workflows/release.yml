@@ -58,7 +58,7 @@ jobs:
           echo "release-name=${ref_name}" >> $GITHUB_OUTPUT
 
   build:
-    name: "build (${{ matrix.gui_target }})"
+    name: ${{ matrix.gui_target && format('GUI ({0})', matrix.gui_target) || format('CLI ({0})', matrix.cli_targets) }}
     needs: [ensure-release]
     outputs:
       app-version: ${{ steps.app-version.outputs.version }}
@@ -66,20 +66,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # CLI
           - platform: macos-15
-            gui_target:  "aarch64-apple-darwin"
             cli_targets: "aarch64-apple-darwin x86_64-apple-darwin"
-          - platform: macos-15
-            gui_target:  "x86_64-apple-darwin"
           - platform: windows-2025
             cli_targets: "x86_64-pc-windows-msvc"
-            gui_target:  "x86_64-pc-windows-msvc"
           - platform: ubuntu-22.04
             cli_targets: "x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
-            gui_target:  "x86_64-unknown-linux-gnu"
           - platform: ubuntu-22.04-arm
             cli_targets: "aarch64-unknown-linux-gnu"
-            gui_target:  "aarch64-unknown-linux-gnu"
+
+          # GUI
+          - platform: macos-15
+            gui_target: "aarch64-apple-darwin"
+          - platform: macos-15
+            gui_target: "x86_64-apple-darwin"
+          - platform: windows-2025
+            gui_target: "x86_64-pc-windows-msvc"
+          - platform: ubuntu-22.04
+            gui_target: "x86_64-unknown-linux-gnu"
+          - platform: ubuntu-22.04-arm
+            gui_target: "aarch64-unknown-linux-gnu"
 
     runs-on: ${{ matrix.platform }}
 
@@ -124,6 +131,7 @@ jobs:
             xdg-utils
 
       - name: Install Tauri CLI
+        if: matrix.gui_target != ''
         shell: bash
         run: |
           # Only install if not already cached
@@ -159,17 +167,19 @@ jobs:
           fi
 
       - name: Install targets
+        if: matrix.gui_target != ''
         shell: bash
         run: |
           rustup target add "${{ matrix.gui_target }}"
 
       - name: Install trusted-signing-cli (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.gui_target != ''
         run: |
           # TODO: use git dependency until trusted-signing-cli next release (v0.8.1 or v0.9)
           cargo install --git https://github.com/Levminer/trusted-signing-cli.git --rev 5415376 trusted-signing-cli
 
       - name: Build GUI
+        if: matrix.gui_target != ''
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -195,7 +205,7 @@ jobs:
           assetNamePattern: "tidewave-app-[arch][ext]"
 
       - name: Verify GUI notarization (macos)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.gui_target != ''
         shell: bash
         run: |
           app_path="target/${{ matrix.gui_target }}/release/bundle/macos/tidewave.app"
@@ -203,8 +213,8 @@ jobs:
           spctl -a -t exec -vvv "$app_path"
 
       - name: Build CLI binaries
+        if: matrix.gui_target == ''
         shell: bash
-        if: matrix.cli_targets != ''
         run: |
           for target in ${{ matrix.cli_targets }}; do
             echo "Building CLI for $target"
@@ -218,7 +228,7 @@ jobs:
           done
 
       - name: Sign CLI binaries (macos)
-        if: runner.os == 'macOS' && matrix.cli_targets != ''
+        if: runner.os == 'macOS' && matrix.gui_target == ''
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -249,7 +259,7 @@ jobs:
           done
 
       - name: Sign CLI binaries (windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.gui_target == ''
         uses: azure/trusted-signing-action@v0.4.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -266,7 +276,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Upload CLI binaries
-        if: matrix.cli_targets != ''
+        if: matrix.gui_target == ''
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
