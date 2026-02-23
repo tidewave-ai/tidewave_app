@@ -347,6 +347,15 @@ pub struct ProcessState {
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
     pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
     pub fork_request_ids: Arc<DashSet<Value>>,
+
+    /// Epoch counter bumped each time a client connects. Used to invalidate
+    /// pending inactivity timers when a new client arrives.
+    pub connect_epoch: Arc<AtomicU64>,
+    /// Whether the agent supports resuming sessions (loadSession, session.fork,
+    /// or session.resume in agentCapabilities). Set from init response.
+    /// When true, the process can be stopped on inactivity since sessions
+    /// can be restored after a restart.
+    pub supports_resuming: Arc<RwLock<Option<bool>>>,
 }
 
 pub struct SessionState {
@@ -387,6 +396,8 @@ impl ProcessState {
             load_request_ids: Arc::new(DashMap::new()),
             resume_request_ids: Arc::new(DashMap::new()),
             fork_request_ids: Arc::new(DashSet::<Value>::new()),
+            connect_epoch: Arc::new(AtomicU64::new(0)),
+            supports_resuming: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -601,7 +612,11 @@ pub async fn init(
     let mut exit_rx = {
         let process_state = state.processes.get(&process_key).map(|p| p.clone());
         match process_state {
-            Some(ps) => ps.exit_broadcast.subscribe(),
+            Some(ps) => {
+                // Bump connect epoch to invalidate any pending inactivity timer
+                ps.connect_epoch.fetch_add(1, Ordering::SeqCst);
+                ps.exit_broadcast.subscribe()
+            }
             None => {
                 // Process already gone
                 state.channel_senders.remove(&channel_id);
@@ -683,6 +698,10 @@ pub async fn init(
     // Cleanup
     debug!("ACP channel terminating for channel_id: {}", channel_id);
 
+    // Drop our exit broadcast subscription before checking receiver count,
+    // so our own subscription is not counted.
+    drop(exit_rx);
+
     state.channel_senders.remove(&channel_id);
 
     // Capture sessions for this channel and remove mappings.
@@ -754,6 +773,58 @@ pub async fn init(
             }
         }
     });
+
+    // If this was the last connected client, spawn a 1-minute inactivity timer
+    // that stops the process (if the agent supports resuming sessions).
+    if let Some(process_state) = state.processes.get(&process_key) {
+        if process_state.exit_broadcast.receiver_count() == 0 {
+            let epoch = process_state.connect_epoch.load(Ordering::SeqCst);
+            let process_state = process_state.clone();
+            let process_key = process_key.clone();
+            let state_clone = state.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+                // Check if epoch still matches (no new client connected in the meantime)
+                if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
+                    debug!(
+                        "Skipping process stop for {} (client reconnected)",
+                        process_key
+                    );
+                    return;
+                }
+
+                // Check if the agent supports resuming sessions
+                let supports_resuming = process_state
+                    .supports_resuming
+                    .read()
+                    .await
+                    .unwrap_or(false);
+
+                if !supports_resuming {
+                    debug!(
+                        "Skipping process stop for {} (agent does not support resuming)",
+                        process_key
+                    );
+                    return;
+                }
+
+                info!(
+                    "Stopping process {} after 1 minute of inactivity",
+                    process_key
+                );
+
+                // Remove from state first so new clients start a fresh process
+                // instead of connecting to one that's about to be killed.
+                state_clone.processes.remove(&process_key);
+
+                if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+                    let _ = exit_tx.send(());
+                }
+            });
+        }
+    }
 
     result
 }
@@ -1494,7 +1565,11 @@ async fn maybe_handle_init_response(
     let init_request_id = process_state.init_request_id.read().await;
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
-                               // Store init response for future inits
+
+        // Parse agent capabilities to check for session resuming support
+        *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
+
+        // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
         // Notify any waiters that the init response is now cached
         process_state.init_complete.notify_waiters();
@@ -1677,6 +1752,33 @@ async fn handle_process_notification_or_request(
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+/// Check if the agent supports resuming sessions by examining agentCapabilities
+/// in the init response. Checks for loadSession, session.fork, or session.resume.
+fn check_supports_resuming(response: &JsonRpcResponse) -> bool {
+    let caps = response
+        .result
+        .as_ref()
+        .and_then(|r| r.get("agentCapabilities"));
+
+    let Some(caps) = caps else {
+        return false;
+    };
+
+    // loadSession: true
+    if caps.get("loadSession").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+
+    // session: { fork: {}, resume: {} }
+    if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
+        if session.contains_key("fork") || session.contains_key("resume") {
+            return true;
+        }
+    }
+
+    false
+}
 
 fn inject_notification_id(notification: &mut JsonRpcNotification, notif_id: NotificationId) {
     // Add _meta.tidewave.ai/notificationId to params
@@ -2282,5 +2384,68 @@ mod tests {
 
         // Should add notification ID
         assert_eq!(meta.get("tidewave.ai/notificationId").unwrap(), "notif_99");
+    }
+
+    // ============================================================================
+    // check_supports_resuming Tests
+    // ============================================================================
+
+    fn make_init_response(agent_capabilities: Value) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(0)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": agent_capabilities,
+            })),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_supports_resuming_with_load_session() {
+        let response = make_init_response(json!({ "loadSession": true }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_session_fork() {
+        let response = make_init_response(json!({ "session": { "fork": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_session_resume() {
+        let response = make_init_response(json!({ "session": { "resume": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_fork_and_resume() {
+        let response = make_init_response(json!({ "session": { "fork": {}, "resume": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_empty_capabilities() {
+        let response = make_init_response(json!({}));
+        assert!(!check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_no_result() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(0)),
+            result: None,
+            error: None,
+        };
+        assert!(!check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_load_session_false() {
+        let response = make_init_response(json!({ "loadSession": false }));
+        assert!(!check_supports_resuming(&response));
     }
 }
