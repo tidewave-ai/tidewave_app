@@ -289,7 +289,7 @@ pub struct AcpChannelState {
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
     /// Locks to prevent multiple concurrent process starts for the same process_key
-    pub process_start_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
+    pub process_lifecycle_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
 }
 
 impl AcpChannelState {
@@ -304,7 +304,7 @@ impl AcpChannelState {
             sessions: Arc::new(DashMap::new()),
             session_to_channel: Arc::new(DashMap::new()),
             process_starter,
-            process_start_locks: Arc::new(DashMap::new()),
+            process_lifecycle_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -347,6 +347,15 @@ pub struct ProcessState {
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
     pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
     pub fork_request_ids: Arc<DashSet<Value>>,
+
+    /// Epoch counter bumped each time a client connects. Used to invalidate
+    /// pending inactivity timers when a new client arrives.
+    pub connect_epoch: Arc<AtomicU64>,
+    /// Whether the agent supports resuming sessions (loadSession, session.fork,
+    /// or session.resume in agentCapabilities). Set from init response.
+    /// When true, the process can be stopped on inactivity since sessions
+    /// can be restored after a restart.
+    pub supports_resuming: Arc<RwLock<Option<bool>>>,
 }
 
 pub struct SessionState {
@@ -387,6 +396,8 @@ impl ProcessState {
             load_request_ids: Arc::new(DashMap::new()),
             resume_request_ids: Arc::new(DashMap::new()),
             fork_request_ids: Arc::new(DashSet::<Value>::new()),
+            connect_epoch: Arc::new(AtomicU64::new(0)),
+            supports_resuming: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -568,7 +579,7 @@ pub async fn init(
 
     // Acquire or create a lock for this process_key
     let lock = state
-        .process_start_locks
+        .process_lifecycle_locks
         .entry(process_key.clone())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
@@ -585,30 +596,36 @@ pub async fn init(
             }
             Err(e) => {
                 drop(guard);
-                state.process_start_locks.remove(&process_key);
+                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error(format!("failed to start process: {}", e));
             }
         }
     }
 
-    drop(guard);
-    state.process_start_locks.remove(&process_key);
-
-    // Subscribe to exit broadcast before entering the loop.
-    // This must happen before the OK reply so we don't miss an exit that
-    // occurs between reply and the first select! iteration.
+    // Subscribe to exit broadcast and bump epoch while still holding the
+    // lifecycle lock.  This prevents the inactivity timer (which also acquires
+    // this lock) from removing the process between lock release and subscribe.
     let mut exit_rx = {
         let process_state = state.processes.get(&process_key).map(|p| p.clone());
         match process_state {
-            Some(ps) => ps.exit_broadcast.subscribe(),
+            Some(ps) => {
+                // Bump connect epoch to invalidate any pending inactivity timer
+                ps.connect_epoch.fetch_add(1, Ordering::SeqCst);
+                ps.exit_broadcast.subscribe()
+            }
             None => {
                 // Process already gone
+                drop(guard);
+                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error("process exited before channel init".to_string());
             }
         }
     };
+
+    drop(guard);
+    state.process_lifecycle_locks.remove(&process_key);
 
     // Send success reply
     let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({})));
@@ -683,6 +700,10 @@ pub async fn init(
     // Cleanup
     debug!("ACP channel terminating for channel_id: {}", channel_id);
 
+    // Drop our exit broadcast subscription before checking receiver count,
+    // so our own subscription is not counted.
+    drop(exit_rx);
+
     state.channel_senders.remove(&channel_id);
 
     // Capture sessions for this channel and remove mappings.
@@ -754,6 +775,61 @@ pub async fn init(
             }
         }
     });
+
+    // If this was the last connected client, spawn a 1-minute inactivity timer
+    // that stops the process (if the agent supports resuming sessions).
+    if let Some(process_state) = state.processes.get(&process_key) {
+        // Check if the agent supports resuming sessions
+        let supports_resuming = process_state
+            .supports_resuming
+            .read()
+            .await
+            .unwrap_or(false);
+
+        if process_state.exit_broadcast.receiver_count() == 0 && supports_resuming {
+            let epoch = process_state.connect_epoch.load(Ordering::SeqCst);
+            let process_state = process_state.clone();
+            let process_key = process_key.clone();
+            let state_clone = state.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+                // Acquire the lifecycle lock so we don't race with a new
+                // client that is between process lookup and exit_broadcast
+                // subscribe (where it bumps connect_epoch).
+                let lock = state_clone
+                    .process_lifecycle_locks
+                    .entry(process_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let _guard = lock.lock().await;
+
+                // Re-check epoch now that we hold the lock – a client that
+                // connected while we were waiting will have bumped it.
+                if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
+                    debug!(
+                        "Skipping process stop for {} (client reconnected)",
+                        process_key
+                    );
+                    return;
+                }
+
+                info!(
+                    "Stopping process {} after 1 minute of inactivity",
+                    process_key
+                );
+
+                // Remove from state first so new clients start a fresh process
+                // instead of connecting to one that's about to be killed.
+                state_clone.processes.remove(&process_key);
+
+                if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+                    let _ = exit_tx.send(());
+                }
+            });
+        }
+    }
 
     result
 }
@@ -1304,6 +1380,15 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             (None, None)
         };
 
+        // Acquire the lifecycle lock so that broadcast + remove is atomic
+        // with respect to new clients subscribing to exit_broadcast.
+        let lock = state_exit
+            .process_lifecycle_locks
+            .entry(process_state_exit.key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         // Broadcast exit event to all subscribed init loops
         let _ = process_state_exit.exit_broadcast.send(AgentExitEvent {
             error: error_type.to_string(),
@@ -1494,7 +1579,11 @@ async fn maybe_handle_init_response(
     let init_request_id = process_state.init_request_id.read().await;
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
-                               // Store init response for future inits
+
+        // Parse agent capabilities to check for session resuming support
+        *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
+
+        // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
         // Notify any waiters that the init response is now cached
         process_state.init_complete.notify_waiters();
@@ -1677,6 +1766,33 @@ async fn handle_process_notification_or_request(
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+/// Check if the agent supports resuming sessions by examining agentCapabilities
+/// in the init response. Checks for loadSession, session.fork, or session.resume.
+fn check_supports_resuming(response: &JsonRpcResponse) -> bool {
+    let caps = response
+        .result
+        .as_ref()
+        .and_then(|r| r.get("agentCapabilities"));
+
+    let Some(caps) = caps else {
+        return false;
+    };
+
+    // loadSession: true
+    if caps.get("loadSession").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+
+    // session: { fork: {}, resume: {} }
+    if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
+        if session.contains_key("fork") || session.contains_key("resume") {
+            return true;
+        }
+    }
+
+    false
+}
 
 fn inject_notification_id(notification: &mut JsonRpcNotification, notif_id: NotificationId) {
     // Add _meta.tidewave.ai/notificationId to params
@@ -2282,5 +2398,68 @@ mod tests {
 
         // Should add notification ID
         assert_eq!(meta.get("tidewave.ai/notificationId").unwrap(), "notif_99");
+    }
+
+    // ============================================================================
+    // check_supports_resuming Tests
+    // ============================================================================
+
+    fn make_init_response(agent_capabilities: Value) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(0)),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": agent_capabilities,
+            })),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_supports_resuming_with_load_session() {
+        let response = make_init_response(json!({ "loadSession": true }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_session_fork() {
+        let response = make_init_response(json!({ "session": { "fork": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_session_resume() {
+        let response = make_init_response(json!({ "session": { "resume": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_fork_and_resume() {
+        let response = make_init_response(json!({ "session": { "fork": {}, "resume": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_empty_capabilities() {
+        let response = make_init_response(json!({}));
+        assert!(!check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_no_result() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(0)),
+            result: None,
+            error: None,
+        };
+        assert!(!check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_load_session_false() {
+        let response = make_init_response(json!({ "loadSession": false }));
+        assert!(!check_supports_resuming(&response));
     }
 }
