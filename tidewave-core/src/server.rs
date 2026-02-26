@@ -101,6 +101,7 @@ struct WhichParams {
 #[derive(Deserialize)]
 struct AboutParams {
     #[serde(default)]
+    #[allow(dead_code)]
     is_wsl: bool,
 }
 
