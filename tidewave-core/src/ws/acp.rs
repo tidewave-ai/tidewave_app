@@ -289,7 +289,7 @@ pub struct AcpChannelState {
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
     /// Locks to prevent multiple concurrent process starts for the same process_key
-    pub process_start_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
+    pub process_lifecycle_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
 }
 
 impl AcpChannelState {
@@ -304,7 +304,7 @@ impl AcpChannelState {
             sessions: Arc::new(DashMap::new()),
             session_to_channel: Arc::new(DashMap::new()),
             process_starter,
-            process_start_locks: Arc::new(DashMap::new()),
+            process_lifecycle_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -579,7 +579,7 @@ pub async fn init(
 
     // Acquire or create a lock for this process_key
     let lock = state
-        .process_start_locks
+        .process_lifecycle_locks
         .entry(process_key.clone())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
@@ -596,19 +596,16 @@ pub async fn init(
             }
             Err(e) => {
                 drop(guard);
-                state.process_start_locks.remove(&process_key);
+                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error(format!("failed to start process: {}", e));
             }
         }
     }
 
-    drop(guard);
-    state.process_start_locks.remove(&process_key);
-
-    // Subscribe to exit broadcast before entering the loop.
-    // This must happen before the OK reply so we don't miss an exit that
-    // occurs between reply and the first select! iteration.
+    // Subscribe to exit broadcast and bump epoch while still holding the
+    // lifecycle lock.  This prevents the inactivity timer (which also acquires
+    // this lock) from removing the process between lock release and subscribe.
     let mut exit_rx = {
         let process_state = state.processes.get(&process_key).map(|p| p.clone());
         match process_state {
@@ -619,11 +616,16 @@ pub async fn init(
             }
             None => {
                 // Process already gone
+                drop(guard);
+                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error("process exited before channel init".to_string());
             }
         }
     };
+
+    drop(guard);
+    state.process_lifecycle_locks.remove(&process_key);
 
     // Send success reply
     let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({})));
@@ -793,7 +795,18 @@ pub async fn init(
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
-                // Check if epoch still matches (no new client connected in the meantime)
+                // Acquire the lifecycle lock so we don't race with a new
+                // client that is between process lookup and exit_broadcast
+                // subscribe (where it bumps connect_epoch).
+                let lock = state_clone
+                    .process_lifecycle_locks
+                    .entry(process_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let _guard = lock.lock().await;
+
+                // Re-check epoch now that we hold the lock – a client that
+                // connected while we were waiting will have bumped it.
                 if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
                     debug!(
                         "Skipping process stop for {} (client reconnected)",
