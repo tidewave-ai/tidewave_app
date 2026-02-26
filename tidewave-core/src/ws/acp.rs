@@ -1380,6 +1380,15 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             (None, None)
         };
 
+        // Acquire the lifecycle lock so that broadcast + remove is atomic
+        // with respect to new clients subscribing to exit_broadcast.
+        let lock = state_exit
+            .process_lifecycle_locks
+            .entry(process_state_exit.key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         // Broadcast exit event to all subscribed init loops
         let _ = process_state_exit.exit_broadcast.send(AgentExitEvent {
             error: error_type.to_string(),
