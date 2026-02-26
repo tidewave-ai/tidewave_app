@@ -777,7 +777,14 @@ pub async fn init(
     // If this was the last connected client, spawn a 1-minute inactivity timer
     // that stops the process (if the agent supports resuming sessions).
     if let Some(process_state) = state.processes.get(&process_key) {
-        if process_state.exit_broadcast.receiver_count() == 0 {
+        // Check if the agent supports resuming sessions
+        let supports_resuming = process_state
+            .supports_resuming
+            .read()
+            .await
+            .unwrap_or(false);
+
+        if process_state.exit_broadcast.receiver_count() == 0 && supports_resuming {
             let epoch = process_state.connect_epoch.load(Ordering::SeqCst);
             let process_state = process_state.clone();
             let process_key = process_key.clone();
@@ -790,21 +797,6 @@ pub async fn init(
                 if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
                     debug!(
                         "Skipping process stop for {} (client reconnected)",
-                        process_key
-                    );
-                    return;
-                }
-
-                // Check if the agent supports resuming sessions
-                let supports_resuming = process_state
-                    .supports_resuming
-                    .read()
-                    .await
-                    .unwrap_or(false);
-
-                if !supports_resuming {
-                    debug!(
-                        "Skipping process stop for {} (agent does not support resuming)",
                         process_key
                     );
                     return;
