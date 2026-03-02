@@ -387,6 +387,7 @@ pub async fn download_handler(
                     .arg("wslpath")
                     .arg("-a")
                     .arg(&windows_path)
+                    .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
                     .output()
                     .await
                 {

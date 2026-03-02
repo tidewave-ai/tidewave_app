@@ -59,7 +59,11 @@ pub async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut cmd = Command::new("wsl.exe");
-        cmd.arg("-e").arg("wslpath").arg("-w").arg(wsl_path);
+        cmd.arg("-e")
+            .arg("wslpath")
+            .arg("-w")
+            .arg(wsl_path)
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
         cmd
     };
 
