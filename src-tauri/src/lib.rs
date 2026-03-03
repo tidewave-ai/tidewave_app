@@ -21,6 +21,7 @@ struct ServerState {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
+#[allow(dead_code)]
 struct PortState {
     port: u16,
     https_port: Option<u16>,
