@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.6 (2026-03-03)
+
+* Fix terminal windows opening on Windows when doing WSL path translation
+
 ## v0.3.5 (2026-02-17)
 
 * Fix `xdg-open` in appimage
