@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.7 (2026-03-05)
+
+* Terminate ACP processes if there's no client connected for more than 1 minute and the agent supports resuming sessions
+
 ## v0.3.6 (2026-03-03)
 
 * Fix terminal windows opening on Windows when doing WSL path translation
