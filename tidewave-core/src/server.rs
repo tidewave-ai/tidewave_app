@@ -203,6 +203,7 @@ struct AboutResponse {
     name: String,
     version: String,
     system: SystemInfo,
+    cache_dir: String,
 }
 
 #[derive(Serialize)]
@@ -1035,6 +1036,12 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
 }
 
 async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("tidewave")
+        .to_string_lossy()
+        .to_string();
+
     #[cfg(target_os = "windows")]
     {
         if params.is_wsl {
@@ -1058,6 +1065,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                         target: env!("TARGET"),
                         wsl: true,
                     },
+                    cache_dir,
                 };
 
                 let json_body = serde_json::to_string(&response_body)
@@ -1086,6 +1094,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
             target: env!("TARGET"),
             wsl: false,
         },
+        cache_dir,
     };
 
     let json_body =
