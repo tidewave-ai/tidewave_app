@@ -290,6 +290,8 @@ pub struct AcpChannelState {
     pub process_starter: ProcessStarterFn,
     /// Locks to prevent multiple concurrent process starts for the same process_key
     pub process_lifecycle_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
+    /// Locks to prevent races between session/close and session reconnect
+    pub session_lifecycle_locks: Arc<DashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
 impl AcpChannelState {
@@ -305,6 +307,7 @@ impl AcpChannelState {
             session_to_channel: Arc::new(DashMap::new()),
             process_starter,
             process_lifecycle_locks: Arc::new(DashMap::new()),
+            session_lifecycle_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -347,6 +350,9 @@ pub struct ProcessState {
     pub load_request_ids: Arc<DashMap<Value, SessionId>>,
     pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
     pub fork_request_ids: Arc<DashSet<Value>>,
+    /// Client-initiated session/close requests (proxy_id -> session_id).
+    /// Session is removed when the response arrives.
+    pub close_request_ids: Arc<DashMap<Value, SessionId>>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
@@ -356,6 +362,10 @@ pub struct ProcessState {
     /// When true, the process can be stopped on inactivity since sessions
     /// can be restored after a restart.
     pub supports_resuming: Arc<RwLock<Option<bool>>>,
+    /// Whether the agent supports session/close (session.close in agentCapabilities).
+    /// When true, on disconnect we send session/close instead of session/cancel,
+    /// and remove the session state entirely.
+    pub supports_session_close: Arc<RwLock<Option<bool>>>,
 }
 
 pub struct SessionState {
@@ -396,8 +406,10 @@ impl ProcessState {
             load_request_ids: Arc::new(DashMap::new()),
             resume_request_ids: Arc::new(DashMap::new()),
             fork_request_ids: Arc::new(DashSet::<Value>::new()),
+            close_request_ids: Arc::new(DashMap::new()),
             connect_epoch: Arc::new(AtomicU64::new(0)),
             supports_resuming: Arc::new(RwLock::new(None)),
+            supports_session_close: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -730,7 +742,7 @@ pub async fn init(
         }
     }
 
-    // Spawn a task to send session/cancel after 10 seconds
+    // Spawn a task to send session/cancel or session/close after 10 seconds
     let state_clone = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -739,38 +751,90 @@ pub async fn init(
             // Check if session is still unmapped (not reconnected)
             if state_clone.session_to_channel.contains_key(&session_id) {
                 debug!("Skipping session/cancel for {} (reconnected)", session_id);
-            } else if let Some(session_state) = state_clone.sessions.get(&session_id) {
-                // Check if cancel_counter matches (session hasn't been reloaded)
-                if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
-                    debug!(
-                        "Skipping session/cancel for {} because counter does not match!",
-                        session_id
-                    );
-                    continue;
+                continue;
+            }
+
+            let Some(session_state) = state_clone.sessions.get(&session_id) else {
+                continue;
+            };
+
+            // Check if cancel_counter matches (session hasn't been reloaded)
+            if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
+                debug!(
+                    "Skipping session/cancel for {} because counter does not match!",
+                    session_id
+                );
+                continue;
+            }
+
+            // Acquire session lock to prevent races between stop and reconnect
+            let lock = state_clone
+                .session_lifecycle_locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            let _guard = lock.lock().await;
+
+            // Session is still unmapped
+            let process_key = session_state.process_key.clone();
+            let Some(process_state) = state_clone.processes.get(&process_key) else {
+                continue;
+            };
+
+            // Check if agent supports session/close
+            let supports_stop = process_state
+                .supports_session_close
+                .read()
+                .await
+                .unwrap_or(false);
+
+            if supports_stop {
+                // Drop the DashMap ref before removing to avoid deadlock
+                drop(session_state);
+
+                // Send session/close as a request (no proxy ID mapping — the
+                // response will be silently ignored since there is no client).
+                let proxy_id = process_state.generate_proxy_id();
+                let stop_request = JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: proxy_id,
+                    method: "session/close".to_string(),
+                    params: Some(json!({
+                        "sessionId": session_id
+                    })),
+                };
+
+                if let Err(e) = process_state
+                    .send_to_process(JsonRpcMessage::Request(stop_request))
+                    .await
+                {
+                    error!("Failed to send session/close for {}: {}", session_id, e);
+                } else {
+                    debug!("Sent session/close for unmapped session: {}", session_id);
                 }
 
-                // Session is still unmapped, send cancel notification
-                let process_key = &session_state.process_key;
-                if let Some(process_state) = state_clone.processes.get(process_key) {
-                    // Mark session as cancelled
-                    session_state.cancelled.store(true, Ordering::SeqCst);
+                // Remove session state entirely — session is permanently gone
+                state_clone.sessions.remove(&session_id);
+                state_clone.session_lifecycle_locks.remove(&session_id);
+            } else {
+                // Mark session as cancelled (keep state for potential reconnect)
+                session_state.cancelled.store(true, Ordering::SeqCst);
 
-                    let cancel_notification = JsonRpcNotification {
-                        jsonrpc: "2.0".to_string(),
-                        method: "session/cancel".to_string(),
-                        params: Some(json!({
-                            "sessionId": session_id
-                        })),
-                    };
+                let cancel_notification = JsonRpcNotification {
+                    jsonrpc: "2.0".to_string(),
+                    method: "session/cancel".to_string(),
+                    params: Some(json!({
+                        "sessionId": session_id
+                    })),
+                };
 
-                    if let Err(e) = process_state
-                        .send_to_process(JsonRpcMessage::Notification(cancel_notification))
-                        .await
-                    {
-                        error!("Failed to send session/cancel for {}: {}", session_id, e);
-                    } else {
-                        debug!("Sent session/cancel for unmapped session: {}", session_id);
-                    }
+                if let Err(e) = process_state
+                    .send_to_process(JsonRpcMessage::Notification(cancel_notification))
+                    .await
+                {
+                    error!("Failed to send session/cancel for {}: {}", session_id, e);
+                } else {
+                    debug!("Sent session/cancel for unmapped session: {}", session_id);
                 }
             }
         }
@@ -964,6 +1028,14 @@ async fn handle_tidewave_session_load(
         serde_json::from_value(request.params.clone().unwrap_or(Value::Null))
             .map_err(|e| anyhow!("Invalid session/load params: {}", e))?;
 
+    // Acquire session lock to prevent races with session/close on disconnect
+    let lock = state
+        .session_lifecycle_locks
+        .entry(params.session_id.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
     let session_state = match state.sessions.get(&params.session_id) {
         Some(session) => {
             let s = session.clone();
@@ -1145,6 +1217,14 @@ async fn handle_regular_request(
         }
         "session/fork" => {
             process_state.fork_request_ids.insert(proxy_id.clone());
+        }
+        // We intercept session/close to remove session state on response.
+        "session/close" => {
+            if let Some(session_id) = session_id {
+                process_state
+                    .close_request_ids
+                    .insert(proxy_id.clone(), session_id);
+            }
         }
         _ => (),
     }
@@ -1564,6 +1644,14 @@ async fn handle_process_response(
             handle_disconnected_client_response(process_state, state, response).await;
         }
 
+        // Remove session state after forwarding a successful session/close response
+        if let Some((_, session_id)) = process_state.close_request_ids.remove(&response.id) {
+            state.sessions.remove(&session_id);
+            state.session_to_channel.remove(&session_id);
+            state.session_lifecycle_locks.remove(&session_id);
+            info!("Removed session {} after session/close response", session_id);
+        }
+
         process_state.cleanup_id_mappings(&response.id);
     }
 
@@ -1580,8 +1668,10 @@ async fn maybe_handle_init_response(
     if init_request_id.as_ref() == Some(&response.id) {
         drop(init_request_id); // Release read lock
 
-        // Parse agent capabilities to check for session resuming support
+        // Parse agent capabilities
         *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
+        *process_state.supports_session_close.write().await =
+            Some(check_supports_session_close(response));
 
         // Store init response for future inits
         *process_state.cached_init_response.write().await = Some(client_response.clone());
@@ -1787,6 +1877,27 @@ fn check_supports_resuming(response: &JsonRpcResponse) -> bool {
     // session: { fork: {}, resume: {} }
     if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
         if session.contains_key("fork") || session.contains_key("resume") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if the agent supports session/close by examining agentCapabilities
+/// in the init response. Checks for session.close.
+fn check_supports_session_close(response: &JsonRpcResponse) -> bool {
+    let caps = response
+        .result
+        .as_ref()
+        .and_then(|r| r.get("agentCapabilities"));
+
+    let Some(caps) = caps else {
+        return false;
+    };
+
+    if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
+        if session.contains_key("close") {
             return true;
         }
     }
@@ -2461,5 +2572,45 @@ mod tests {
     fn test_supports_resuming_load_session_false() {
         let response = make_init_response(json!({ "loadSession": false }));
         assert!(!check_supports_resuming(&response));
+    }
+
+    // ============================================================================
+    // check_supports_session_close Tests
+    // ============================================================================
+
+    #[test]
+    fn test_supports_session_close_with_close() {
+        let response = make_init_response(json!({ "session": { "close": {} } }));
+        assert!(check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_supports_session_close_with_multiple_capabilities() {
+        let response =
+            make_init_response(json!({ "session": { "fork": {}, "resume": {}, "close": {} } }));
+        assert!(check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_supports_session_close_empty_capabilities() {
+        let response = make_init_response(json!({}));
+        assert!(!check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_supports_session_close_session_without_close() {
+        let response = make_init_response(json!({ "session": { "fork": {} } }));
+        assert!(!check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_supports_session_close_no_result() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::Number(serde_json::Number::from(0)),
+            result: None,
+            error: None,
+        };
+        assert!(!check_supports_session_close(&response));
     }
 }
