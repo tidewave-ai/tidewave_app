@@ -78,6 +78,10 @@
 //! # Download a zip archive and extract a specific file
 //! curl "http://localhost:9832/download?key=myzip&url=https://example.com/archive.zip&extract=path/inside/zip"
 //! # Returns: {"status":"done","path":"/path/to/cached/file"}
+//!
+//! # Download an archive and extract the entire contents to a directory
+//! curl "http://localhost:9832/download?key=fullextract&url=https://example.com/archive.tar.gz&extract="
+//! # Returns: {"status":"done","path":"/path/to/cached/fullextract/"}
 //! ```
 
 use axum::body::{Body, Bytes};
@@ -597,14 +601,14 @@ async fn perform_download(
         return Err(e);
     }
 
-    // If extract parameter is provided, extract the specified file from the archive
+    // If extract parameter is provided, extract from the archive
     if let Some(ref extract_path) = extract {
-        debug!("Extracting {} from archive {:?}", extract_path, temp_path);
+        debug!("Extracting from archive {:?} to {:?}", temp_path, file_path);
 
+        let is_zip = url.ends_with(".zip");
         let temp_path_clone = temp_path.clone();
         let extract_path_clone = extract_path.clone();
         let file_path_clone = file_path.clone();
-        let is_zip = url.ends_with(".zip");
 
         // Run extraction in a blocking task since tar/flate2/zip are synchronous
         let extract_result = tokio::task::spawn_blocking(move || {
@@ -619,10 +623,9 @@ async fn perform_download(
 
         // Clean up the archive temp file
         let _ = tokio::fs::remove_file(&temp_path).await;
-
         extract_result?;
 
-        debug!("Extracted {} to {:?}", extract_path, file_path);
+        debug!("Extracted to {:?}", file_path);
     } else {
         // No extraction - move temp file to final location (existing behavior)
         tokio::fs::rename(&temp_path, &file_path)
@@ -634,8 +637,8 @@ async fn perform_download(
             })?;
     }
 
-    // If executable flag is set, make the final file executable
-    if executable == Some(true) {
+    // If executable flag is set, make the final file executable (skip for directories)
+    if executable == Some(true) && file_path.is_file() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -661,7 +664,9 @@ async fn perform_download(
     Ok(final_path)
 }
 
-/// Extract a specific file from a tar.gz/tgz archive
+/// Extract from a tar.gz/tgz archive.
+/// If `extract_path` is empty, extracts all files into `dest_path` as a directory.
+/// If `extract_path` is non-empty, extracts a single matching file to `dest_path`.
 fn extract_from_tarball(
     archive_path: &std::path::Path,
     extract_path: &str,
@@ -677,7 +682,76 @@ fn extract_from_tarball(
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
-    // Normalize the extract path (remove leading ./ or /)
+    if extract_path.is_empty() {
+        // Extract entire archive
+        std::fs::create_dir_all(dest_path)
+            .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+
+        for entry_result in archive
+            .entries()
+            .map_err(|e| format!("Failed to read archive entries: {}", e))?
+        {
+            let mut entry =
+                entry_result.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+
+            let entry_path = entry
+                .path()
+                .map_err(|e| format!("Failed to get entry path: {}", e))?;
+
+            let cleaned = match sanitize_archive_path(&entry_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if cleaned.as_os_str().is_empty() {
+                continue;
+            }
+
+            let dest = dest_path.join(&cleaned);
+
+            if !dest.starts_with(dest_path) {
+                continue;
+            }
+
+            let entry_type = entry.header().entry_type();
+
+            // Skip symlinks and special entries for security
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                continue;
+            }
+
+            if entry_type.is_dir() {
+                std::fs::create_dir_all(&dest)
+                    .map_err(|e| format!("Failed to create directory {:?}: {}", dest, e))?;
+            } else if entry_type.is_file() {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+                }
+
+                let mut contents = Vec::new();
+                entry
+                    .read_to_end(&mut contents)
+                    .map_err(|e| format!("Failed to read entry contents: {}", e))?;
+
+                std::fs::write(&dest, &contents)
+                    .map_err(|e| format!("Failed to write extracted file: {}", e))?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(mode) = entry.header().mode() {
+                        let perms = std::fs::Permissions::from_mode(mode);
+                        let _ = std::fs::set_permissions(&dest, perms);
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Extract a single file
     let extract_path = extract_path
         .trim_start_matches("./")
         .trim_start_matches('/');
@@ -733,7 +807,9 @@ fn extract_from_tarball(
     ))
 }
 
-/// Extract a specific file from a zip archive
+/// Extract from a zip archive.
+/// If `extract_path` is empty, extracts all files into `dest_path` as a directory.
+/// If `extract_path` is non-empty, extracts a single matching file to `dest_path`.
 fn extract_from_zip(
     archive_path: &std::path::Path,
     extract_path: &str,
@@ -747,7 +823,69 @@ fn extract_from_zip(
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
 
-    // Normalize the extract path (remove leading ./ or /)
+    if extract_path.is_empty() {
+        // Extract entire archive
+        std::fs::create_dir_all(dest_path)
+            .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+
+            let entry_path = std::path::PathBuf::from(entry.name());
+
+            let cleaned = match sanitize_archive_path(&entry_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if cleaned.as_os_str().is_empty() {
+                continue;
+            }
+
+            let dest = dest_path.join(&cleaned);
+
+            if !dest.starts_with(dest_path) {
+                continue;
+            }
+
+            if entry.is_dir() {
+                std::fs::create_dir_all(&dest)
+                    .map_err(|e| format!("Failed to create directory {:?}: {}", dest, e))?;
+            } else {
+                if entry.is_symlink() {
+                    continue;
+                }
+
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+                }
+
+                let mut contents = Vec::new();
+                entry
+                    .read_to_end(&mut contents)
+                    .map_err(|e| format!("Failed to read entry contents: {}", e))?;
+
+                std::fs::write(&dest, &contents)
+                    .map_err(|e| format!("Failed to write extracted file: {}", e))?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = entry.unix_mode() {
+                        let perms = std::fs::Permissions::from_mode(mode);
+                        let _ = std::fs::set_permissions(&dest, perms);
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Extract a single file
     let extract_path = extract_path
         .trim_start_matches("./")
         .trim_start_matches('/');
@@ -793,6 +931,25 @@ fn extract_from_zip(
         "File '{}' not found in archive. Found entries: {:?}",
         extract_path, found_entries
     ))
+}
+
+/// Sanitize an archive entry path to prevent path traversal attacks.
+/// Strips leading `/` and `./`, rejects paths containing `..` components.
+fn sanitize_archive_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let path_str = path.to_string_lossy();
+    let stripped = path_str.trim_start_matches("./").trim_start_matches('/');
+    let cleaned = std::path::PathBuf::from(stripped);
+
+    for component in cleaned.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "Path traversal detected in archive entry: {}",
+                path_str
+            ));
+        }
+    }
+
+    Ok(cleaned)
 }
 
 pub async fn do_proxy(

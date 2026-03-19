@@ -1565,3 +1565,147 @@ async fn test_download_with_extract_from_zip_not_found() {
     file_shutdown_tx.send(()).ok();
     shutdown_tx.send(()).ok();
 }
+
+/// Create a tar.gz archive in memory with multiple files
+fn create_test_tarball_multi(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::Builder;
+
+    let mut archive_data = Vec::new();
+    let encoder = GzEncoder::new(&mut archive_data, Compression::default());
+    let mut builder = Builder::new(encoder);
+
+    for (path, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+
+        builder.append(&header, *content).unwrap();
+    }
+
+    builder.into_inner().unwrap().finish().unwrap();
+    archive_data
+}
+
+/// Create a zip archive in memory with multiple files
+fn create_test_zip_multi(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mut archive_data = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(&mut archive_data));
+
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o644);
+
+    for (path, content) in files {
+        writer.start_file(*path, options).unwrap();
+        writer.write_all(content).unwrap();
+    }
+
+    writer.finish().unwrap();
+    archive_data
+}
+
+#[tokio::test]
+async fn test_download_with_extract_all_from_tarball() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let files: &[(&str, &[u8])] = &[
+        ("package/README.md", b"# My Package"),
+        ("package/src/main.rs", b"fn main() {}"),
+        ("package/src/lib.rs", b"pub fn hello() {}"),
+    ];
+    let archive = create_test_tarball_multi(files);
+    let (file_port, file_shutdown_tx) = start_file_server("/archive.tar.gz", archive).await;
+
+    let test_key = format!("extract_all_tar_{}", uuid::Uuid::new_v4());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.tar.gz&extract="
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = parse_download_chunks(&response.bytes().await.unwrap());
+    assert!(!chunks.is_empty(), "Expected at least one chunk");
+
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "done", "Got: {:?}", last_chunk);
+
+    let path = std::path::Path::new(last_chunk["path"].as_str().unwrap());
+    assert!(path.is_dir(), "Expected a directory at {:?}", path);
+
+    // Verify extracted files
+    assert_eq!(
+        std::fs::read_to_string(path.join("package/README.md")).unwrap(),
+        "# My Package"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("package/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("package/src/lib.rs")).unwrap(),
+        "pub fn hello() {}"
+    );
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_download_with_extract_all_from_zip() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let files: &[(&str, &[u8])] = &[
+        ("data/config.json", b"{\"key\": \"value\"}"),
+        ("data/items/a.txt", b"alpha"),
+        ("data/items/b.txt", b"beta"),
+    ];
+    let archive = create_test_zip_multi(files);
+    let (file_port, file_shutdown_tx) = start_file_server("/archive.zip", archive).await;
+
+    let test_key = format!("extract_all_zip_{}", uuid::Uuid::new_v4());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract="
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = parse_download_chunks(&response.bytes().await.unwrap());
+    assert!(!chunks.is_empty(), "Expected at least one chunk");
+
+    let last_chunk = chunks.last().unwrap();
+    assert_eq!(last_chunk["status"], "done", "Got: {:?}", last_chunk);
+
+    let path = std::path::Path::new(last_chunk["path"].as_str().unwrap());
+    assert!(path.is_dir(), "Expected a directory at {:?}", path);
+
+    // Verify extracted files
+    assert_eq!(
+        std::fs::read_to_string(path.join("data/config.json")).unwrap(),
+        "{\"key\": \"value\"}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("data/items/a.txt")).unwrap(),
+        "alpha"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("data/items/b.txt")).unwrap(),
+        "beta"
+    );
+
+    file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
