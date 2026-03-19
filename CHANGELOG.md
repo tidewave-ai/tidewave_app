@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.8 (2026-03-19)
+
+* Add support for extracting full archives (required for some future ACP integrations)
+* Support handling of session/close in the ACP proxy
+
 ## v0.3.7 (2026-03-05)
 
 * Terminate ACP processes if there's no client connected for more than 1 minute and the agent supports resuming sessions
