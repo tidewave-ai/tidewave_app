@@ -37,7 +37,7 @@ async fn test_channel_init_request_flow() {
         .await
         .expect("Expected join reply");
     assert_eq!(reply.event, "phx_reply");
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     // Wait for process to actually start
     process_started.await.expect("Process failed to start");
@@ -75,7 +75,7 @@ async fn test_channel_init_request_flow() {
         .await
         .expect("Expected response message");
     assert_eq!(msg.event, "jsonrpc");
-    let response = &msg.payload;
+    let response = msg.payload.as_json();
     assert_eq!(response["id"], 1);
     assert_eq!(response["result"]["protocolVersion"], 1);
 }
@@ -169,7 +169,7 @@ async fn test_channel_session_new_flow() {
         .await
         .expect("Expected response message");
     assert_eq!(msg.event, "jsonrpc");
-    let response = &msg.payload;
+    let response = msg.payload.as_json();
     assert_eq!(response["id"], "new_123");
     assert_eq!(response["result"]["sessionId"], "sess_xyz_789");
 }
@@ -271,7 +271,7 @@ async fn test_channel_notification_forwarding() {
         .await
         .expect("Expected notification message");
     assert_eq!(msg.event, "jsonrpc");
-    let notif = &msg.payload;
+    let notif = msg.payload.as_json();
     assert_eq!(notif["method"], "session/update");
     assert_eq!(notif["params"]["sessionId"], "sess_123");
 }
@@ -382,8 +382,8 @@ async fn test_concurrent_channel_joins() {
     // Both joins should succeed
     assert!(result1.is_some(), "First join should succeed");
     assert!(result2.is_some(), "Second join should succeed");
-    assert_eq!(result1.unwrap().payload["status"], "ok");
-    assert_eq!(result2.unwrap().payload["status"], "ok");
+    assert_eq!(result1.unwrap().payload.as_json()["status"], "ok");
+    assert_eq!(result2.unwrap().payload.as_json()["status"], "ok");
 
     // Process starter should have been called only once
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
@@ -418,7 +418,7 @@ async fn test_concurrent_init_requests() {
     let reply1 = recv_phoenix_msg(&mut out_rx1)
         .await
         .expect("Expected join reply for client 1");
-    assert_eq!(reply1.payload["status"], "ok");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
 
     // Wait for process to start
     process_started.await.expect("Process failed to start");
@@ -431,7 +431,7 @@ async fn test_concurrent_init_requests() {
     let reply2 = recv_phoenix_msg(&mut out_rx2)
         .await
         .expect("Expected join reply for client 2");
-    assert_eq!(reply2.payload["status"], "ok");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
 
     // Both clients send init requests concurrently
     let init_request1 = json!({
@@ -478,15 +478,15 @@ async fn test_concurrent_init_requests() {
         .await
         .expect("Expected response for client 1");
     assert_eq!(msg1.event, "jsonrpc");
-    assert_eq!(msg1.payload["id"], 1);
-    assert_eq!(msg1.payload["result"]["protocolVersion"], 1);
+    assert_eq!(msg1.payload.as_json()["id"], 1);
+    assert_eq!(msg1.payload.as_json()["result"]["protocolVersion"], 1);
 
     let msg2 = recv_phoenix_msg(&mut out_rx2)
         .await
         .expect("Expected response for client 2");
     assert_eq!(msg2.event, "jsonrpc");
-    assert_eq!(msg2.payload["id"], 2);
-    assert_eq!(msg2.payload["result"]["protocolVersion"], 1);
+    assert_eq!(msg2.payload.as_json()["id"], 2);
+    assert_eq!(msg2.payload.as_json()["result"]["protocolVersion"], 1);
 
     // Verify no additional init request was sent to the process by sending another
     // request and checking it's not an init

@@ -113,7 +113,7 @@ pub async fn init(
     outgoing_tx: UnboundedSender<PhxMessage>,
     mut incoming_rx: tokio::sync::mpsc::UnboundedReceiver<PhxMessage>,
 ) -> InitResult {
-    let payload: JoinPayload = match serde_json::from_value(msg.payload.clone()) {
+    let payload: JoinPayload = match serde_json::from_value(msg.payload.clone().into_json()) {
         Ok(p) => p,
         Err(e) => return InitResult::Error(e.to_string()),
     };

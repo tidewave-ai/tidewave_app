@@ -59,7 +59,7 @@ impl Drop for ChildProcess {
     }
 }
 
-fn command_with_limited_env(program: &str) -> Command {
+pub(crate) fn command_with_limited_env(program: &str) -> Command {
     let mut std_command = std::process::Command::new(program);
     cleanup_appimage_env(&mut std_command);
     std_command.into()

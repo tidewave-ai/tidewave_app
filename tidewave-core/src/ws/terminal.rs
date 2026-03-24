@@ -121,7 +121,7 @@ pub async fn init(
     let topic = msg.topic.clone();
     let join_ref = msg.join_ref.clone();
 
-    let join_payload: JoinPayload = match serde_json::from_value(msg.payload.clone()) {
+    let join_payload: JoinPayload = match serde_json::from_value(msg.payload.clone().into_json()) {
         Ok(p) => p,
         Err(e) => return InitResult::Error(format!("Invalid join payload: {}", e)),
     };
@@ -232,14 +232,14 @@ pub async fn init(
                     Some(msg) => {
                         match msg.event.as_str() {
                             "input" => {
-                                if let Ok(payload) = serde_json::from_value::<InputPayload>(msg.payload) {
+                                if let Ok(payload) = serde_json::from_value::<InputPayload>(msg.payload.into_json()) {
                                     if let Err(e) = writer.write_all(payload.data.as_bytes()) {
                                         warn!("PTY write error: {}", e);
                                     }
                                 }
                             }
                             "resize" => {
-                                if let Ok(payload) = serde_json::from_value::<ResizePayload>(msg.payload) {
+                                if let Ok(payload) = serde_json::from_value::<ResizePayload>(msg.payload.into_json()) {
                                     let size = PtySize {
                                         rows: payload.rows,
                                         cols: payload.cols,

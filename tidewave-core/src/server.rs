@@ -99,6 +99,23 @@ struct WhichParams {
 }
 
 #[derive(Deserialize)]
+struct RecordParams {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct OpenParams {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct RecordResponse {
+    success: bool,
+    path: String,
+    directory: String,
+}
+
+#[derive(Deserialize)]
 struct AboutParams {
     #[serde(default)]
     #[allow(dead_code)]
@@ -357,6 +374,8 @@ async fn serve_http_server_inner(
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
+        .route("/record", post(record_handler))
+        .route("/open", post(open_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -817,6 +836,100 @@ async fn delete_file_handler(
             error: error.kind().to_string(),
         })),
     }
+}
+
+async fn record_handler(
+    Query(query): Query<RecordParams>,
+    req: Request,
+) -> Result<Json<RecordResponse>, StatusCode> {
+    // Validate name to prevent path traversal
+    if query.name.contains('/') || query.name.contains('\\') || query.name.contains("..") {
+        error!("Record: invalid name: {}", query.name);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Resolve recording directory: video_dir/Tidewave or data_dir/tidewave/recordings
+    let recordings_dir = dirs::video_dir()
+        .map(|d| d.join("Tidewave"))
+        .unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(|| std::env::temp_dir())
+                .join("tidewave")
+                .join("recordings")
+        });
+
+    let file_path = recordings_dir.join(&query.name);
+
+    tokio::fs::create_dir_all(&recordings_dir)
+        .await
+        .map_err(|e| {
+            error!("Record: failed to create recordings dir: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+        .await
+        .map_err(|e| {
+            error!("Record: failed to open file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    use tokio::io::AsyncWriteExt;
+
+    let body = req.into_body();
+    let mut stream = body.into_data_stream();
+
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| {
+            error!("Record: failed to read body chunk: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        file.write_all(&bytes).await.map_err(|e| {
+            error!("Record: failed to write chunk: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    file.flush().await.map_err(|e| {
+        error!("Record: failed to flush file: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(RecordResponse {
+        success: true,
+        path: file_path.display().to_string(),
+        directory: recordings_dir.display().to_string(),
+    }))
+}
+
+async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.exists() {
+        error!("Open: path does not exist: {}", payload.path);
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+
+    crate::command::command_with_limited_env(program)
+        .arg(&payload.path)
+        .spawn()
+        .map_err(|e| {
+            error!("Open: failed to spawn {}: {}", program, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {

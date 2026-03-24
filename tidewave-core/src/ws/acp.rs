@@ -577,12 +577,13 @@ pub async fn init(
     };
 
     // Parse spawn options from join payload
-    let spawn_opts: TidewaveSpawnOptions = match serde_json::from_value(msg.payload.clone()) {
-        Ok(opts) => opts,
-        Err(e) => {
-            return InitResult::Error(format!("invalid spawn options: {}", e));
-        }
-    };
+    let spawn_opts: TidewaveSpawnOptions =
+        match serde_json::from_value(msg.payload.clone().into_json()) {
+            Ok(opts) => opts,
+            Err(e) => {
+                return InitResult::Error(format!("invalid spawn options: {}", e));
+            }
+        };
 
     // Store the sender for this channel
     state.channel_senders.insert(channel_id, sender);
@@ -672,7 +673,7 @@ pub async fn init(
                             "jsonrpc" => {
                                 // Parse the JSON-RPC message
                                 let message: JsonRpcMessage =
-                                    match serde_json::from_value(phx_msg.payload.clone()) {
+                                    match serde_json::from_value(phx_msg.payload.clone().into_json()) {
                                         Ok(msg) => msg,
                                         Err(e) => {
                                             error!("Failed to parse JSON-RPC message: {}", e);
@@ -1649,7 +1650,10 @@ async fn handle_process_response(
             state.sessions.remove(&session_id);
             state.session_to_channel.remove(&session_id);
             state.session_lifecycle_locks.remove(&session_id);
-            info!("Removed session {} after session/close response", session_id);
+            info!(
+                "Removed session {} after session/close response",
+                session_id
+            );
         }
 
         process_state.cleanup_id_mappings(&response.id);

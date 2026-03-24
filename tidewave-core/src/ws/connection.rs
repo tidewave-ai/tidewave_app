@@ -107,13 +107,13 @@ pub async fn unit_testable_ws_handler<W, R>(
         tokio::select! {
             msg = ws_receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
+                    Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
                         handle_incoming_message(
                             &state,
                             &outgoing_tx,
                             &mut channels,
                             &mut channel_tasks,
-                            &text,
+                            msg,
                         ).await;
                     }
                     Some(Ok(Message::Close(_))) => {
@@ -150,11 +150,21 @@ async fn handle_incoming_message(
     outgoing_tx: &UnboundedSender<PhxMessage>,
     channels: &mut HashMap<String, UnboundedSender<PhxMessage>>,
     channel_tasks: &mut tokio::task::JoinSet<ChannelExit>,
-    text: &str,
+    ws_msg: Message,
 ) {
-    let msg = match PhxMessage::decode(text) {
-        Ok(m) => m,
-        Err(_) => return,
+    let msg = match ws_msg {
+        Message::Text(ref text) => match PhxMessage::decode(text) {
+            Ok(m) => m,
+            Err(_) => return,
+        },
+        Message::Binary(ref bytes) => match PhxMessage::decode_binary(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("Failed to decode binary message: {}", e);
+                return;
+            }
+        },
+        _ => return,
     };
 
     // Handle heartbeat
