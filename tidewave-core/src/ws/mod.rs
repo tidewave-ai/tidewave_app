@@ -27,6 +27,7 @@
 pub mod acp;
 pub mod connection;
 pub mod mcp;
+pub mod recording;
 pub mod terminal;
 pub mod watch;
 
