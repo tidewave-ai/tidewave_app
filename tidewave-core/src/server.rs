@@ -844,10 +844,14 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
     }
 
     #[cfg(target_os = "windows")]
-    let path_str = path.canonicalize().map_err(|e| {
-        error!("Open: failed to canonicalize path: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?.to_string_lossy().into_owned();
+    let path_str = path
+        .canonicalize()
+        .map_err(|e| {
+            error!("Open: failed to canonicalize path: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .to_string_lossy()
+        .into_owned();
     #[cfg(not(target_os = "windows"))]
     let path_str = &payload.path;
 
@@ -867,14 +871,26 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
         }
         #[cfg(target_os = "linux")]
         {
-            let open_path = if path.is_file() {
-                path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or(payload.path.clone())
+            if env::var("WSL_DISTRO_NAME").is_ok() {
+                let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                    error!("Open: wslpath failed: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                crate::command::command_with_limited_env("explorer.exe")
+                    .arg(format!("/select,{}", win_path))
+                    .spawn()
             } else {
-                payload.path.clone()
-            };
-            crate::command::command_with_limited_env("xdg-open")
-                .arg(&open_path)
-                .spawn()
+                let open_path = if path.is_file() {
+                    path.parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(payload.path.clone())
+                } else {
+                    payload.path.clone()
+                };
+                crate::command::command_with_limited_env("xdg-open")
+                    .arg(&open_path)
+                    .spawn()
+            }
         }
     } else {
         #[cfg(target_os = "macos")]
@@ -884,6 +900,21 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
         #[cfg(target_os = "windows")]
         let program = "explorer.exe";
 
+        #[cfg(target_os = "linux")]
+        if env::var("WSL_DISTRO_NAME").is_ok() {
+            let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                error!("Open: wslpath failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            crate::command::command_with_limited_env("explorer.exe")
+                .arg(&win_path)
+                .spawn()
+        } else {
+            crate::command::command_with_limited_env(program)
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(not(target_os = "linux"))]
         crate::command::command_with_limited_env(program)
             .arg(path_str)
             .spawn()
