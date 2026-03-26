@@ -91,15 +91,6 @@ struct DeleteFileParams {
 }
 
 #[derive(Deserialize)]
-struct RenameParams {
-    from: String,
-    to: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
-}
-
-#[derive(Deserialize)]
 struct WhichParams {
     command: String,
     // Note that cwd is only used in case PATH in env is also set
@@ -201,13 +192,6 @@ enum WriteFileResponse {
 enum DeleteFileResponse {
     DeleteFileResponseOk { success: bool },
     DeleteFileResponseErr { success: bool, error: String },
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum RenameResponse {
-    RenameResponseOk { success: bool },
-    RenameResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -379,7 +363,6 @@ async fn serve_http_server_inner(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
-        .route("/rename", post(rename_handler))
         .route("/stat", get(stat_handler))
         .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
@@ -846,42 +829,6 @@ async fn delete_file_handler(
             success: true,
         })),
         Err(error) => Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
-            success: false,
-            error: error.kind().to_string(),
-        })),
-    }
-}
-
-async fn rename_handler(
-    Json(payload): Json<RenameParams>,
-) -> Result<Json<RenameResponse>, StatusCode> {
-    let from_path = match normalize_path(&payload.from, payload.is_wsl).await {
-        Ok(path) => path,
-        Err(error) => {
-            return Ok(Json(RenameResponse::RenameResponseErr {
-                success: false,
-                error,
-            }));
-        }
-    };
-
-    let to_path = match normalize_path(&payload.to, payload.is_wsl).await {
-        Ok(path) => path,
-        Err(error) => {
-            return Ok(Json(RenameResponse::RenameResponseErr {
-                success: false,
-                error,
-            }));
-        }
-    };
-
-    if !Path::new(&from_path).is_absolute() || !Path::new(&to_path).is_absolute() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    match tokio::fs::rename(&from_path, &to_path).await {
-        Ok(()) => Ok(Json(RenameResponse::RenameResponseOk { success: true })),
-        Err(error) => Ok(Json(RenameResponse::RenameResponseErr {
             success: false,
             error: error.kind().to_string(),
         })),
