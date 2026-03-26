@@ -192,6 +192,62 @@ pub fn create_shell_command(
     }
 }
 
+pub fn create_exec_command(
+    executable: &str,
+    args: &[String],
+    env: HashMap<String, String>,
+    cwd: &str,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] is_wsl: bool,
+) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        if is_wsl {
+            let env_string: Vec<String> = env
+                .iter()
+                .map(|(k, v)| {
+                    let escaped_value = v.replace("'", "'\\''");
+                    format!("{}='{}'", k, escaped_value)
+                })
+                .collect();
+
+            let mut command = command_with_limited_env("wsl.exe");
+            command.arg("--cd").arg(cwd);
+
+            if !env_string.is_empty() {
+                // Use env to set variables: env VAR=val executable args...
+                command.arg("env");
+                for assignment in &env_string {
+                    command.arg(assignment);
+                }
+            }
+
+            command.arg(executable);
+            command.args(args);
+            command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
+        } else {
+            let mut command = command_with_limited_env(executable);
+            command
+                .args(args)
+                .envs(env)
+                .current_dir(Path::new(cwd))
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = command_with_limited_env(executable);
+        command
+            .args(args)
+            .envs(env)
+            .current_dir(Path::new(cwd))
+            .process_group(0);
+        command
+    }
+}
+
 /// Spawns a command and wraps it in a ChildProcess.
 /// On Windows, this creates a job object to track all child processes.
 /// On Unix, the process group is already set up by create_shell_command.
