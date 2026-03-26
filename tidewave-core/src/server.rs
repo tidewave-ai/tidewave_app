@@ -1,4 +1,4 @@
-use crate::command::{create_exec_command, create_shell_command, spawn_command};
+use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use crate::utils::{
@@ -30,25 +30,13 @@ use tracing::{debug, error, info};
 use which;
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum ShellParams {
-    Shell {
-        command: String,
-        cwd: Option<String>,
-        env: Option<HashMap<String, String>>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        is_wsl: bool,
-    },
-    Exec {
-        executable: String,
-        args: Option<Vec<String>>,
-        cwd: Option<String>,
-        env: Option<HashMap<String, String>>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        is_wsl: bool,
-    },
+struct ShellParams {
+    command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
 }
 
 #[derive(Deserialize)]
@@ -624,30 +612,10 @@ fn shell_error(message: &str) -> (StatusCode, Json<ShellError>) {
 async fn shell_handler(
     Json(payload): Json<ShellParams>,
 ) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
-    let mut command = match payload {
-        ShellParams::Shell {
-            command,
-            cwd,
-            env,
-            is_wsl,
-        } => {
-            let cwd = cwd.unwrap_or(".".to_string());
-            let env = env.unwrap_or_else(|| std::env::vars().collect());
-            create_shell_command(&command, env, &cwd, is_wsl)
-        }
-        ShellParams::Exec {
-            executable,
-            args,
-            cwd,
-            env,
-            is_wsl,
-        } => {
-            let cwd = cwd.unwrap_or(".".to_string());
-            let env = env.unwrap_or_else(|| std::env::vars().collect());
-            let args = args.unwrap_or_default();
-            create_exec_command(&executable, &args, env, &cwd, is_wsl)
-        }
-    };
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+
+    let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

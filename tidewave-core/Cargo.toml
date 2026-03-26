@@ -35,7 +35,6 @@ zip = { version = "7", features = ["deflate"] }
 which = "8.0"
 dirs = "5.0"
 portable-pty = "0.9"
-tower-http = { version = "0.6", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "jobapi2", "winnt", "processthreadsapi", "handleapi", "errhandlingapi"] }
