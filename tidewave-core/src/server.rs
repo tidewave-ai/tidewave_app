@@ -25,6 +25,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
+use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
 
@@ -107,11 +108,6 @@ struct WhichParams {
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
-}
-
-#[derive(Deserialize)]
-struct OpenParams {
-    path: String,
 }
 
 #[derive(Deserialize)]
@@ -395,7 +391,6 @@ async fn serve_http_server_inner(
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
-        .route("/open", post(open_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -403,6 +398,7 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
+        .nest_service("/recordings", ServeDir::new(recordings_dir()))
         .merge(mcp_routes) // TODO: remove on 0.4.0
         .merge(acp_routes) // TODO: remove on 0.4.0
         .merge(download_routes)
@@ -895,32 +891,6 @@ async fn rename_handler(
             error: error.kind().to_string(),
         })),
     }
-}
-
-async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
-    let path = Path::new(&payload.path);
-
-    if !path.exists() {
-        error!("Open: path does not exist: {}", payload.path);
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(target_os = "linux")]
-    let program = "xdg-open";
-    #[cfg(target_os = "windows")]
-    let program = "explorer";
-
-    crate::command::command_with_limited_env(program)
-        .arg(&payload.path)
-        .spawn()
-        .map_err(|e| {
-            error!("Open: failed to spawn {}: {}", program, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {

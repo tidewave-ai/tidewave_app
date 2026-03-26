@@ -4,7 +4,7 @@
 //!
 //! Join payload: `{"name": "filename.webm"}`
 //! Client sends `"chunk"` events with `Payload::Binary` data.
-//! Client sends `"done"` event with `{}` payload; reply contains `{path, directory}`.
+//! Client sends `"done"` event with `{}` payload; reply contains `{path}`.
 
 use serde::Deserialize;
 use serde_json::json;
@@ -89,7 +89,6 @@ pub async fn init(
                             &phx_msg,
                             json!({
                                 "path": file_path.display().to_string(),
-                                "directory": recordings_dir.display().to_string(),
                             }),
                         ));
                     }
