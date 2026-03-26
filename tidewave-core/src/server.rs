@@ -1,7 +1,9 @@
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{load_tls_config_from_paths, normalize_path, wslpath_to_windows};
+use crate::utils::{
+    load_tls_config_from_paths, normalize_path, recordings_dir, wslpath_to_windows,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -82,6 +84,15 @@ struct WriteFileParams {
 #[derive(Deserialize)]
 struct DeleteFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct RenameParams {
+    from: String,
+    to: String,
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
@@ -190,6 +201,13 @@ enum DeleteFileResponse {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum RenameResponse {
+    RenameResponseOk { success: bool },
+    RenameResponseErr { success: bool, error: String },
+}
+
+#[derive(Serialize)]
 struct WhichResponse {
     path: Option<String>,
 }
@@ -209,6 +227,20 @@ struct AboutResponse {
     version: String,
     system: SystemInfo,
     cache_dir: String,
+    recordings_dir: String,
+    ffmpeg: Option<String>,
+}
+
+fn detect_ffmpeg() -> Option<String> {
+    let ffmpeg = std::env::var("TIDEWAVE_FFMPEG_EXECUTABLE").unwrap_or_else(|_| "ffmpeg".into());
+    let path = std::path::Path::new(&ffmpeg);
+    if path.is_absolute() && path.exists() {
+        Some(ffmpeg)
+    } else {
+        which::which(&ffmpeg)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
 }
 
 #[derive(Serialize)]
@@ -357,6 +389,7 @@ async fn serve_http_server_inner(
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
+        .route("/rename", post(rename_handler))
         .route("/stat", get(stat_handler))
         .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
@@ -587,7 +620,10 @@ async fn shell_handler(
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
     let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
@@ -819,6 +855,42 @@ async fn delete_file_handler(
             success: true,
         })),
         Err(error) => Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
+            success: false,
+            error: error.kind().to_string(),
+        })),
+    }
+}
+
+async fn rename_handler(
+    Json(payload): Json<RenameParams>,
+) -> Result<Json<RenameResponse>, StatusCode> {
+    let from_path = match normalize_path(&payload.from, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(RenameResponse::RenameResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    let to_path = match normalize_path(&payload.to, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(RenameResponse::RenameResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    if !Path::new(&from_path).is_absolute() || !Path::new(&to_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match tokio::fs::rename(&from_path, &to_path).await {
+        Ok(()) => Ok(Json(RenameResponse::RenameResponseOk { success: true })),
+        Err(error) => Ok(Json(RenameResponse::RenameResponseErr {
             success: false,
             error: error.kind().to_string(),
         })),
@@ -1072,7 +1144,9 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
         .to_string_lossy()
-        .to_string();
+        .into_owned();
+
+    let recordings_dir = recordings_dir().to_string_lossy().into_owned();
 
     #[cfg(target_os = "windows")]
     {
@@ -1098,6 +1172,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                         wsl: true,
                     },
                     cache_dir,
+                    recordings_dir,
+                    ffmpeg: detect_ffmpeg(),
                 };
 
                 let json_body = serde_json::to_string(&response_body)
@@ -1127,6 +1203,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
             wsl: false,
         },
         cache_dir,
+        recordings_dir,
+        ffmpeg: detect_ffmpeg(),
     };
 
     let json_body =

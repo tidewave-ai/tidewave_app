@@ -6,16 +6,14 @@
 //! Client sends `"chunk"` events with `Payload::Binary` data.
 //! Client sends `"done"` event with `{}` payload; reply contains `{path, directory}`.
 
-use std::path::Path;
-
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
-use crate::command::command_with_limited_env;
 use crate::phoenix::{InitResult, Payload, PhxMessage};
+use crate::utils::recordings_dir;
 
 #[derive(Deserialize)]
 struct JoinPayload {
@@ -39,15 +37,7 @@ pub async fn init(
         return InitResult::Error(format!("Invalid name: {}", name));
     }
 
-    // Resolve recording directory: video_dir/Tidewave or data_dir/tidewave/recordings
-    let recordings_dir = dirs::video_dir()
-        .map(|d| d.join("Tidewave"))
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("tidewave")
-                .join("recordings")
-        });
+    let recordings_dir = recordings_dir();
 
     if let Err(e) = tokio::fs::create_dir_all(&recordings_dir).await {
         return InitResult::Error(format!("Failed to create recordings dir: {}", e));
@@ -69,10 +59,7 @@ pub async fn init(
     debug!("Recording channel opened: {}", file_path.display());
 
     // Send success reply with the filename
-    let _ = outgoing_tx.send(PhxMessage::ok_reply(
-        msg,
-        json!({"name": name}),
-    ));
+    let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({"name": name})));
 
     // Main loop: receive chunks and "done"
     loop {
@@ -96,7 +83,7 @@ pub async fn init(
                     } else {
                         // Drop the file handle before remuxing
                         drop(file);
-                        remux_with_ffmpeg(&file_path).await;
+                        // remux_with_ffmpeg(&file_path).await;
 
                         let _ = outgoing_tx.send(PhxMessage::ok_reply(
                             &phx_msg,
@@ -115,45 +102,4 @@ pub async fn init(
     }
 
     InitResult::Done
-}
-
-/// Remux a WebM file with ffmpeg to fix duration metadata.
-/// Silently skips if ffmpeg is not available.
-async fn remux_with_ffmpeg(path: &Path) {
-    let temp_path = path.with_extension("tmp.webm");
-
-    let ffmpeg = std::env::var("TIDEWAVE_FFMPEG_EXECUTABLE").unwrap_or_else(|_| "ffmpeg".into());
-
-    let result = command_with_limited_env(&ffmpeg)
-        .args([
-            "-y",
-            "-i",
-        ])
-        .arg(path)
-        .args(["-c", "copy"])
-        .arg(&temp_path)
-        .output();
-
-    match result.await {
-        Ok(output) if output.status.success() => {
-            if let Err(e) = tokio::fs::rename(&temp_path, path).await {
-                error!("Failed to rename remuxed file: {}", e);
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            } else {
-                debug!("Remuxed recording with ffmpeg: {}", path.display());
-            }
-        }
-        Ok(output) => {
-            warn!(
-                "ffmpeg remux failed (status {}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let _ = tokio::fs::remove_file(&temp_path).await;
-        }
-        Err(_) => {
-            // ffmpeg not available, skip remuxing
-            debug!("ffmpeg not found, skipping remux for {}", path.display());
-        }
-    }
 }
