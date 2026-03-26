@@ -231,19 +231,6 @@ struct AboutResponse {
     system: SystemInfo,
     cache_dir: String,
     recordings_dir: String,
-    ffmpeg: Option<String>,
-}
-
-fn detect_ffmpeg() -> Option<String> {
-    let ffmpeg = std::env::var("TIDEWAVE_FFMPEG_EXECUTABLE").unwrap_or_else(|_| "ffmpeg".into());
-    let path = std::path::Path::new(&ffmpeg);
-    if path.is_absolute() && path.exists() {
-        Some(ffmpeg)
-    } else {
-        which::which(&ffmpeg)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
 }
 
 #[derive(Serialize)]
@@ -1213,7 +1200,6 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     },
                     cache_dir,
                     recordings_dir,
-                    ffmpeg: detect_ffmpeg(),
                 };
 
                 let json_body = serde_json::to_string(&response_body)
@@ -1244,7 +1230,6 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         },
         cache_dir,
         recordings_dir,
-        ffmpeg: detect_ffmpeg(),
     };
 
     let json_body =

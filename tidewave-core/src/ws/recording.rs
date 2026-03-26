@@ -81,10 +81,6 @@ pub async fn init(
                             format!("Flush error: {}", e),
                         ));
                     } else {
-                        // Drop the file handle before remuxing
-                        drop(file);
-                        // remux_with_ffmpeg(&file_path).await;
-
                         let _ = outgoing_tx.send(PhxMessage::ok_reply(
                             &phx_msg,
                             json!({
