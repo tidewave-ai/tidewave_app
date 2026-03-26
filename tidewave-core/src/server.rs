@@ -111,6 +111,13 @@ struct WhichParams {
 }
 
 #[derive(Deserialize)]
+struct OpenParams {
+    path: String,
+    #[serde(default)]
+    reveal: bool,
+}
+
+#[derive(Deserialize)]
 struct AboutParams {
     #[serde(default)]
     #[allow(dead_code)]
@@ -391,6 +398,7 @@ async fn serve_http_server_inner(
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
+        .route("/open", post(open_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -891,6 +899,68 @@ async fn rename_handler(
             error: error.kind().to_string(),
         })),
     }
+}
+
+async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.exists() {
+        error!("Open: path does not exist: {}", payload.path);
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(target_os = "windows")]
+    let path_str = path.canonicalize().map_err(|e| {
+        error!("Open: failed to canonicalize path: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?.to_string_lossy().into_owned();
+    #[cfg(not(target_os = "windows"))]
+    let path_str = &payload.path;
+
+    let spawn_result = if payload.reveal {
+        #[cfg(target_os = "macos")]
+        {
+            crate::command::command_with_limited_env("open")
+                .arg("-R")
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::command::command_with_limited_env("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path_str))
+                .spawn()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let open_path = if path.is_file() {
+                path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or(payload.path.clone())
+            } else {
+                payload.path.clone()
+            };
+            crate::command::command_with_limited_env("xdg-open")
+                .arg(&open_path)
+                .spawn()
+        }
+    } else {
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "linux")]
+        let program = "xdg-open";
+        #[cfg(target_os = "windows")]
+        let program = "explorer.exe";
+
+        crate::command::command_with_limited_env(program)
+            .arg(path_str)
+            .spawn()
+    };
+
+    spawn_result.map_err(|e| {
+        error!("Open: failed to spawn: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {
