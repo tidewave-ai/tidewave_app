@@ -1,23 +1,23 @@
-//! Recording channel for receiving binary media chunks over WebSocket.
+//! Upload channel for receiving binary chunks over WebSocket.
 //!
-//! Topics: `recording:<ref>` where `<ref>` is a client-chosen identifier.
+//! Topics: `upload:<ref>` where `<ref>` is a client-chosen identifier.
 //!
-//! Join payload: `{"name": "filename.webm"}`
+//! Join payload: `{"path": "/absolute/path/to/file.ext"}`
 //! Client sends `"chunk"` events with `Payload::Binary` data.
-//! Client sends `"done"` event with `{}` payload; reply contains `{path}`.
+//! Client sends `"done"` event with `{}` payload; reply contains `{path, size}`.
 
 use serde::Deserialize;
 use serde_json::json;
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
 
 use crate::phoenix::{InitResult, Payload, PhxMessage};
-use crate::utils::recordings_dir;
 
 #[derive(Deserialize)]
 struct JoinPayload {
-    name: String,
+    path: String,
 }
 
 pub async fn init(
@@ -30,20 +30,14 @@ pub async fn init(
         Err(e) => return InitResult::Error(format!("Invalid join payload: {}", e)),
     };
 
-    let name = &join_payload.name;
+    let file_path = PathBuf::from(&join_payload.path);
 
-    // Validate name to prevent path traversal
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return InitResult::Error(format!("Invalid name: {}", name));
+    // Create parent directories if needed
+    if let Some(parent) = file_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return InitResult::Error(format!("Failed to create parent directories: {}", e));
+        }
     }
-
-    let recordings_dir = recordings_dir();
-
-    if let Err(e) = tokio::fs::create_dir_all(&recordings_dir).await {
-        return InitResult::Error(format!("Failed to create recordings dir: {}", e));
-    }
-
-    let file_path = recordings_dir.join(name);
 
     let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
@@ -56,10 +50,15 @@ pub async fn init(
         Err(e) => return InitResult::Error(format!("Failed to open file: {}", e)),
     };
 
-    debug!("Recording channel opened: {}", file_path.display());
+    debug!("Upload channel opened: {}", file_path.display());
 
-    // Send success reply with the filename
-    let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({"name": name})));
+    // Send success reply
+    let _ = outgoing_tx.send(PhxMessage::ok_reply(
+        msg,
+        json!({"path": join_payload.path}),
+    ));
+
+    let mut size: u64 = 0;
 
     // Main loop: receive chunks and "done"
     loop {
@@ -67,15 +66,16 @@ pub async fn init(
             Some(phx_msg) => match phx_msg.event.as_str() {
                 "chunk" => {
                     if let Payload::Binary(data) = phx_msg.payload {
+                        size += data.len() as u64;
                         if let Err(e) = file.write_all(&data).await {
-                            error!("Recording write error: {}", e);
+                            error!("Upload write error: {}", e);
                             return InitResult::Shutdown(format!("Write error: {}", e));
                         }
                     }
                 }
                 "done" => {
                     if let Err(e) = file.flush().await {
-                        error!("Recording flush error: {}", e);
+                        error!("Upload flush error: {}", e);
                         let _ = outgoing_tx.send(PhxMessage::error_reply(
                             &phx_msg,
                             format!("Flush error: {}", e),
@@ -84,7 +84,8 @@ pub async fn init(
                         let _ = outgoing_tx.send(PhxMessage::ok_reply(
                             &phx_msg,
                             json!({
-                                "path": file_path.display().to_string(),
+                                "path": file_path.to_string_lossy().into_owned(),
+                                "size": size,
                             }),
                         ));
                     }

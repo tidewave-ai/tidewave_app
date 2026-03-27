@@ -266,10 +266,10 @@ fn dispatch_join(
                 &outgoing_tx,
             );
         }))
-    } else if msg.topic.starts_with("recording:") {
+    } else if msg.topic.starts_with("upload:") {
         Some(tokio::spawn(async move {
             reply_init(
-                super::recording::init(&msg, outgoing_tx.clone(), incoming_rx).await,
+                super::upload::init(&msg, outgoing_tx.clone(), incoming_rx).await,
                 msg,
                 &outgoing_tx,
             );

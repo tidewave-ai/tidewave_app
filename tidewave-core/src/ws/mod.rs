@@ -27,8 +27,8 @@
 pub mod acp;
 pub mod connection;
 pub mod mcp;
-pub mod recording;
 pub mod terminal;
+pub mod upload;
 pub mod watch;
 
 use serde_json::Value;
