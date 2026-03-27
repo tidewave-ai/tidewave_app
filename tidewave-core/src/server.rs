@@ -284,8 +284,6 @@ async fn serve_http_server_inner(
     };
 
     let https_port = config.https_port;
-    let mcp_state = crate::mcp_remote::McpRemoteState::new();
-    let acp_state = crate::acp_proxy::AcpProxyState::new();
     let download_state = DownloadState::new();
 
     // Build allowed origins for both HTTP and HTTPS
@@ -304,25 +302,6 @@ async fn serve_http_server_inner(
         port,
         https_port,
     };
-
-    // Create the MCP routes that need state
-    // TODO: remove on 0.4.0
-    let mcp_routes = Router::new()
-        .route(
-            "/acp/mcp-remote",
-            get(crate::mcp_remote::mcp_remote_ws_handler),
-        )
-        .route(
-            "/acp/mcp-remote-client",
-            post(crate::mcp_remote::mcp_remote_client_handler),
-        )
-        .with_state(mcp_state);
-
-    // Create ACP routes
-    // TODO: remove on 0.4.0
-    let acp_routes = Router::new()
-        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state.clone());
 
     // Create download routes
     let client_for_download = client.clone();
@@ -377,8 +356,6 @@ async fn serve_http_server_inner(
             }),
         )
         .nest_service("/recordings", ServeDir::new(recordings_dir()))
-        .merge(mcp_routes) // TODO: remove on 0.4.0
-        .merge(acp_routes) // TODO: remove on 0.4.0
         .merge(download_routes)
         .merge(ws_routes)
         .merge(mcp_channel_post_routes);
@@ -481,20 +458,6 @@ async fn serve_http_server_inner(
         https_result??;
     }
     http_result??;
-
-    // TODO: remove on 0.4.0 since ACP cleanup is handled in ws_state.clear()
-    // Kill all ACP processes via their exit channels.
-    // Note: We use the exit_tx channel instead of directly killing, because
-    // the exit monitor task holds the child write lock while waiting.
-    let acp_process_count = acp_state.processes.len();
-    debug!("Found {} ACP processes to clean up", acp_process_count);
-
-    for entry in acp_state.processes.iter() {
-        let process_state = entry.value();
-        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
-            let _ = exit_tx.send(());
-        }
-    }
 
     // Clear all WebSocket state (includes ACP channel process cleanup)
     ws_state.clear().await;

@@ -1,9 +1,7 @@
-pub mod acp_proxy;
 mod command;
 pub use command::cleanup_appimage_env;
 pub mod config;
 mod http_handlers;
-mod mcp_remote;
 pub mod phoenix;
 pub mod server;
 pub mod utils;
