@@ -1,7 +1,9 @@
 use crate::command::{create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{load_tls_config_from_paths, normalize_path, wslpath_to_windows};
+use crate::utils::{
+    load_tls_config_from_paths, normalize_path, recordings_dir, wslpath_to_windows,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -23,6 +25,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
+use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
 
@@ -96,6 +99,13 @@ struct WhichParams {
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct OpenParams {
+    path: String,
+    #[serde(default)]
+    reveal: bool,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +214,7 @@ struct AboutResponse {
     version: String,
     system: SystemInfo,
     cache_dir: String,
+    recordings_dir: String,
 }
 
 #[derive(Serialize)]
@@ -357,6 +368,7 @@ async fn serve_http_server_inner(
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/which", post(which_handler))
+        .route("/open", post(open_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -364,6 +376,7 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
+        .nest_service("/recordings", ServeDir::new(recordings_dir()))
         .merge(mcp_routes) // TODO: remove on 0.4.0
         .merge(acp_routes) // TODO: remove on 0.4.0
         .merge(download_routes)
@@ -581,7 +594,10 @@ async fn shell_handler(
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
     let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
@@ -819,6 +835,99 @@ async fn delete_file_handler(
     }
 }
 
+async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.exists() {
+        error!("Open: path does not exist: {}", payload.path);
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(target_os = "windows")]
+    let path_str = path
+        .canonicalize()
+        .map_err(|e| {
+            error!("Open: failed to canonicalize path: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(target_os = "windows"))]
+    let path_str = &payload.path;
+
+    let spawn_result = if payload.reveal {
+        #[cfg(target_os = "macos")]
+        {
+            crate::command::command_with_limited_env("open")
+                .arg("-R")
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::command::command_with_limited_env("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path_str))
+                .spawn()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if env::var("WSL_DISTRO_NAME").is_ok() {
+                let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                    error!("Open: wslpath failed: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                crate::command::command_with_limited_env("explorer.exe")
+                    .arg(format!("/select,{}", win_path))
+                    .spawn()
+            } else {
+                let open_path = if path.is_file() {
+                    path.parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(payload.path.clone())
+                } else {
+                    payload.path.clone()
+                };
+                crate::command::command_with_limited_env("xdg-open")
+                    .arg(&open_path)
+                    .spawn()
+            }
+        }
+    } else {
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "linux")]
+        let program = "xdg-open";
+        #[cfg(target_os = "windows")]
+        let program = "explorer.exe";
+
+        #[cfg(target_os = "linux")]
+        if env::var("WSL_DISTRO_NAME").is_ok() {
+            let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                error!("Open: wslpath failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            crate::command::command_with_limited_env("explorer.exe")
+                .arg(&win_path)
+                .spawn()
+        } else {
+            crate::command::command_with_limited_env(program)
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(not(target_os = "linux"))]
+        crate::command::command_with_limited_env(program)
+            .arg(path_str)
+            .spawn()
+    };
+
+    spawn_result.map_err(|e| {
+        error!("Open: failed to spawn: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {
     let file_path = match normalize_path(&query.path, query.is_wsl).await {
         Ok(path) => path,
@@ -1040,7 +1149,9 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
         .to_string_lossy()
-        .to_string();
+        .into_owned();
+
+    let recordings_dir = recordings_dir().to_string_lossy().into_owned();
 
     #[cfg(target_os = "windows")]
     {
@@ -1066,6 +1177,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                         wsl: true,
                     },
                     cache_dir,
+                    recordings_dir,
                 };
 
                 let json_body = serde_json::to_string(&response_body)
@@ -1095,6 +1207,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
             wsl: false,
         },
         cache_dir,
+        recordings_dir,
     };
 
     let json_body =

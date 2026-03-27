@@ -99,7 +99,7 @@ pub async fn init(
         match incoming_rx.recv().await {
             Some(phx_msg) => {
                 if phx_msg.event == "mcp_message" {
-                    let json_rpc_message = phx_msg.payload;
+                    let json_rpc_message = phx_msg.payload.into_json();
 
                     // Check if this is a reply to a pending request
                     if let Some(id) = json_rpc_message.get("id") {

@@ -52,8 +52,10 @@ async fn test_watch_subscribe_success() {
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "watch1", &watch_path).await;
 
     assert_eq!(reply.topic, "watch:watch1");
-    assert_eq!(reply.payload["status"], "ok");
-    assert!(reply.payload["response"]["path"].as_str().is_some());
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+    assert!(reply.payload.as_json()["response"]["path"]
+        .as_str()
+        .is_some());
 }
 
 #[tokio::test]
@@ -69,8 +71,8 @@ async fn test_watch_subscribe_relative_path_error() {
 
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "watch1", "relative/path").await;
 
-    assert_eq!(reply.payload["status"], "error");
-    assert!(reply.payload["response"]["reason"]
+    assert_eq!(reply.payload.as_json()["status"], "error");
+    assert!(reply.payload.as_json()["response"]["reason"]
         .as_str()
         .unwrap()
         .contains("absolute"));
@@ -96,8 +98,8 @@ async fn test_watch_subscribe_nonexistent_path_error() {
     )
     .await;
 
-    assert_eq!(reply.payload["status"], "error");
-    assert!(reply.payload["response"]["reason"]
+    assert_eq!(reply.payload.as_json()["status"], "error");
+    assert!(reply.payload.as_json()["response"]["reason"]
         .as_str()
         .unwrap()
         .contains("does not exist"));
@@ -120,7 +122,7 @@ async fn test_watch_file_created() {
 
     // Subscribe to the directory
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "mywatch", &watch_path).await;
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     // Give the watcher time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -134,7 +136,10 @@ async fn test_watch_file_created() {
     assert!(event.is_some(), "Expected created event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:mywatch");
-    assert_eq!(event.payload["path"].as_str().unwrap(), "test_file.txt");
+    assert_eq!(
+        event.payload.as_json()["path"].as_str().unwrap(),
+        "test_file.txt"
+    );
 }
 
 #[tokio::test]
@@ -159,7 +164,7 @@ async fn test_watch_file_modified() {
 
     // Subscribe to the directory
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "modwatch", &watch_path).await;
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     // Give the watcher time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -174,7 +179,10 @@ async fn test_watch_file_modified() {
     assert!(event.is_some(), "Expected modified event");
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:modwatch");
-    assert_eq!(event.payload["path"].as_str().unwrap(), "existing_file.txt");
+    assert_eq!(
+        event.payload.as_json()["path"].as_str().unwrap(),
+        "existing_file.txt"
+    );
 }
 
 #[tokio::test]
@@ -197,7 +205,7 @@ async fn test_watch_file_deleted() {
 
     // Subscribe to the directory
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "delwatch", &watch_path).await;
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -210,7 +218,7 @@ async fn test_watch_file_deleted() {
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:delwatch");
     assert_eq!(
-        event.payload["path"].as_str().unwrap(),
+        event.payload.as_json()["path"].as_str().unwrap(),
         "file_to_delete.txt"
     );
 }
@@ -232,7 +240,7 @@ async fn test_watch_unsubscribe() {
 
     // Join
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "unsub_test", &watch_path).await;
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     // Leave
     send_phoenix_msg(
@@ -244,7 +252,7 @@ async fn test_watch_unsubscribe() {
     assert!(reply.is_some(), "Expected phx_reply for leave");
     let reply = reply.unwrap();
     assert_eq!(reply.topic, "watch:unsub_test");
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 }
 
 #[tokio::test]
@@ -269,7 +277,7 @@ async fn test_watch_heartbeat() {
     let reply = reply.unwrap();
     assert_eq!(reply.topic, "phoenix");
     assert_eq!(reply.ref_, Some("3".to_string()));
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 }
 
 #[tokio::test]
@@ -302,8 +310,8 @@ async fn test_watch_concurrent_subscribers() {
     // Both join with different refs
     let reply1 = join_watch(&ws1_in_tx, &mut ws1_out_rx, "client1_watch", &watch_path).await;
     let reply2 = join_watch(&ws2_in_tx, &mut ws2_out_rx, "client2_watch", &watch_path).await;
-    assert_eq!(reply1.payload["status"], "ok");
-    assert_eq!(reply2.payload["status"], "ok");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -341,7 +349,7 @@ async fn test_watch_subdirectory_events() {
 
     // Subscribe to the parent directory
     let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "recursive_watch", &watch_path).await;
-    assert_eq!(reply.payload["status"], "ok");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
 
     // Give the watcher time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -358,7 +366,7 @@ async fn test_watch_subdirectory_events() {
     let event = event.unwrap();
     assert_eq!(event.topic, "watch:recursive_watch");
     assert_eq!(
-        event.payload["path"].as_str().unwrap(),
+        event.payload.as_json()["path"].as_str().unwrap(),
         "subdir/nested_file.txt"
     );
 }
