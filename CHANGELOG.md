@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.0 (2026-03-27)
+
+* Add channel for videio mode recordings
+* Remove old ACP WebSocket code
+
 ## v0.3.8 (2026-03-19)
 
 * Add support for extracting full archives (required for some future ACP integrations)
