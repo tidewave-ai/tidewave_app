@@ -137,21 +137,11 @@ pub fn create_shell_command(
     #[cfg(target_os = "windows")]
     {
         if is_wsl {
-            // WSL case: use --cd flag and construct env string
-            // Build env assignments string: VAR1=value1 VAR2=value2 ... command
-            let env_string: Vec<String> = env
-                .iter()
-                .map(|(k, v)| {
-                    // Escape single quotes in the value by replacing ' with '\''
-                    let escaped_value = v.replace("'", "'\\''");
-                    format!("{}='{}'", k, escaped_value)
-                })
-                .collect();
-
-            let full_command = if env_string.is_empty() {
+            let env_prefix = wsl_env_assignments(&env);
+            let full_command = if env_prefix.is_empty() {
                 cmd.to_string()
             } else {
-                format!("{} {}", env_string.join(" "), cmd)
+                format!("{} {}", env_prefix.join(" "), cmd)
             };
 
             let mut command = command_with_limited_env("wsl.exe");
@@ -185,6 +175,64 @@ pub fn create_shell_command(
         command
             .arg("-c")
             .arg(cmd)
+            .envs(env)
+            .current_dir(Path::new(cwd))
+            .process_group(0);
+        command
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_env_assignments(env: &HashMap<String, String>) -> Vec<String> {
+    env.iter()
+        .map(|(k, v)| format!("{}={}", k, shell_quote(v)))
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+pub fn create_cmd_command(
+    cmd: &str,
+    args: &[String],
+    env: HashMap<String, String>,
+    cwd: &str,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] is_wsl: bool,
+) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        if is_wsl {
+            let env_assignments = wsl_env_assignments(&env);
+            let mut command = command_with_limited_env("wsl.exe");
+            command.arg("--cd").arg(cwd);
+            if !env_assignments.is_empty() {
+                command.arg("env");
+                for assignment in &env_assignments {
+                    command.arg(assignment);
+                }
+            }
+            command.arg(cmd);
+            command.args(args);
+            command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
+        } else {
+            let mut command = command_with_limited_env(cmd);
+            command
+                .args(args)
+                .envs(env)
+                .current_dir(Path::new(cwd))
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = command_with_limited_env(cmd);
+        command
+            .args(args)
             .envs(env)
             .current_dir(Path::new(cwd))
             .process_group(0);

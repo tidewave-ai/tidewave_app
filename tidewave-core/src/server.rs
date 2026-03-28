@@ -1,4 +1,4 @@
-use crate::command::{create_shell_command, spawn_command};
+use crate::command::{create_cmd_command, create_shell_command, spawn_command, ChildProcess};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use crate::utils::{
@@ -24,7 +24,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
@@ -32,6 +32,18 @@ use which;
 #[derive(Deserialize)]
 struct ShellParams {
     command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct CmdParams {
+    command: String,
+    args: Option<Vec<String>>,
+    input: Option<String>,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -346,6 +358,7 @@ async fn serve_http_server_inner(
         .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
+        .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
         .route("/open", post(open_handler))
         .route(
@@ -562,9 +575,46 @@ async fn shell_handler(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let process = spawn_command(command)
+        .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
+
+    stream_process_response(process)
+}
+
+async fn cmd_handler(
+    Json(payload): Json<CmdParams>,
+) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    let args = payload.args.unwrap_or_default();
+
+    let mut command = create_cmd_command(&payload.command, &args, env, &cwd, payload.is_wsl);
+    command
+        .stdin(if payload.input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
     let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
 
+    if let Some(input) = payload.input {
+        if let Some(mut stdin) = process.child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(input.as_bytes()).await;
+            });
+        }
+    }
+
+    stream_process_response(process)
+}
+
+fn stream_process_response(
+    mut process: ChildProcess,
+) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let mut stdout = Some(
         process
             .child
@@ -612,7 +662,7 @@ async fn shell_handler(
         }
 
         // Take the process to wait on it (prevents Drop from killing it since process completed normally)
-        let process_opt = _process_holder.lock().ok().and_then(|mut g| g.take());
+        let process_opt = _process_holder.lock().ok().and_then(|mut g: std::sync::MutexGuard<Option<ChildProcess>>| g.take());
         let status = if let Some(mut process) = process_opt {
             match process.child.wait().await {
                 Ok(status) => Some(status.code().unwrap_or(-1)),
@@ -632,11 +682,11 @@ async fn shell_handler(
 
     let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
         .body(body)
-        .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))?)
+        .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))
 }
 
 fn create_data_chunk(data: &[u8]) -> Bytes {
