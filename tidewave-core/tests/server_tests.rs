@@ -706,6 +706,21 @@ async fn test_shell_echo_command() {
     shutdown_tx.send(()).ok();
 }
 
+fn data_chunk(data: &[u8]) -> Vec<u8> {
+    let mut v = vec![0u8];
+    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+fn status_chunk(code: i32) -> Vec<u8> {
+    let json = format!(r#"{{"status":{}}}"#, code);
+    let mut v = vec![1u8];
+    v.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    v.extend_from_slice(json.as_bytes());
+    v
+}
+
 #[tokio::test]
 async fn test_cmd_basic() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
@@ -723,10 +738,13 @@ async fn test_cmd_basic() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["success"], true);
-    assert_eq!(body["exit_code"], 0);
-    assert!(body["output"].as_str().unwrap().contains("hello"));
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        [data_chunk(b"hello\n"), status_chunk(0)]
+            .concat()
+            .as_slice()
+    );
 
     shutdown_tx.send(()).ok();
 }
@@ -748,9 +766,8 @@ async fn test_cmd_exit_code() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["success"], true);
-    assert_eq!(body["exit_code"], 42);
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(bytes.as_ref(), status_chunk(42).as_slice());
 
     shutdown_tx.send(()).ok();
 }
@@ -772,10 +789,13 @@ async fn test_cmd_stdin() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["success"], true);
-    assert_eq!(body["exit_code"], 0);
-    assert_eq!(body["output"], "hello from stdin");
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        [data_chunk(b"hello from stdin"), status_chunk(0)]
+            .concat()
+            .as_slice()
+    );
 
     shutdown_tx.send(()).ok();
 }
@@ -795,9 +815,8 @@ async fn test_cmd_invalid_executable() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["success"], false);
     assert!(body["error"].as_str().unwrap().contains("Failed to spawn"));
 
     shutdown_tx.send(()).ok();
