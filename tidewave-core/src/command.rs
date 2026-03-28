@@ -144,7 +144,15 @@ pub fn create_shell_command(
                 format!("{} {}", env_prefix.join(" "), cmd)
             };
 
-            wsl_sh_command(cwd, &full_command)
+            let mut command = command_with_limited_env("wsl.exe");
+            command
+                .arg("--cd")
+                .arg(cwd)
+                .arg("sh")
+                .arg("-c")
+                .arg(full_command)
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
         } else {
             // Windows cmd case: use .current_dir()
             let mut command = command_with_limited_env("cmd.exe");
@@ -175,19 +183,6 @@ pub fn create_shell_command(
 }
 
 #[cfg(target_os = "windows")]
-fn wsl_sh_command(cwd: &str, shell_cmd: &str) -> Command {
-    let mut command = command_with_limited_env("wsl.exe");
-    command
-        .arg("--cd")
-        .arg(cwd)
-        .arg("sh")
-        .arg("-c")
-        .arg(shell_cmd)
-        .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
-    command
-}
-
-#[cfg(target_os = "windows")]
 fn wsl_env_assignments(env: &HashMap<String, String>) -> Vec<String> {
     env.iter()
         .map(|(k, v)| format!("{}={}", k, shell_quote(v)))
@@ -209,11 +204,19 @@ pub fn create_cmd_command(
     #[cfg(target_os = "windows")]
     {
         if is_wsl {
-            let mut parts = wsl_env_assignments(&env);
-            parts.push(shell_quote(cmd));
-            parts.extend(args.iter().map(|a| shell_quote(a)));
-
-            wsl_sh_command(cwd, &parts.join(" "))
+            let env_assignments = wsl_env_assignments(&env);
+            let mut command = command_with_limited_env("wsl.exe");
+            command.arg("--cd").arg(cwd);
+            if !env_assignments.is_empty() {
+                command.arg("env");
+                for assignment in &env_assignments {
+                    command.arg(assignment);
+                }
+            }
+            command.arg(cmd);
+            command.args(args);
+            command.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+            command
         } else {
             let mut command = command_with_limited_env(cmd);
             command
