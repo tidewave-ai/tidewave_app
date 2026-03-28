@@ -707,6 +707,103 @@ async fn test_shell_echo_command() {
 }
 
 #[tokio::test]
+async fn test_cmd_basic() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/cmd", port))
+        .json(&serde_json::json!({
+            "command": "echo",
+            "args": ["hello"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["exit_code"], 0);
+    assert!(body["output"].as_str().unwrap().contains("hello"));
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_cmd_exit_code() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/cmd", port))
+        .json(&serde_json::json!({
+            "command": "sh",
+            "args": ["-c", "exit 42"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["exit_code"], 42);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_cmd_stdin() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/cmd", port))
+        .json(&serde_json::json!({
+            "command": "cat",
+            "input": "hello from stdin"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["exit_code"], 0);
+    assert_eq!(body["output"], "hello from stdin");
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_cmd_invalid_executable() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/cmd", port))
+        .json(&serde_json::json!({
+            "command": "nonexistent_binary_xyz"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].as_str().unwrap().contains("Failed to spawn"));
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
 async fn test_write_file_exclusive_succeeds_if_not_exists() {
     use std::fs;
 

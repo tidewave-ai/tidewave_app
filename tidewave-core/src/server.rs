@@ -1,4 +1,4 @@
-use crate::command::{create_shell_command, spawn_command};
+use crate::command::{create_cmd_command, create_shell_command, spawn_command};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
 use crate::utils::{
@@ -24,7 +24,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
@@ -32,6 +32,18 @@ use which;
 #[derive(Deserialize)]
 struct ShellParams {
     command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct CmdParams {
+    command: String,
+    args: Option<Vec<String>>,
+    input: Option<String>,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -113,6 +125,20 @@ struct AboutParams {
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CmdResponse {
+    CmdResponseOk {
+        success: bool,
+        output: String,
+        exit_code: i32,
+    },
+    CmdResponseErr {
+        success: bool,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -346,6 +372,7 @@ async fn serve_http_server_inner(
         .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
+        .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
         .route("/open", post(open_handler))
         .route(
@@ -637,6 +664,101 @@ async fn shell_handler(
         .header("content-type", "application/octet-stream")
         .body(body)
         .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))?)
+}
+
+async fn cmd_handler(Json(payload): Json<CmdParams>) -> Result<Json<CmdResponse>, StatusCode> {
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    let args = payload.args.unwrap_or_default();
+
+    let mut command = create_cmd_command(&payload.command, &args, env, &cwd, payload.is_wsl);
+    command
+        .stdin(if payload.input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut process = match spawn_command(command) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(Json(CmdResponse::CmdResponseErr {
+                success: false,
+                error: format!("Failed to spawn process: {}", e),
+            }))
+        }
+    };
+
+    if let Some(input) = payload.input {
+        if let Some(mut stdin) = process.child.stdin.take() {
+            if let Err(e) = stdin.write_all(input.as_bytes()).await {
+                return Ok(Json(CmdResponse::CmdResponseErr {
+                    success: false,
+                    error: format!("Failed to write stdin: {}", e),
+                }));
+            }
+        }
+    }
+
+    let mut stdout = match process.child.stdout.take() {
+        Some(s) => s,
+        None => {
+            return Ok(Json(CmdResponse::CmdResponseErr {
+                success: false,
+                error: "Failed to get process stdout".to_string(),
+            }))
+        }
+    };
+    let mut stderr = match process.child.stderr.take() {
+        Some(s) => s,
+        None => {
+            return Ok(Json(CmdResponse::CmdResponseErr {
+                success: false,
+                error: "Failed to get process stderr".to_string(),
+            }))
+        }
+    };
+
+    let (stdout_bytes, stderr_bytes) = match tokio::try_join!(
+        async {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await.map(|_| buf)
+        },
+        async {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).await.map(|_| buf)
+        }
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            return Ok(Json(CmdResponse::CmdResponseErr {
+                success: false,
+                error: format!("Failed to read process output: {}", e),
+            }))
+        }
+    };
+
+    let exit_code = match process.child.wait().await {
+        Ok(s) => s.code().unwrap_or(-1),
+        Err(e) => {
+            return Ok(Json(CmdResponse::CmdResponseErr {
+                success: false,
+                error: format!("Failed to wait for process: {}", e),
+            }))
+        }
+    };
+
+    let mut combined = stdout_bytes;
+    combined.extend(stderr_bytes);
+    let output = String::from_utf8_lossy(&combined).into_owned();
+
+    Ok(Json(CmdResponse::CmdResponseOk {
+        success: true,
+        output,
+        exit_code,
+    }))
 }
 
 fn create_data_chunk(data: &[u8]) -> Bytes {
