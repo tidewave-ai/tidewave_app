@@ -1260,11 +1260,16 @@ async fn root(_req: Request) -> Html<String> {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="tidewave:source" content="cli" />
     <meta name="tidewave:version" content="{}" />
-    <link rel="manifest" href="/manifest.json" />
     <script type="module" src="{}/tc/tc.js"></script>
     <script>
-      if ('serviceWorker' in navigator && /Chrome/.test(navigator.userAgent)) {{
+      if ('serviceWorker' in navigator) {{
         navigator.serviceWorker.register('/sw.js');
+      }}
+      if (/Chrome/.test(navigator.userAgent)) {{
+        const link = document.createElement('link');
+        link.rel = 'manifest';
+        link.href = '/manifest.json';
+        document.head.appendChild(link);
       }}
     </script>
   </head>
