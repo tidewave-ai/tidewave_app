@@ -1263,7 +1263,7 @@ async fn root(_req: Request) -> Html<String> {
     <link rel="manifest" href="/manifest.json" />
     <script type="module" src="{}/tc/tc.js"></script>
     <script>
-      if ('serviceWorker' in navigator) {{
+      if ('serviceWorker' in navigator && /Chrome/.test(navigator.userAgent)) {{
         navigator.serviceWorker.register('/sw.js');
       }}
     </script>
