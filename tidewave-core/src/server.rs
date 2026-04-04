@@ -529,9 +529,9 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // Skip origin verification for /about and /check-origin routes
+    // Skip origin verification for /check-origin routes
     let path = req.uri().path();
-    if path == "/about" || path == "/check-origin" {
+    if path == "/check-origin" {
         return Ok(next.run(req).await);
     }
 
@@ -1199,7 +1199,6 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                 return Response::builder()
-                    .header("Access-Control-Allow-Origin", "*")
                     .header("Content-Type", "application/json")
                     .body(Body::from(json_body))
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
@@ -1229,7 +1228,6 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Response::builder()
-        .header("Access-Control-Allow-Origin", "*")
         .header("Content-Type", "application/json")
         .body(Body::from(json_body))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
