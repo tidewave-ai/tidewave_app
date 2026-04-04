@@ -350,12 +350,14 @@ async fn serve_http_server_inner(
     let mut app = Router::new()
         .route("/", get(root))
         .route("/about", get(about))
+        // Deprecated routes
+        .route("/stat", get(stat_handler).post(stat_handler))
+        .route("/listdir", get(listdir_handler).post(listdir_handler))
+        // Always use POST routes so it triggers origin checks
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
-        .route("/stat", get(stat_handler))
-        .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
