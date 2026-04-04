@@ -348,9 +348,9 @@ async fn serve_http_server_inner(
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
-        .route("/", get(root))
-        .route("/about", get(about))
+        .route("/", get(root_handler))
         // Deprecated routes
+        .route("/about", get(about_handler).post(about_handler))
         .route("/stat", get(stat_handler).post(stat_handler))
         .route("/listdir", get(listdir_handler).post(listdir_handler))
         // Always use POST routes so it triggers origin checks
@@ -1159,7 +1159,7 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
+async fn about_handler(Query(params): Query<AboutParams>) -> Result<Json<AboutResponse>, StatusCode> {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
@@ -1181,7 +1181,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let response_body = AboutResponse {
+                return Ok(Json(AboutResponse {
                     name: "tidewave-cli".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     system: SystemInfo {
@@ -1193,15 +1193,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     },
                     cache_dir,
                     recordings_dir,
-                };
-
-                let json_body = serde_json::to_string(&response_body)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                return Response::builder()
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(json_body))
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                }));
             };
 
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1210,7 +1202,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
     _ = params;
 
-    let response_body = AboutResponse {
+    Ok(Json(AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {
@@ -1222,15 +1214,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         },
         cache_dir,
         recordings_dir,
-    };
-
-    let json_body =
-        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Response::builder()
-        .header("Content-Type", "application/json")
-        .body(Body::from(json_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }))
 }
 
 async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>, StatusCode> {
@@ -1244,7 +1228,7 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-async fn root(_req: Request) -> Html<String> {
+async fn root_handler(_req: Request) -> Html<String> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
