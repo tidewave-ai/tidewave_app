@@ -350,11 +350,11 @@ async fn serve_http_server_inner(
     let client_for_proxy = client.clone();
     let mut app = Router::new()
         .route("/", get(root_handler))
-        // Deprecated routes
+        // TODO: remove deprecated GET
         .route("/about", get(about_handler).post(about_handler))
+        .route("/stat", get(stat_handler).post(stat_handler))
+        .route("/listdir", get(listdir_handler).post(listdir_handler))
         // Always use POST routes so it triggers origin checks
-        .route("/stat", post(stat_handler))
-        .route("/listdir", post(listdir_handler))
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
