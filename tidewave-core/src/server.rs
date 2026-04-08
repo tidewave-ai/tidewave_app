@@ -350,6 +350,10 @@ async fn serve_http_server_inner(
     let client_for_proxy = client.clone();
     let mut app = Router::new()
         .route("/", get(root_handler))
+        .route("/manifest.json", get(manifest_json_handler))
+        .route("/sw.js", get(service_worker_handler))
+        .route("/icon-192.png", get(icon_192_handler))
+        .route("/icon-512.png", get(icon_512_handler))
         // TODO: remove deprecated GET
         .route("/about", get(about_handler).post(about_handler))
         .route("/stat", get(stat_handler).post(stat_handler))
@@ -1242,6 +1246,17 @@ async fn root_handler(_req: Request) -> Html<String> {
     <meta name="tidewave:source" content="cli" />
     <meta name="tidewave:version" content="{}" />
     <script type="module" src="{}/tc/tc.js"></script>
+    <script>
+      if ('serviceWorker' in navigator) {{
+        navigator.serviceWorker.register('/sw.js');
+      }}
+      if (/Chrome/.test(navigator.userAgent)) {{
+        const link = document.createElement('link');
+        link.rel = 'manifest';
+        link.href = '/manifest.json';
+        document.head.appendChild(link);
+      }}
+    </script>
   </head>
   <body></body>
 </html>"#,
@@ -1250,4 +1265,100 @@ async fn root_handler(_req: Request) -> Html<String> {
     );
 
     Html(html)
+}
+
+async fn manifest_json_handler() -> Response<Body> {
+    let manifest = serde_json::json!({
+        "name": "Tidewave Web",
+        "short_name": "Tidewave Web",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#000000",
+        "description": "Tidewave Web",
+        "icons": [
+            {
+                "src": "/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            }
+        ],
+        "protocol_handlers": [
+            {
+                "protocol": "web+tidewave",
+                "url": "/?pwa=%s"
+            }
+        ]
+    });
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/manifest+json")
+        .body(Body::from(manifest.to_string()))
+        .unwrap()
+}
+
+async fn service_worker_handler() -> Response<Body> {
+    let sw = r##"const OFFLINE_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tidewave</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0d1117; color: #fff; }
+    p { font-size: 1.1rem; text-align: center; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <p>Could not load <span id="url"></span><br>Ensure the Tidewave App (or CLI) is running in your menu bar and <a href="#" onclick="location.reload();return false" style="color:#fff">refresh</a>.</p>
+  <script>document.getElementById('url').textContent = location.href;</script>
+</body>
+</html>`;
+
+self.addEventListener('install', event => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', event => {
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request).catch(() => new Response(OFFLINE_HTML, {
+        headers: { 'Content-Type': 'text/html' }
+      }))
+    );
+  }
+});"##;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/javascript")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(sw))
+        .unwrap()
+}
+
+async fn icon_192_handler() -> Response<Body> {
+    let bytes = include_bytes!("../icons/pwa-192.png");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap()
+}
+
+async fn icon_512_handler() -> Response<Body> {
+    let bytes = include_bytes!("../icons/pwa-512.png");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap()
 }

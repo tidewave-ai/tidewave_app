@@ -5307,6 +5307,9 @@ name = "tidewave-app"
 version = "0.4.1"
 dependencies = [
  "dirs 5.0.1",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",

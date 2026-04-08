@@ -278,14 +278,50 @@ pub fn run() {
         });
 }
 
+fn has_pwa_handler() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSWorkspace;
+        use objc2_foundation::{NSString, NSURL};
+
+        let url_string = NSString::from_str("web+tidewave://open");
+        let Some(url) = NSURL::URLWithString(&url_string) else {
+            return false;
+        };
+        let workspace = NSWorkspace::sharedWorkspace();
+        workspace.URLForApplicationToOpenURL(&url).is_some()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKCR\web+tidewave"])
+            .output();
+        matches!(output, Ok(o) if o.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = command_with_limited_env("xdg-mime")
+            .args(["query", "default", "x-scheme-handler/web+tidewave"])
+            .output();
+        matches!(output, Ok(o) if o.status.success() && !o.stdout.is_empty())
+    }
+}
+
 fn open_tidewave(app: &tauri::AppHandle, port: u16, https_port: Option<u16>) {
-    debug!("Opening Tidewave in browser");
-    // Prefer HTTPS if available
-    let url = if let Some(https_port) = https_port {
-        format!("https://localhost:{}", https_port)
+    let url = if has_pwa_handler() {
+        debug!("Opening Tidewave PWA via protocol handler");
+        "web+tidewave://open".to_string()
     } else {
-        format!("http://localhost:{}", port)
+        debug!("Opening Tidewave in browser");
+        if let Some(https_port) = https_port {
+            format!("https://localhost:{}", https_port)
+        } else {
+            format!("http://localhost:{}", port)
+        }
     };
+
     #[cfg(target_os = "linux")]
     let result = command_with_limited_env("xdg-open")
         .arg(&url)
