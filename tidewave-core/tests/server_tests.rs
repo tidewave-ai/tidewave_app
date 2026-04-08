@@ -126,7 +126,7 @@ async fn test_localhost_proxy_retry() {
 
     // Test 1: Proxy to localhost:PORT/about (should work directly)
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/proxy?url=http://localhost:{}/about",
             port, port
         ))
@@ -140,7 +140,7 @@ async fn test_localhost_proxy_retry() {
 
     // Test 2: Proxy to tidewave-app-test.localhost:PORT/about (should retry to 127.0.0.1)
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/proxy?url=http://tidewave-app-test.localhost:{}/about",
             port, port
         ))
@@ -164,7 +164,7 @@ async fn test_verify_origin_mismatch() {
 
     // Test 1: Evil origin should be blocked on /stat
     let response = client
-        .get(format!("http://127.0.0.1:{}/stat?path=/tmp", port))
+        .post(format!("http://127.0.0.1:{}/stat?path=/tmp", port))
         .header("Origin", "http://evil.com")
         .send()
         .await
@@ -194,7 +194,7 @@ async fn test_verify_origin_localhost_with_matching_port() {
 
     // Test 1: localhost with matching port should be allowed
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -207,7 +207,7 @@ async fn test_verify_origin_localhost_with_matching_port() {
 
     // Test 2: 127.0.0.1 with matching port should be allowed
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -220,7 +220,7 @@ async fn test_verify_origin_localhost_with_matching_port() {
 
     // Test 3: *.localhost with matching port should be allowed
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -244,7 +244,7 @@ async fn test_verify_origin_localhost_with_wrong_port() {
 
     // Test 1: localhost with wrong port should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -257,7 +257,7 @@ async fn test_verify_origin_localhost_with_wrong_port() {
 
     // Test 2: 127.0.0.1 with wrong port should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -270,7 +270,7 @@ async fn test_verify_origin_localhost_with_wrong_port() {
 
     // Test 3: *.localhost with wrong port should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -293,7 +293,7 @@ async fn test_verify_origin_localhost_with_wrong_scheme() {
 
     // Test 1: HTTPS origin when server is HTTP should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -306,7 +306,7 @@ async fn test_verify_origin_localhost_with_wrong_scheme() {
 
     // Test 2: HTTPS with 127.0.0.1 should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -319,7 +319,7 @@ async fn test_verify_origin_localhost_with_wrong_scheme() {
 
     // Test 3: HTTPS with *.localhost should be blocked
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -350,7 +350,7 @@ async fn test_verify_origin_subdomain_localhost_variants() {
 
     for subdomain in subdomains {
         let response = client
-            .get(format!(
+            .post(format!(
                 "http://127.0.0.1:{}/stat?path={}",
                 port,
                 test_path.display()
@@ -387,7 +387,7 @@ async fn test_verify_origin_non_localhost_domains_blocked() {
 
     for domain in domains {
         let response = client
-            .get(format!(
+            .post(format!(
                 "http://127.0.0.1:{}/stat?path={}",
                 port,
                 test_path.display()
@@ -420,7 +420,7 @@ async fn test_verify_origin_allowed_origins_work() {
 
     // Test that explicitly allowed origins still work
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -432,7 +432,7 @@ async fn test_verify_origin_allowed_origins_work() {
     assert_ne!(response.status(), StatusCode::FORBIDDEN);
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -455,7 +455,7 @@ async fn test_verify_origin_no_origin_header_allowed() {
 
     // Test that requests without Origin header are allowed
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             test_path.display()
@@ -548,7 +548,7 @@ async fn test_about_includes_system_info() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("http://127.0.0.1:{}/about", port))
+        .post(format!("http://127.0.0.1:{}/about", port))
         .send()
         .await
         .unwrap();
@@ -1130,7 +1130,7 @@ async fn test_stat_file() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             readme_path.to_str().unwrap()
@@ -1161,7 +1161,7 @@ async fn test_stat_directory() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/stat?path={}",
             port,
             dir_path.to_str().unwrap()
@@ -1198,7 +1198,7 @@ async fn test_listdir() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/listdir?path={}",
             port,
             temp_dir.to_str().unwrap()
@@ -1253,7 +1253,7 @@ async fn test_listdir_requires_absolute_path() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/listdir?path=relative/path",
             port
         ))
@@ -1273,7 +1273,7 @@ async fn test_listdir_nonexistent() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{}/listdir?path=/nonexistent/path/that/does/not/exist",
             port
         ))
@@ -1398,7 +1398,7 @@ async fn test_download_basic() {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key=test_file&url=http://127.0.0.1:{file_port}/test.txt"
         ))
         .send()
@@ -1417,7 +1417,7 @@ async fn test_download_basic() {
 
     // Request again - should return immediately with done status (cached)
     let response2 = client
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key=test_file&url=http://127.0.0.1:{file_port}/test.txt"
         ))
         .send()
@@ -1448,7 +1448,7 @@ async fn test_download_concurrent_with_throttle() {
 
     let handle1 = tokio::spawn(async move {
         let response = reqwest::Client::new()
-            .get(format!(
+            .post(format!(
                 "http://127.0.0.1:{port}/download?key={test_key1}&url=http://127.0.0.1:{file_port}/large.txt&throttle=10240"
             ))
             .send()
@@ -1468,7 +1468,7 @@ async fn test_download_concurrent_with_throttle() {
 
     let handle2 = tokio::spawn(async move {
         let response = reqwest::Client::new()
-            .get(format!(
+            .post(format!(
                 "http://127.0.0.1:{port}/download?key={test_key2}&url=http://127.0.0.1:{file_port}/large.txt&throttle=10240"
             ))
             .send()
@@ -1520,7 +1520,7 @@ async fn test_download_with_executable_flag() {
         start_file_server("/script.sh", test_content.to_vec()).await;
 
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key=test_executable&url=http://127.0.0.1:{file_port}/script.sh&executable=true"
         ))
         .send()
@@ -1558,7 +1558,7 @@ async fn test_download_with_extract_from_tarball() {
 
     let test_key = format!("extract_test_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.tar.gz&extract=package/bin/myexe&executable=true"
         ))
         .send()
@@ -1588,7 +1588,7 @@ async fn test_download_with_extract_file_not_found() {
 
     let test_key = format!("extract_notfound_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.tar.gz&extract=nonexistent/path"
         ))
         .send()
@@ -1626,7 +1626,7 @@ async fn test_download_with_extract_from_zip() {
 
     let test_key = format!("extract_zip_test_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract=package/bin/myexe&executable=true"
         ))
         .send()
@@ -1656,7 +1656,7 @@ async fn test_download_with_extract_from_zip_not_found() {
 
     let test_key = format!("extract_zip_notfound_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract=nonexistent/path"
         ))
         .send()
@@ -1742,7 +1742,7 @@ async fn test_download_with_extract_all_from_tarball() {
 
     let test_key = format!("extract_all_tar_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.tar.gz&extract="
         ))
         .send()
@@ -1791,7 +1791,7 @@ async fn test_download_with_extract_all_from_zip() {
 
     let test_key = format!("extract_all_zip_{}", uuid::Uuid::new_v4());
     let response = reqwest::Client::new()
-        .get(format!(
+        .post(format!(
             "http://127.0.0.1:{port}/download?key={test_key}&url=http://127.0.0.1:{file_port}/archive.zip&extract="
         ))
         .send()
