@@ -348,18 +348,20 @@ async fn serve_http_server_inner(
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
-        .route("/", get(root))
-        .route("/manifest.json", get(manifest_json))
-        .route("/sw.js", get(service_worker))
-        .route("/icon-192.png", get(icon_192))
-        .route("/icon-512.png", get(icon_512))
-        .route("/about", get(about))
+        .route("/", get(root_handler))
+        .route("/manifest.json", get(manifest_json_handler))
+        .route("/sw.js", get(service_worker_handler))
+        .route("/icon-192.png", get(icon_192_handler))
+        .route("/icon-512.png", get(icon_512_handler))
+        // Deprecated routes
+        .route("/about", get(about_handler).post(about_handler))
+        .route("/stat", get(stat_handler).post(stat_handler))
+        .route("/listdir", get(listdir_handler).post(listdir_handler))
+        // Always use POST routes so it triggers origin checks
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
-        .route("/stat", get(stat_handler))
-        .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
@@ -531,9 +533,9 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // Skip origin verification for /about and /check-origin routes
+    // Skip origin verification for /check-origin routes
     let path = req.uri().path();
-    if path == "/about" || path == "/check-origin" {
+    if path == "/check-origin" {
         return Ok(next.run(req).await);
     }
 
@@ -1161,7 +1163,7 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
+async fn about_handler(Query(params): Query<AboutParams>) -> Result<Json<AboutResponse>, StatusCode> {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
@@ -1183,7 +1185,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let response_body = AboutResponse {
+                return Ok(Json(AboutResponse {
                     name: "tidewave-cli".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     system: SystemInfo {
@@ -1195,16 +1197,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                     },
                     cache_dir,
                     recordings_dir,
-                };
-
-                let json_body = serde_json::to_string(&response_body)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                return Response::builder()
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(json_body))
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                }));
             };
 
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1213,7 +1206,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
     _ = params;
 
-    let response_body = AboutResponse {
+    Ok(Json(AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {
@@ -1225,16 +1218,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
         },
         cache_dir,
         recordings_dir,
-    };
-
-    let json_body =
-        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Response::builder()
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Content-Type", "application/json")
-        .body(Body::from(json_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }))
 }
 
 async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>, StatusCode> {
@@ -1248,7 +1232,7 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-async fn root(_req: Request) -> Html<String> {
+async fn root_handler(_req: Request) -> Html<String> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
@@ -1282,7 +1266,7 @@ async fn root(_req: Request) -> Html<String> {
     Html(html)
 }
 
-async fn manifest_json() -> Response<Body> {
+async fn manifest_json_handler() -> Response<Body> {
     let manifest = serde_json::json!({
         "name": "Tidewave Web",
         "short_name": "Tidewave Web",
@@ -1319,7 +1303,7 @@ async fn manifest_json() -> Response<Body> {
         .unwrap()
 }
 
-async fn service_worker() -> Response<Body> {
+async fn service_worker_handler() -> Response<Body> {
     let sw = r##"const OFFLINE_HTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -1362,7 +1346,7 @@ self.addEventListener('fetch', event => {
         .unwrap()
 }
 
-async fn icon_192() -> Response<Body> {
+async fn icon_192_handler() -> Response<Body> {
     let bytes = include_bytes!("../icons/pwa-192.png");
     Response::builder()
         .header(header::CONTENT_TYPE, "image/png")
@@ -1370,7 +1354,7 @@ async fn icon_192() -> Response<Body> {
         .unwrap()
 }
 
-async fn icon_512() -> Response<Body> {
+async fn icon_512_handler() -> Response<Body> {
     let bytes = include_bytes!("../icons/pwa-512.png");
     Response::builder()
         .header(header::CONTENT_TYPE, "image/png")
