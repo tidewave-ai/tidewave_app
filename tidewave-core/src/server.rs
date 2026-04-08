@@ -10,7 +10,7 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
-    routing::{get, post},
+    routing::{get, post, any},
     Router,
 };
 use bytes::BytesMut;
@@ -320,7 +320,8 @@ async fn serve_http_server_inner(
     let download_routes = Router::new()
         .route(
             "/download",
-            get(move |params, state| {
+            // TODO: convert to POST
+            any(move |params, state| {
                 let client = client_for_download.clone();
                 download_handler(params, state, client)
             }),
@@ -353,7 +354,7 @@ async fn serve_http_server_inner(
         .route("/sw.js", get(service_worker_handler))
         .route("/icon-192.png", get(icon_192_handler))
         .route("/icon-512.png", get(icon_512_handler))
-        // Deprecated routes
+        // TODO: remove deprecated GET
         .route("/about", get(about_handler).post(about_handler))
         .route("/stat", get(stat_handler).post(stat_handler))
         .route("/listdir", get(listdir_handler).post(listdir_handler))
