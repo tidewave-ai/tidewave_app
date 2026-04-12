@@ -10,7 +10,7 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
-    routing::{get, post, any},
+    routing::{any, get, post},
     Router,
 };
 use bytes::BytesMut;
@@ -97,6 +97,15 @@ struct WriteFileParams {
 #[derive(Deserialize)]
 struct DeleteFileParams {
     path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct CopyParams {
+    from_path: String,
+    to_path: String,
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
@@ -204,6 +213,13 @@ enum WriteFileResponse {
 enum DeleteFileResponse {
     DeleteFileResponseOk { success: bool },
     DeleteFileResponseErr { success: bool, error: String },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CopyResponse {
+    CopyResponseOk { success: bool },
+    CopyResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -364,6 +380,7 @@ async fn serve_http_server_inner(
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
         .route("/mkdir", post(mkdir_handler))
+        .route("/copy", post(copy_handler))
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
@@ -855,6 +872,44 @@ async fn delete_file_handler(
     }
 }
 
+async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyResponse>, StatusCode> {
+    let from_path = match normalize_path(&payload.from_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(CopyResponse::CopyResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    let to_path = match normalize_path(&payload.to_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(CopyResponse::CopyResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    if !Path::new(&from_path).is_absolute() || !Path::new(&to_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = tokio::fs::copy(&from_path, &to_path)
+        .await
+        .map_err(|e| e.kind().to_string());
+
+    match result {
+        Ok(_) => Ok(Json(CopyResponse::CopyResponseOk { success: true })),
+        Err(error) => Ok(Json(CopyResponse::CopyResponseErr {
+            success: false,
+            error,
+        })),
+    }
+}
+
 async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
     let path = Path::new(&payload.path);
 
@@ -1164,7 +1219,9 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about_handler(Query(params): Query<AboutParams>) -> Result<Json<AboutResponse>, StatusCode> {
+async fn about_handler(
+    Query(params): Query<AboutParams>,
+) -> Result<Json<AboutResponse>, StatusCode> {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
