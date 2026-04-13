@@ -1,6 +1,11 @@
 # Changelog
 
-## v0.4.1 (2026-04-27)
+## v0.4.2 (2026-04-13)
+
+* Support running as a PWA
+* Add /copy endpoint
+
+## v0.4.1 (2026-04-08)
 
 * Add routes for /stat and /listdir
 * Provide a POST version for /about and /download
