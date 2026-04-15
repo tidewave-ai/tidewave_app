@@ -112,6 +112,15 @@ struct CopyParams {
 }
 
 #[derive(Deserialize)]
+struct MoveParams {
+    from_path: String,
+    to_path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
 struct WhichParams {
     command: String,
     // Note that cwd is only used in case PATH in env is also set
@@ -220,6 +229,13 @@ enum DeleteFileResponse {
 enum CopyResponse {
     CopyResponseOk { success: bool },
     CopyResponseErr { success: bool, error: String },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MoveResponse {
+    MoveResponseOk { success: bool },
+    MoveResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -381,6 +397,7 @@ async fn serve_http_server_inner(
         .route("/delete", post(delete_file_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/copy", post(copy_handler))
+        .route("/move", post(move_handler))
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
@@ -904,6 +921,44 @@ async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyRespon
     match result {
         Ok(_) => Ok(Json(CopyResponse::CopyResponseOk { success: true })),
         Err(error) => Ok(Json(CopyResponse::CopyResponseErr {
+            success: false,
+            error,
+        })),
+    }
+}
+
+async fn move_handler(Json(payload): Json<MoveParams>) -> Result<Json<MoveResponse>, StatusCode> {
+    let from_path = match normalize_path(&payload.from_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(MoveResponse::MoveResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    let to_path = match normalize_path(&payload.to_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(MoveResponse::MoveResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    if !Path::new(&from_path).is_absolute() || !Path::new(&to_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = tokio::fs::rename(&from_path, &to_path)
+        .await
+        .map_err(|e| e.kind().to_string());
+
+    match result {
+        Ok(_) => Ok(Json(MoveResponse::MoveResponseOk { success: true })),
+        Err(error) => Ok(Json(MoveResponse::MoveResponseErr {
             success: false,
             error,
         })),

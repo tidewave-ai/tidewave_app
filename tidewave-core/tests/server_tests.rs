@@ -1203,6 +1203,92 @@ async fn test_copy_file_nonexistent_source() {
     shutdown_tx.send(()).ok();
 }
 
+// ============================================================================
+// Move Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_move_file() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("move_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let from_path = temp_dir.join("source.txt");
+    let to_path = temp_dir.join("dest.txt");
+    fs::write(&from_path, "hello move").expect("Failed to write file");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/move", port))
+        .json(&serde_json::json!({
+            "from_path": from_path.to_str().unwrap(),
+            "to_path": to_path.to_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    assert!(to_path.exists());
+    assert_eq!(fs::read_to_string(&to_path).unwrap(), "hello move");
+    // Source should no longer exist
+    assert!(!from_path.exists());
+
+    fs::remove_dir_all(&temp_dir).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_move_file_requires_absolute_paths() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/move", port))
+        .json(&serde_json::json!({
+            "from_path": "relative/source.txt",
+            "to_path": "/tmp/dest.txt"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_move_file_nonexistent_source() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/move", port))
+        .json(&serde_json::json!({
+            "from_path": "/nonexistent/source.txt",
+            "to_path": "/tmp/dest.txt"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].is_string());
+
+    shutdown_tx.send(()).ok();
+}
+
 #[tokio::test]
 async fn test_stat_file() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
