@@ -5304,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-app"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "dirs 5.0.1",
  "objc2",
@@ -5330,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "clap",
  "tidewave-core",
@@ -5341,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "tidewave-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
