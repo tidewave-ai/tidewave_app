@@ -9,7 +9,7 @@ use axum::{
     extract::{Json, Query, Request},
     http::{header, StatusCode},
     middleware,
-    response::{Html, Response},
+    response::Response,
     routing::{any, get, post},
     Router,
 };
@@ -1345,7 +1345,7 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-async fn root_handler(_req: Request) -> Html<String> {
+async fn root_handler(_req: Request) -> Response<Body> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
@@ -1376,7 +1376,14 @@ async fn root_handler(_req: Request) -> Html<String> {
         client_url,
     );
 
-    Html(html)
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "base-uri 'self'; frame-ancestors 'self'",
+        )
+        .body(Body::from(html))
+        .unwrap()
 }
 
 async fn manifest_json_handler() -> Response<Body> {
