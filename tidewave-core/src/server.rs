@@ -1323,7 +1323,10 @@ async fn root_handler(_req: Request) -> Response<Body> {
 
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'self'")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "base-uri 'self'; frame-ancestors 'self'",
+        )
         .body(Body::from(html))
         .unwrap()
 }
