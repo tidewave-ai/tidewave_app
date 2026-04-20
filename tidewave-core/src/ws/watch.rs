@@ -415,6 +415,35 @@ fn convert_notify_event(
                         }
                     }
                 }
+                notify::event::RenameMode::Any => {
+                    // Any means that the path is a part of rename, but the backend does
+                    // not specify it it is "From" or "To". To detect it we check if the
+                    // given path exists.
+                    if let Some(path) = event.paths.first() {
+                        if path.exists() {
+                            // Path exists → treat as "To"
+                            if let Some(to_relative) = to_relative_path(path, watched_path) {
+                                if let Some(from_relative) = pending_rename_from.take() {
+                                    results.push(WatchEvent::FS(FsEvent::Renamed {
+                                        from: from_relative,
+                                        to: to_relative,
+                                    }));
+                                } else {
+                                    results.push(WatchEvent::FS(FsEvent::Created {
+                                        path: to_relative,
+                                    }));
+                                }
+                            } else if let Some(from_relative) = pending_rename_from.take() {
+                                results.push(WatchEvent::FS(FsEvent::Deleted {
+                                    path: from_relative,
+                                }));
+                            }
+                        } else {
+                            // Path gone → treat as "From"
+                            *pending_rename_from = to_relative_path(path, watched_path);
+                        }
+                    }
+                }
                 notify::event::RenameMode::Both => {
                     if event.paths.len() >= 2 {
                         let from_relative = to_relative_path(&event.paths[0], watched_path);
