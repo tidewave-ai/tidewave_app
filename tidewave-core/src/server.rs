@@ -352,7 +352,6 @@ async fn serve_http_server_inner(
     let download_routes = Router::new()
         .route(
             "/download",
-            // TODO: convert to POST
             post(move |params, state| {
                 let client = client_for_download.clone();
                 download_handler(params, state, client)
