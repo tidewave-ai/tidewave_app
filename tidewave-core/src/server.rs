@@ -259,6 +259,9 @@ struct AboutResponse {
     system: SystemInfo,
     cache_dir: String,
     recordings_dir: String,
+    http_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    https_port: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -1274,7 +1277,14 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
 
 async fn about_handler(
     Query(params): Query<AboutParams>,
+    req: Request,
 ) -> Result<Json<AboutResponse>, StatusCode> {
+    let (port, https_port) = req
+        .extensions()
+        .get::<ServerConfig>()
+        .map(|c| (c.port, c.https_port))
+        .unwrap_or((0, None));
+
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
@@ -1308,6 +1318,8 @@ async fn about_handler(
                     },
                     cache_dir,
                     recordings_dir,
+                    port,
+                    https_port,
                 }));
             };
 
@@ -1329,6 +1341,8 @@ async fn about_handler(
         },
         cache_dir,
         recordings_dir,
+        http_port: port,
+        https_port,
     }))
 }
 
