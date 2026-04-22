@@ -254,6 +254,7 @@ struct SystemInfo {
 
 #[derive(Serialize)]
 struct AboutResponse {
+    id: String,
     name: String,
     version: String,
     system: SystemInfo,
@@ -271,6 +272,7 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
     port: u16,
     https_port: Option<u16>,
+    instance_id: String,
 }
 
 pub async fn start_http_server(
@@ -310,6 +312,8 @@ async fn serve_http_server_inner(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    let instance_id = uuid::Uuid::new_v4().to_string();
+
     // Single client without automatic compression (we handle it manually in download handler)
     let client = Client::builder()
         .use_preconfigured_tls(ClientConfig::with_platform_verifier())
@@ -345,6 +349,7 @@ async fn serve_http_server_inner(
         allowed_origins,
         port,
         https_port,
+        instance_id,
     };
 
     // Create download routes
@@ -1274,7 +1279,14 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
 
 async fn about_handler(
     Query(params): Query<AboutParams>,
+    req: Request,
 ) -> Result<Json<AboutResponse>, StatusCode> {
+    let instance_id = req
+        .extensions()
+        .get::<ServerConfig>()
+        .map(|c| c.instance_id.clone())
+        .unwrap_or_default();
+
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
@@ -1297,6 +1309,7 @@ async fn about_handler(
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 return Ok(Json(AboutResponse {
+                    id: instance_id,
                     name: "tidewave-cli".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     system: SystemInfo {
@@ -1318,6 +1331,7 @@ async fn about_handler(
     _ = params;
 
     Ok(Json(AboutResponse {
+        id: instance_id,
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {

@@ -556,6 +556,21 @@ async fn test_about_includes_system_info() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
 
+    // Verify instance id is a non-empty string and stable across requests
+    assert!(body["id"].is_string());
+    assert!(!body["id"].as_str().unwrap().is_empty());
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let body2: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{}/about", port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body2["id"], id);
+
     assert_eq!(body["name"], "tidewave-cli");
     assert!(body["version"].is_string());
 
