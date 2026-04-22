@@ -159,7 +159,7 @@ pub fn run() {
             let maybe_hotkey = |_s: &str| None::<&str>;
 
             let open_tidewave_i = MenuItem::with_id(app, "open_tidewave", "Open in Browser", true, maybe_hotkey("Command+O"))?;
-            let open_config_i = MenuItem::with_id(app, "open_config", "Settings…", true, maybe_hotkey("Command+,"))?;
+            let open_config_i = MenuItem::with_id(app, "open_config", "Configuration", true, maybe_hotkey("Command+,"))?;
             let is_autostart = app.autolaunch().is_enabled().unwrap_or(false);
             let launch_at_login_i = CheckMenuItem::with_id(app, "launch_at_login", "Launch at Login", true, is_autostart, None::<&str>)?;
             let view_logs_i = MenuItem::with_id(app, "view_logs", "View Logs", true, maybe_hotkey("Command+L"))?;
