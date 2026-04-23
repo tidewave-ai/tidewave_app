@@ -1448,7 +1448,7 @@ self.addEventListener('activate', event => {
 });
 
 self.addEventListener('fetch', event => {
-  if (event.request.mode === 'navigate') {
+  if (event.request.mode === 'navigate' && new URL(event.request.url).pathname === '/') {
     event.respondWith(
       fetch(event.request).catch(() => new Response(OFFLINE_HTML, {
         headers: { 'Content-Type': 'text/html' }
