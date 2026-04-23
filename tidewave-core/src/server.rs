@@ -1279,11 +1279,11 @@ async fn about_handler(
     Query(params): Query<AboutParams>,
     req: Request,
 ) -> Result<Json<AboutResponse>, StatusCode> {
-    let (port, https_port) = req
+    let config = req
         .extensions()
         .get::<ServerConfig>()
-        .map(|c| (c.port, c.https_port))
-        .unwrap_or((0, None));
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (port, https_port) = (config.port, config.https_port);
 
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
