@@ -559,6 +559,10 @@ async fn test_about_includes_system_info() {
     assert_eq!(body["name"], "tidewave-cli");
     assert!(body["version"].is_string());
 
+    // Verify ports
+    assert_eq!(body["http_port"], port);
+    assert!(body["https_port"].is_null());
+
     // Verify system info is present
     let system = &body["system"];
     assert!(system.is_object());
