@@ -10,7 +10,7 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::Response,
-    routing::{any, get, post},
+    routing::{get, post},
     Router,
 };
 use bytes::BytesMut;
