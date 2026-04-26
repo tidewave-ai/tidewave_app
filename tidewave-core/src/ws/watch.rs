@@ -75,11 +75,16 @@ pub struct ActiveWatch {
     pub started: AtomicBool,
 }
 
+/// Key identifying a watcher: the canonical path plus a flag for whether the
+/// root `.gitignore` is honored. Different flag values get different watchers
+/// so each can broadcast events appropriate for its mode.
+pub type WatcherKey = (String, bool);
+
 /// Watch feature state
 #[derive(Clone, Default)]
 pub struct WatchFeatureState {
-    /// Active watchers (canonical_path → active_watch)
-    pub watchers: Arc<DashMap<String, Arc<ActiveWatch>>>,
+    /// Active watchers ((canonical_path, respect_gitignore) → active_watch)
+    pub watchers: Arc<DashMap<WatcherKey, Arc<ActiveWatch>>>,
 }
 
 impl WatchFeatureState {
@@ -99,6 +104,9 @@ struct JoinPayload {
     path: String,
     #[serde(default)]
     is_wsl: bool,
+    /// When true, drop events for paths matched by the root `.gitignore`.
+    #[serde(default)]
+    respect_gitignore: bool,
 }
 
 /// Initialize a `watch:<ref>` channel.
@@ -142,10 +150,14 @@ pub async fn init(
         Err(e) => return InitResult::Error(format!("Failed to canonicalize path: {}", e)),
     };
 
+    // Watchers are keyed by (canonical_path, respect_gitignore) so clients
+    // requesting different filtering modes get different broadcasters.
+    let key: WatcherKey = (canonical_path.clone(), payload.respect_gitignore);
+
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
         .watchers
-        .entry(canonical_path.clone())
+        .entry(key.clone())
         .or_insert_with(|| {
             let (tx, _rx) = broadcast::channel::<WatchEvent>(256);
             Arc::new(ActiveWatch {
@@ -165,7 +177,7 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(&state, &active_watch, &canonical_path, payload.is_wsl);
+        init_watcher(&state, &active_watch, &key, payload.is_wsl);
     }
 
     // Send success reply
@@ -204,17 +216,21 @@ pub async fn init(
     }
 }
 
-/// Spawn the filesystem watcher task for a canonical path.
+/// Spawn the filesystem watcher task for a watcher key.
 /// Broadcasts `WatchEvent`s to all subscribers via the `ActiveWatch` broadcast channel.
+/// When `respect_gitignore` is true (encoded in the key), events for paths
+/// matched by `<root>/.gitignore` are dropped before broadcasting.
 /// Cleans itself up from `state.watch.watchers` when done.
 fn init_watcher(
     state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
-    canonical_path: &str,
+    key: &WatcherKey,
     is_wsl: bool,
 ) {
     let tx = active_watch.tx.clone();
-    let canonical_path = canonical_path.to_string();
+    let key = key.clone();
+    let canonical_path = key.0.clone();
+    let respect_gitignore = key.1;
     let state = state.clone();
 
     // On Windows with WSL, use poll watcher directly since native watcher
@@ -254,7 +270,7 @@ fn init_watcher(
                     let _ = tx.send(WatchEvent::Terminated {
                         error: format!("Failed to create poll watcher: {}", e),
                     });
-                    state.watchers.remove(&canonical_path);
+                    state.watchers.remove(&key);
                     return;
                 }
             }
@@ -296,7 +312,7 @@ fn init_watcher(
                                     e, poll_err
                                 ),
                             });
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                     }
@@ -311,11 +327,15 @@ fn init_watcher(
             let _ = tx.send(WatchEvent::Terminated {
                 error: format!("Failed to watch path: {}", e),
             });
-            state.watchers.remove(&canonical_path);
+            state.watchers.remove(&key);
             return;
         }
 
-        let mut gitignore = build_gitignore(&root_path);
+        let mut gitignore = if respect_gitignore {
+            Some(build_gitignore(&root_path))
+        } else {
+            None
+        };
         let mut pending_rename_from: Option<String> = None;
         let cleanup_check_interval = Duration::from_secs(30);
 
@@ -324,10 +344,8 @@ fn init_watcher(
                 res = notify_rx.recv() => {
                     match res {
                         Some(Ok(event)) => {
-                            let gitignore_changed = event
-                                .paths
-                                .iter()
-                                .any(|p| p == &gitignore_path);
+                            let gitignore_changed = gitignore.is_some()
+                                && event.paths.iter().any(|p| p == &gitignore_path);
 
                             let watch_events = convert_notify_event(
                                 event,
@@ -338,33 +356,40 @@ fn init_watcher(
                             for watch_event in watch_events {
                                 let is_terminated = matches!(&watch_event, WatchEvent::Terminated { .. });
 
-                                if let Some(filtered) = filter_event_for_gitignore(
-                                    watch_event,
-                                    &gitignore,
-                                    &root_path,
-                                ) {
-                                    let _ = tx.send(filtered);
+                                let to_send = match &gitignore {
+                                    Some(gi) => filter_event_for_gitignore(
+                                        watch_event,
+                                        gi,
+                                        &root_path,
+                                    ),
+                                    None => Some(watch_event),
+                                };
+
+                                if let Some(event) = to_send {
+                                    let _ = tx.send(event);
                                 }
 
                                 if is_terminated {
-                                    state.watchers.remove(&canonical_path);
+                                    state.watchers.remove(&key);
                                     return;
                                 }
                             }
 
                             if gitignore_changed {
-                                gitignore = build_gitignore(&root_path);
+                                if let Some(gi) = gitignore.as_mut() {
+                                    *gi = build_gitignore(&root_path);
+                                }
                             }
                         }
                         Some(Err(e)) => {
                             let _ = tx.send(WatchEvent::Terminated {
                                 error: format!("Watch error: {}", e),
                             });
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                         None => {
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                     }
@@ -372,7 +397,7 @@ fn init_watcher(
                 _ = tokio::time::sleep(cleanup_check_interval) => {
                     if tx.receiver_count() == 0 {
                         debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path);
-                        state.watchers.remove(&canonical_path);
+                        state.watchers.remove(&key);
                         return;
                     }
                 }

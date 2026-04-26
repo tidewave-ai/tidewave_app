@@ -30,6 +30,24 @@ async fn join_watch(
         .expect("Expected phx_reply for join")
 }
 
+/// Same as `join_watch` but allows specifying the full join payload
+/// (e.g. to set `respect_gitignore`).
+async fn join_watch_with_payload(
+    ws_in_tx: &futures_mpsc::UnboundedSender<Result<axum::extract::ws::Message, axum::Error>>,
+    ws_out_rx: &mut futures_mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+    reference: &str,
+    payload: serde_json::Value,
+) -> PhxMessage {
+    send_phoenix_msg(
+        ws_in_tx,
+        &PhxMessage::new(format!("watch:{}", reference), events::PHX_JOIN, payload).with_ref("1"),
+    );
+
+    wait_for_reply(ws_out_rx, 1000)
+        .await
+        .expect("Expected phx_reply for join")
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -349,7 +367,13 @@ async fn test_watch_gitignore_filters_files_and_directories() {
         unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
     });
 
-    let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "ignore_watch", &watch_path).await;
+    let reply = join_watch_with_payload(
+        &ws_in_tx,
+        &mut ws_out_rx,
+        "ignore_watch",
+        json!({"path": watch_path, "respect_gitignore": true}),
+    )
+    .await;
     assert_eq!(reply.payload.as_json()["status"], "ok");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -389,7 +413,13 @@ async fn test_watch_gitignore_reload() {
         unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
     });
 
-    let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "reload_watch", &watch_path).await;
+    let reply = join_watch_with_payload(
+        &ws_in_tx,
+        &mut ws_out_rx,
+        "reload_watch",
+        json!({"path": watch_path, "respect_gitignore": true}),
+    )
+    .await;
     assert_eq!(reply.payload.as_json()["status"], "ok");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
