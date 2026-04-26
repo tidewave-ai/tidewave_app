@@ -330,6 +330,105 @@ async fn test_watch_concurrent_subscribers() {
 }
 
 #[tokio::test]
+async fn test_watch_gitignore_filters_files_and_directories() {
+    let state = WsState::new();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
+    let websocket_id = uuid::Uuid::new_v4();
+
+    // Ignore `*.log` (file pattern) and `target/` (directory pattern).
+    let temp_dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(temp_dir.path().join(".gitignore"), "*.log\ntarget/\n")
+        .await
+        .unwrap();
+    let target_dir = temp_dir.path().join("target");
+    tokio::fs::create_dir(&target_dir).await.unwrap();
+
+    let watch_path = temp_dir.path().to_string_lossy().to_string();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
+    });
+
+    let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "ignore_watch", &watch_path).await;
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Both ignored writes (file pattern + directory pattern) should be
+    // dropped; only the non-ignored file should produce an event.
+    tokio::fs::write(temp_dir.path().join("debug.log"), "ignored")
+        .await
+        .unwrap();
+    tokio::fs::write(target_dir.join("artifact.bin"), "ignored")
+        .await
+        .unwrap();
+    tokio::fs::write(temp_dir.path().join("keep.txt"), "kept")
+        .await
+        .unwrap();
+
+    let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
+    assert!(event.is_some(), "Expected created event for keep.txt");
+    let event = event.unwrap();
+    assert_eq!(event.payload.as_json()["path"].as_str().unwrap(), "keep.txt");
+}
+
+#[tokio::test]
+async fn test_watch_gitignore_reload() {
+    let state = WsState::new();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
+    let websocket_id = uuid::Uuid::new_v4();
+
+    // Initially ignore *.log
+    let temp_dir = tempfile::tempdir().unwrap();
+    let gitignore = temp_dir.path().join(".gitignore");
+    tokio::fs::write(&gitignore, "*.log\n").await.unwrap();
+
+    let watch_path = temp_dir.path().to_string_lossy().to_string();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
+    });
+
+    let reply = join_watch(&ws_in_tx, &mut ws_out_rx, "reload_watch", &watch_path).await;
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Rewrite .gitignore so *.log is no longer ignored. The change to the
+    // .gitignore file itself must pass through (it's not in the ignore set),
+    // and trigger a matcher reload.
+    tokio::fs::write(&gitignore, "*.tmp\n").await.unwrap();
+
+    // Drain the .gitignore modification event so it doesn't confuse later
+    // assertions.
+    let _ = wait_for_event(&mut ws_out_rx, "modified", 2000).await;
+
+    // Give the reload a moment to settle (it happens after the event is
+    // processed, on the next iteration of the watcher loop).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Now create a *.log (should pass through since *.log is no longer
+    // ignored) and a *.tmp (should be filtered).
+    tokio::fs::write(temp_dir.path().join("scratch.tmp"), "ignored")
+        .await
+        .unwrap();
+    tokio::fs::write(temp_dir.path().join("debug.log"), "kept")
+        .await
+        .unwrap();
+
+    let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
+    assert!(
+        event.is_some(),
+        "Expected created event for debug.log after reload"
+    );
+    let event = event.unwrap();
+    assert_eq!(
+        event.payload.as_json()["path"].as_str().unwrap(),
+        "debug.log"
+    );
+}
+
+#[tokio::test]
 async fn test_watch_subdirectory_events() {
     let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();

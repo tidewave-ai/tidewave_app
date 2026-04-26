@@ -8,10 +8,11 @@
 //! Event paths (created, modified, deleted, renamed) are relative to the watched directory.
 
 use dashmap::DashMap;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -303,7 +304,10 @@ fn init_watcher(
             }
         };
 
-        if let Err(e) = watcher.watch(Path::new(&canonical_path), RecursiveMode::Recursive) {
+        let root_path = PathBuf::from(&canonical_path);
+        let gitignore_path = root_path.join(".gitignore");
+
+        if let Err(e) = watcher.watch(&root_path, RecursiveMode::Recursive) {
             let _ = tx.send(WatchEvent::Terminated {
                 error: format!("Failed to watch path: {}", e),
             });
@@ -311,6 +315,7 @@ fn init_watcher(
             return;
         }
 
+        let mut gitignore = build_gitignore(&root_path);
         let mut pending_rename_from: Option<String> = None;
         let cleanup_check_interval = Duration::from_secs(30);
 
@@ -319,6 +324,11 @@ fn init_watcher(
                 res = notify_rx.recv() => {
                     match res {
                         Some(Ok(event)) => {
+                            let gitignore_changed = event
+                                .paths
+                                .iter()
+                                .any(|p| p == &gitignore_path);
+
                             let watch_events = convert_notify_event(
                                 event,
                                 &canonical_path,
@@ -328,12 +338,22 @@ fn init_watcher(
                             for watch_event in watch_events {
                                 let is_terminated = matches!(&watch_event, WatchEvent::Terminated { .. });
 
-                                let _ = tx.send(watch_event);
+                                if let Some(filtered) = filter_event_for_gitignore(
+                                    watch_event,
+                                    &gitignore,
+                                    &root_path,
+                                ) {
+                                    let _ = tx.send(filtered);
+                                }
 
                                 if is_terminated {
                                     state.watchers.remove(&canonical_path);
                                     return;
                                 }
+                            }
+
+                            if gitignore_changed {
+                                gitignore = build_gitignore(&root_path);
                             }
                         }
                         Some(Err(e)) => {
@@ -369,6 +389,74 @@ fn to_relative_path(absolute_path: &Path, watched_path: &str) -> Option<String> 
         .strip_prefix(watched)
         .ok()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Build a `Gitignore` matcher from `<root>/.gitignore`. Returns an empty
+/// matcher if the file is missing or unreadable.
+fn build_gitignore(root: &Path) -> Gitignore {
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        return Gitignore::empty();
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(err) = builder.add(&gitignore_path) {
+        warn!("Failed to read .gitignore at {:?}: {}", gitignore_path, err);
+        return Gitignore::empty();
+    }
+    builder.build().unwrap_or_else(|err| {
+        warn!("Failed to build gitignore matcher for {:?}: {}", root, err);
+        Gitignore::empty()
+    })
+}
+
+/// Check whether a path (relative to the watched root) should be ignored.
+fn is_path_ignored(gitignore: &Gitignore, relative_path: &str, root: &Path) -> bool {
+    if relative_path.is_empty() {
+        return false;
+    }
+    let abs = root.join(relative_path);
+    let is_dir = abs.is_dir();
+    if gitignore
+        .matched_path_or_any_parents(relative_path, is_dir)
+        .is_ignore()
+    {
+        return true;
+    }
+    // For paths that no longer exist (e.g. deletions) we don't know whether
+    // the path was a directory. Try the directory interpretation as well so
+    // that patterns like `target/` still match a deleted `target` directory.
+    if !is_dir && !abs.exists() {
+        return gitignore
+            .matched_path_or_any_parents(relative_path, true)
+            .is_ignore();
+    }
+    false
+}
+
+/// Filter a `WatchEvent` through the gitignore matcher. Returns `None` if any
+/// path in the event is ignored; the original event is otherwise mirrored
+/// through unchanged.
+fn filter_event_for_gitignore(
+    event: WatchEvent,
+    gitignore: &Gitignore,
+    root: &Path,
+) -> Option<WatchEvent> {
+    let fs_event = match event {
+        WatchEvent::FS(fs) => fs,
+        other => return Some(other),
+    };
+
+    let keep = match &fs_event {
+        FsEvent::Warning { .. } => true,
+        FsEvent::Created { path }
+        | FsEvent::Modified { path }
+        | FsEvent::Deleted { path } => !is_path_ignored(gitignore, path, root),
+        FsEvent::Renamed { from, to } => {
+            !is_path_ignored(gitignore, from, root) && !is_path_ignored(gitignore, to, root)
+        }
+    };
+
+    keep.then_some(WatchEvent::FS(fs_event))
 }
 
 fn convert_notify_event(
