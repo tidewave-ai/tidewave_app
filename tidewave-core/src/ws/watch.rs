@@ -78,6 +78,12 @@ pub struct ActiveWatch {
 /// Key identifying a watcher: the canonical path plus a flag for whether the
 /// root `.gitignore` is honored. Different flag values get different watchers
 /// so each can broadcast events appropriate for its mode.
+///
+/// Note: `global_gitignores` (see [`JoinPayload`]) is intentionally **not**
+/// part of the key. Callers are expected to pass a consistent list across all
+/// joins with `respect_gitignore = true` for the same path; the first joiner
+/// initializes the matcher and later joiners share that watcher regardless of
+/// what they pass.
 pub type WatcherKey = (String, bool);
 
 /// Watch feature state
@@ -104,9 +110,20 @@ struct JoinPayload {
     path: String,
     #[serde(default)]
     is_wsl: bool,
-    /// When true, drop events for paths matched by the root `.gitignore`.
+    /// When true, drop events for paths matched by the root `.gitignore`
+    /// and any `global_gitignores` files.
     #[serde(default)]
     respect_gitignore: bool,
+    /// Absolute paths to additional gitignore files (e.g. user-global
+    /// excludes). Loaded once at watcher start; assumed not to change.
+    ///
+    /// Ignored when `respect_gitignore` is false. When `respect_gitignore` is
+    /// true, callers are expected to **always** pass this list and to pass
+    /// the **same** list across all watchers for a given path: the field is
+    /// not part of the watcher dedup key, so the first joiner's list is what
+    /// every subsequent joiner will see.
+    #[serde(default)]
+    global_gitignores: Vec<String>,
 }
 
 /// Initialize a `watch:<ref>` channel.
@@ -177,7 +194,13 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(&state, &active_watch, &key, payload.is_wsl);
+        init_watcher(
+            &state,
+            &active_watch,
+            &key,
+            payload.is_wsl,
+            payload.global_gitignores,
+        );
     }
 
     // Send success reply
@@ -219,13 +242,15 @@ pub async fn init(
 /// Spawn the filesystem watcher task for a watcher key.
 /// Broadcasts `WatchEvent`s to all subscribers via the `ActiveWatch` broadcast channel.
 /// When `respect_gitignore` is true (encoded in the key), events for paths
-/// matched by `<root>/.gitignore` are dropped before broadcasting.
+/// matched by `<root>/.gitignore` and any `global_gitignores` files are dropped
+/// before broadcasting. `global_gitignores` is unused when the flag is false.
 /// Cleans itself up from `state.watch.watchers` when done.
 fn init_watcher(
     state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
     key: &WatcherKey,
     is_wsl: bool,
+    global_gitignores: Vec<String>,
 ) {
     let tx = active_watch.tx.clone();
     let key = key.clone();
@@ -332,7 +357,7 @@ fn init_watcher(
         }
 
         let mut gitignore = if respect_gitignore {
-            Some(build_gitignore(&root_path))
+            Some(build_gitignore(&root_path, &global_gitignores))
         } else {
             None
         };
@@ -377,7 +402,7 @@ fn init_watcher(
 
                             if gitignore_changed {
                                 if let Some(gi) = gitignore.as_mut() {
-                                    *gi = build_gitignore(&root_path);
+                                    *gi = build_gitignore(&root_path, &global_gitignores);
                                 }
                             }
                         }
@@ -416,18 +441,26 @@ fn to_relative_path(absolute_path: &Path, watched_path: &str) -> Option<String> 
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// Build a `Gitignore` matcher from `<root>/.gitignore`. Returns an empty
-/// matcher if the file is missing or unreadable.
-fn build_gitignore(root: &Path) -> Gitignore {
-    let gitignore_path = root.join(".gitignore");
-    if !gitignore_path.exists() {
-        return Gitignore::empty();
-    }
+/// Build a `Gitignore` matcher anchored at `root`, combining any external
+/// `globals` files (loaded once, in order) with `<root>/.gitignore`. Globals
+/// are added first so the per-watch `.gitignore` can override them via `!`
+/// patterns (last-match-wins, matching git's precedence).
+fn build_gitignore(root: &Path, globals: &[String]) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
-    if let Some(err) = builder.add(&gitignore_path) {
-        warn!("Failed to read .gitignore at {:?}: {}", gitignore_path, err);
-        return Gitignore::empty();
+
+    for global in globals {
+        if let Some(err) = builder.add(global) {
+            warn!("Failed to read global gitignore {}: {}", global, err);
+        }
     }
+
+    let gitignore_path = root.join(".gitignore");
+    if gitignore_path.exists() {
+        if let Some(err) = builder.add(&gitignore_path) {
+            warn!("Failed to read .gitignore at {:?}: {}", gitignore_path, err);
+        }
+    }
+
     builder.build().unwrap_or_else(|err| {
         warn!("Failed to build gitignore matcher for {:?}: {}", root, err);
         Gitignore::empty()

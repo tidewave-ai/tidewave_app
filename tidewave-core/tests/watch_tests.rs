@@ -397,6 +397,55 @@ async fn test_watch_gitignore_filters_files_and_directories() {
 }
 
 #[tokio::test]
+async fn test_watch_global_gitignores_are_honored() {
+    let state = WsState::new();
+    let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
+    let websocket_id = uuid::Uuid::new_v4();
+
+    // Watched dir has no local .gitignore. The ignore patterns come entirely
+    // from an external file living outside the watched tree.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let globals_dir = tempfile::tempdir().unwrap();
+    let global_gitignore = globals_dir.path().join("global_excludes");
+    tokio::fs::write(&global_gitignore, "*.log\n").await.unwrap();
+
+    let watch_path = temp_dir.path().to_string_lossy().to_string();
+    let global_path = global_gitignore.to_string_lossy().to_string();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(ws_out_tx, ws_in_rx, state, websocket_id).await;
+    });
+
+    let reply = join_watch_with_payload(
+        &ws_in_tx,
+        &mut ws_out_rx,
+        "global_watch",
+        json!({
+            "path": watch_path,
+            "respect_gitignore": true,
+            "global_gitignores": [global_path],
+        }),
+    )
+    .await;
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // *.log is filtered by the global; sibling file passes through.
+    tokio::fs::write(temp_dir.path().join("debug.log"), "ignored")
+        .await
+        .unwrap();
+    tokio::fs::write(temp_dir.path().join("keep.txt"), "kept")
+        .await
+        .unwrap();
+
+    let event = wait_for_event(&mut ws_out_rx, "created", 2000).await;
+    assert!(event.is_some(), "Expected created event for keep.txt");
+    let event = event.unwrap();
+    assert_eq!(event.payload.as_json()["path"].as_str().unwrap(), "keep.txt");
+}
+
+#[tokio::test]
 async fn test_watch_gitignore_reload() {
     let state = WsState::new();
     let (ws_out_tx, mut ws_out_rx, ws_in_tx, ws_in_rx) = create_fake_phoenix_socket();
