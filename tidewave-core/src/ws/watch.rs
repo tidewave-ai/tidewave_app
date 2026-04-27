@@ -8,10 +8,11 @@
 //! Event paths (created, modified, deleted, renamed) are relative to the watched directory.
 
 use dashmap::DashMap;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -74,11 +75,22 @@ pub struct ActiveWatch {
     pub started: AtomicBool,
 }
 
+/// Key identifying a watcher: the canonical path plus a flag for whether the
+/// root `.gitignore` is honored. Different flag values get different watchers
+/// so each can broadcast events appropriate for its mode.
+///
+/// Note: `global_gitignores` (see [`JoinPayload`]) is intentionally **not**
+/// part of the key. Callers are expected to pass a consistent list across all
+/// joins with `respect_gitignore = true` for the same path; the first joiner
+/// initializes the matcher and later joiners share that watcher regardless of
+/// what they pass.
+pub type WatcherKey = (String, bool);
+
 /// Watch feature state
 #[derive(Clone, Default)]
 pub struct WatchFeatureState {
-    /// Active watchers (canonical_path → active_watch)
-    pub watchers: Arc<DashMap<String, Arc<ActiveWatch>>>,
+    /// Active watchers ((canonical_path, respect_gitignore) → active_watch)
+    pub watchers: Arc<DashMap<WatcherKey, Arc<ActiveWatch>>>,
 }
 
 impl WatchFeatureState {
@@ -98,6 +110,20 @@ struct JoinPayload {
     path: String,
     #[serde(default)]
     is_wsl: bool,
+    /// When true, drop events for paths matched by the root `.gitignore`
+    /// and any `global_gitignores` files.
+    #[serde(default)]
+    respect_gitignore: bool,
+    /// Absolute paths to additional gitignore files (e.g. user-global
+    /// excludes). Loaded once at watcher start; assumed not to change.
+    ///
+    /// Ignored when `respect_gitignore` is false. When `respect_gitignore` is
+    /// true, callers are expected to **always** pass this list and to pass
+    /// the **same** list across all watchers for a given path: the field is
+    /// not part of the watcher dedup key, so the first joiner's list is what
+    /// every subsequent joiner will see.
+    #[serde(default)]
+    global_gitignores: Vec<String>,
 }
 
 /// Initialize a `watch:<ref>` channel.
@@ -141,10 +167,14 @@ pub async fn init(
         Err(e) => return InitResult::Error(format!("Failed to canonicalize path: {}", e)),
     };
 
+    // Watchers are keyed by (canonical_path, respect_gitignore) so clients
+    // requesting different filtering modes get different broadcasters.
+    let key: WatcherKey = (canonical_path.clone(), payload.respect_gitignore);
+
     // Get or create active watch entry (atomic via entry API)
     let active_watch = state
         .watchers
-        .entry(canonical_path.clone())
+        .entry(key.clone())
         .or_insert_with(|| {
             let (tx, _rx) = broadcast::channel::<WatchEvent>(256);
             Arc::new(ActiveWatch {
@@ -164,7 +194,13 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(&state, &active_watch, &canonical_path, payload.is_wsl);
+        init_watcher(
+            &state,
+            &active_watch,
+            &key,
+            payload.is_wsl,
+            payload.global_gitignores,
+        );
     }
 
     // Send success reply
@@ -203,17 +239,23 @@ pub async fn init(
     }
 }
 
-/// Spawn the filesystem watcher task for a canonical path.
+/// Spawn the filesystem watcher task for a watcher key.
 /// Broadcasts `WatchEvent`s to all subscribers via the `ActiveWatch` broadcast channel.
+/// When `respect_gitignore` is true (encoded in the key), events for paths
+/// matched by `<root>/.gitignore` and any `global_gitignores` files are dropped
+/// before broadcasting. `global_gitignores` is unused when the flag is false.
 /// Cleans itself up from `state.watch.watchers` when done.
 fn init_watcher(
     state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
-    canonical_path: &str,
+    key: &WatcherKey,
     is_wsl: bool,
+    global_gitignores: Vec<String>,
 ) {
     let tx = active_watch.tx.clone();
-    let canonical_path = canonical_path.to_string();
+    let key = key.clone();
+    let canonical_path = key.0.clone();
+    let respect_gitignore = key.1;
     let state = state.clone();
 
     // On Windows with WSL, use poll watcher directly since native watcher
@@ -253,7 +295,7 @@ fn init_watcher(
                     let _ = tx.send(WatchEvent::Terminated {
                         error: format!("Failed to create poll watcher: {}", e),
                     });
-                    state.watchers.remove(&canonical_path);
+                    state.watchers.remove(&key);
                     return;
                 }
             }
@@ -295,7 +337,7 @@ fn init_watcher(
                                     e, poll_err
                                 ),
                             });
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                     }
@@ -303,14 +345,22 @@ fn init_watcher(
             }
         };
 
-        if let Err(e) = watcher.watch(Path::new(&canonical_path), RecursiveMode::Recursive) {
+        let root_path = PathBuf::from(&canonical_path);
+        let gitignore_path = root_path.join(".gitignore");
+
+        if let Err(e) = watcher.watch(&root_path, RecursiveMode::Recursive) {
             let _ = tx.send(WatchEvent::Terminated {
                 error: format!("Failed to watch path: {}", e),
             });
-            state.watchers.remove(&canonical_path);
+            state.watchers.remove(&key);
             return;
         }
 
+        let mut gitignore = if respect_gitignore {
+            Some(build_gitignore(&root_path, &global_gitignores))
+        } else {
+            None
+        };
         let mut pending_rename_from: Option<String> = None;
         let cleanup_check_interval = Duration::from_secs(30);
 
@@ -319,6 +369,9 @@ fn init_watcher(
                 res = notify_rx.recv() => {
                     match res {
                         Some(Ok(event)) => {
+                            let gitignore_changed = gitignore.is_some()
+                                && event.paths.iter().any(|p| p == &gitignore_path);
+
                             let watch_events = convert_notify_event(
                                 event,
                                 &canonical_path,
@@ -328,11 +381,28 @@ fn init_watcher(
                             for watch_event in watch_events {
                                 let is_terminated = matches!(&watch_event, WatchEvent::Terminated { .. });
 
-                                let _ = tx.send(watch_event);
+                                let to_send = match &gitignore {
+                                    Some(gi) => filter_event_for_gitignore(
+                                        watch_event,
+                                        gi,
+                                        &root_path,
+                                    ),
+                                    None => Some(watch_event),
+                                };
+
+                                if let Some(event) = to_send {
+                                    let _ = tx.send(event);
+                                }
 
                                 if is_terminated {
-                                    state.watchers.remove(&canonical_path);
+                                    state.watchers.remove(&key);
                                     return;
+                                }
+                            }
+
+                            if gitignore_changed {
+                                if let Some(gi) = gitignore.as_mut() {
+                                    *gi = build_gitignore(&root_path, &global_gitignores);
                                 }
                             }
                         }
@@ -340,11 +410,11 @@ fn init_watcher(
                             let _ = tx.send(WatchEvent::Terminated {
                                 error: format!("Watch error: {}", e),
                             });
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                         None => {
-                            state.watchers.remove(&canonical_path);
+                            state.watchers.remove(&key);
                             return;
                         }
                     }
@@ -352,7 +422,7 @@ fn init_watcher(
                 _ = tokio::time::sleep(cleanup_check_interval) => {
                     if tx.receiver_count() == 0 {
                         debug!("No subscribers remaining for watch on {}, cleaning up", canonical_path);
-                        state.watchers.remove(&canonical_path);
+                        state.watchers.remove(&key);
                         return;
                     }
                 }
@@ -369,6 +439,82 @@ fn to_relative_path(absolute_path: &Path, watched_path: &str) -> Option<String> 
         .strip_prefix(watched)
         .ok()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Build a `Gitignore` matcher anchored at `root`, combining any external
+/// `globals` files (loaded once, in order) with `<root>/.gitignore`. Globals
+/// are added first so the per-watch `.gitignore` can override them via `!`
+/// patterns (last-match-wins, matching git's precedence).
+fn build_gitignore(root: &Path, globals: &[String]) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+
+    for global in globals {
+        if let Some(err) = builder.add(global) {
+            warn!("Failed to read global gitignore {}: {}", global, err);
+        }
+    }
+
+    let gitignore_path = root.join(".gitignore");
+    if gitignore_path.exists() {
+        if let Some(err) = builder.add(&gitignore_path) {
+            warn!("Failed to read .gitignore at {:?}: {}", gitignore_path, err);
+        }
+    }
+
+    builder.build().unwrap_or_else(|err| {
+        warn!("Failed to build gitignore matcher for {:?}: {}", root, err);
+        Gitignore::empty()
+    })
+}
+
+/// Check whether a path (relative to the watched root) should be ignored.
+fn is_path_ignored(gitignore: &Gitignore, relative_path: &str, root: &Path) -> bool {
+    if relative_path.is_empty() {
+        return false;
+    }
+    let abs = root.join(relative_path);
+    let is_dir = abs.is_dir();
+    if gitignore
+        .matched_path_or_any_parents(relative_path, is_dir)
+        .is_ignore()
+    {
+        return true;
+    }
+    // For paths that no longer exist (e.g. deletions) we don't know whether
+    // the path was a directory. Try the directory interpretation as well so
+    // that patterns like `target/` still match a deleted `target` directory.
+    if !is_dir && !abs.exists() {
+        return gitignore
+            .matched_path_or_any_parents(relative_path, true)
+            .is_ignore();
+    }
+    false
+}
+
+/// Filter a `WatchEvent` through the gitignore matcher. Returns `None` if any
+/// path in the event is ignored; the original event is otherwise mirrored
+/// through unchanged.
+fn filter_event_for_gitignore(
+    event: WatchEvent,
+    gitignore: &Gitignore,
+    root: &Path,
+) -> Option<WatchEvent> {
+    let fs_event = match event {
+        WatchEvent::FS(fs) => fs,
+        other => return Some(other),
+    };
+
+    let keep = match &fs_event {
+        FsEvent::Warning { .. } => true,
+        FsEvent::Created { path }
+        | FsEvent::Modified { path }
+        | FsEvent::Deleted { path } => !is_path_ignored(gitignore, path, root),
+        FsEvent::Renamed { from, to } => {
+            !is_path_ignored(gitignore, from, root) && !is_path_ignored(gitignore, to, root)
+        }
+    };
+
+    keep.then_some(WatchEvent::FS(fs_event))
 }
 
 fn convert_notify_event(
