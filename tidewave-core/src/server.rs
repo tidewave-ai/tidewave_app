@@ -1318,7 +1318,7 @@ async fn about_handler(
                     },
                     cache_dir,
                     recordings_dir,
-                    port,
+                    http_port: port,
                     https_port,
                 }));
             };
