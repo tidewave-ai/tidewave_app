@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.4 (2026-05-05)
+
+* Add port information to `/about` route
+* Only serve `OFFLINE_HTML` on `/`
+* Rename "Settings" to "Configuration"
+* Allow tidewave to be mounted only on same origin iframes
+
 ## v0.4.3 (2026-04-16)
 
 * Add /move endpoint
