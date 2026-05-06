@@ -47,7 +47,8 @@ struct JoinPayload {
     env: HashMap<String, String>,
     cwd: String,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    is_wsl: bool,
+    #[serde(default)]
+    wsl_distro: Option<String>,
 }
 
 fn default_cols() -> u16 {
@@ -60,12 +61,12 @@ fn default_rows() -> u16 {
 
 /// Build the PTY command based on the join payload.
 ///
-/// On Windows with `is_wsl`, spawns `wsl.exe` with the user's shell (from the
-/// `SHELL` env var, falling back to `sh`). Otherwise uses the default program
-/// (the user's native shell).
+/// On Windows with `wsl_distro` set, spawns `wsl.exe -d <distro>` with the
+/// user's shell (from the `SHELL` env var, falling back to `sh`). Otherwise
+/// uses the default program (the user's native shell).
 fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
     #[cfg(target_os = "windows")]
-    if payload.is_wsl {
+    if let Some(distro) = payload.wsl_distro.as_deref() {
         let shell = payload.env.get("SHELL").map(|s| s.as_str()).unwrap_or("sh");
 
         // Build env assignments string: VAR1='value1' VAR2='value2' ...
@@ -86,6 +87,8 @@ fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
         };
 
         let mut cmd = CommandBuilder::new("wsl.exe");
+        cmd.arg("-d");
+        cmd.arg(distro);
         cmd.arg("--cd");
         cmd.arg(&payload.cwd);
         cmd.arg("sh");

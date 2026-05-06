@@ -35,8 +35,7 @@ struct ShellParams {
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,40 +46,35 @@ struct CmdParams {
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StatParams {
     path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ListDirParams {
     path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct MkdirParams {
     path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ReadFileParams {
     path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,16 +84,14 @@ struct WriteFileParams {
     #[serde(default)]
     exclusive: bool,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct DeleteFileParams {
     path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,8 +99,7 @@ struct CopyParams {
     from_path: String,
     to_path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -116,8 +107,7 @@ struct MoveParams {
     from_path: String,
     to_path: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +118,7 @@ struct WhichParams {
     env: Option<HashMap<String, String>>,
     #[serde(default)]
     #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,7 +132,7 @@ struct OpenParams {
 struct AboutParams {
     #[serde(default)]
     #[allow(dead_code)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -611,7 +601,8 @@ async fn shell_handler(
     let cwd = payload.cwd.unwrap_or(".".to_string());
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
-    let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
+    let mut command =
+        create_shell_command(&payload.command, env, &cwd, payload.wsl_distro.as_deref());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -630,7 +621,13 @@ async fn cmd_handler(
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
     let args = payload.args.unwrap_or_default();
 
-    let mut command = create_cmd_command(&payload.command, &args, env, &cwd, payload.is_wsl);
+    let mut command = create_cmd_command(
+        &payload.command,
+        &args,
+        env,
+        &cwd,
+        payload.wsl_distro.as_deref(),
+    );
     command
         .stdin(if payload.input.is_some() {
             Stdio::piped()
@@ -751,7 +748,7 @@ fn create_status_chunk(status: i32) -> Bytes {
 async fn read_file_handler(
     Json(payload): Json<ReadFileParams>,
 ) -> Result<Json<ReadFileResponse>, StatusCode> {
-    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let file_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(ReadFileResponse::ReadFileResponseErr {
@@ -790,7 +787,7 @@ async fn read_file_handler(
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
-    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let file_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(WriteFileResponse::WriteFileResponseErr {
@@ -863,7 +860,7 @@ async fn write_file_handler(
 async fn delete_file_handler(
     Json(payload): Json<DeleteFileParams>,
 ) -> Result<Json<DeleteFileResponse>, StatusCode> {
-    let file_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let file_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
@@ -891,7 +888,7 @@ async fn delete_file_handler(
 }
 
 async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyResponse>, StatusCode> {
-    let from_path = match normalize_path(&payload.from_path, payload.is_wsl).await {
+    let from_path = match normalize_path(&payload.from_path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(CopyResponse::CopyResponseErr {
@@ -901,7 +898,7 @@ async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyRespon
         }
     };
 
-    let to_path = match normalize_path(&payload.to_path, payload.is_wsl).await {
+    let to_path = match normalize_path(&payload.to_path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(CopyResponse::CopyResponseErr {
@@ -929,7 +926,7 @@ async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyRespon
 }
 
 async fn move_handler(Json(payload): Json<MoveParams>) -> Result<Json<MoveResponse>, StatusCode> {
-    let from_path = match normalize_path(&payload.from_path, payload.is_wsl).await {
+    let from_path = match normalize_path(&payload.from_path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(MoveResponse::MoveResponseErr {
@@ -939,7 +936,7 @@ async fn move_handler(Json(payload): Json<MoveParams>) -> Result<Json<MoveRespon
         }
     };
 
-    let to_path = match normalize_path(&payload.to_path, payload.is_wsl).await {
+    let to_path = match normalize_path(&payload.to_path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(MoveResponse::MoveResponseErr {
@@ -1003,7 +1000,7 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
         #[cfg(target_os = "linux")]
         {
             if env::var("WSL_DISTRO_NAME").is_ok() {
-                let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                let win_path = wslpath_to_windows(&payload.path, None).await.map_err(|e| {
                     error!("Open: wslpath failed: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
@@ -1033,7 +1030,7 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
 
         #[cfg(target_os = "linux")]
         if env::var("WSL_DISTRO_NAME").is_ok() {
-            let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+            let win_path = wslpath_to_windows(&payload.path, None).await.map_err(|e| {
                 error!("Open: wslpath failed: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -1060,7 +1057,7 @@ async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, Sta
 }
 
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {
-    let file_path = match normalize_path(&query.path, query.is_wsl).await {
+    let file_path = match normalize_path(&query.path, query.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(StatResponse::StatResponseErr {
@@ -1078,8 +1075,8 @@ async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatRespon
 
     match result {
         Ok((mtime, path_type)) => {
-            let windows_path = if query.is_wsl {
-                wslpath_to_windows(&query.path).await.ok()
+            let windows_path = if let Some(distro) = query.wsl_distro.as_deref() {
+                wslpath_to_windows(&query.path, Some(distro)).await.ok()
             } else {
                 None
             };
@@ -1100,7 +1097,7 @@ async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatRespon
 async fn listdir_handler(
     Query(query): Query<ListDirParams>,
 ) -> Result<Json<ListDirResponse>, StatusCode> {
-    let dir_path = match normalize_path(&query.path, query.is_wsl).await {
+    let dir_path = match normalize_path(&query.path, query.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(ListDirResponse::ListDirResponseErr {
@@ -1131,7 +1128,7 @@ async fn listdir_handler(
 async fn mkdir_handler(
     Json(payload): Json<MkdirParams>,
 ) -> Result<Json<MkdirResponse>, StatusCode> {
-    let dir_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let dir_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
             return Ok(Json(MkdirResponse::MkdirResponseErr {
@@ -1224,29 +1221,27 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     #[cfg(target_os = "windows")]
     {
         // Check if we're in WSL context
-        if let Some(env) = &params.env {
-            if env.get("WSL_DISTRO_NAME").is_some() {
-                // Run which command inside WSL
-                let cwd = params.cwd.as_deref().unwrap_or(".");
-                let env_clone = env.clone();
-                let command_str = format!("which {}", params.command);
+        if let Some(distro) = params.wsl_distro.as_deref() {
+            // Run which command inside WSL
+            let cwd = params.cwd.as_deref().unwrap_or(".");
+            let env_clone = params.env.clone().unwrap_or_default();
+            let command_str = format!("which {}", params.command);
 
-                let mut command = create_shell_command(&command_str, env_clone, cwd, params.is_wsl);
-                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut command = create_shell_command(&command_str, env_clone, cwd, Some(distro));
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-                let output = command
-                    .output()
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let output = command
+                .output()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Ok(Json(WhichResponse { path: Some(path) }));
-                    }
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(Json(WhichResponse { path: Some(path) }));
                 }
-                return Ok(Json(WhichResponse { path: None }));
             }
+            return Ok(Json(WhichResponse { path: None }));
         }
     }
 
@@ -1295,8 +1290,8 @@ async fn about_handler(
 
     #[cfg(target_os = "windows")]
     {
-        if params.is_wsl {
-            let mut command = create_shell_command("uname -m", HashMap::new(), "~", true);
+        if let Some(distro) = params.wsl_distro.as_deref() {
+            let mut command = create_shell_command("uname -m", HashMap::new(), "~", Some(distro));
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
             let output = command

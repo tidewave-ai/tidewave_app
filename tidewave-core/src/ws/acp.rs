@@ -189,7 +189,7 @@ pub struct TidewaveSpawnOptions {
     pub env: HashMap<String, String>,
     pub cwd: String,
     #[serde(default)]
-    pub is_wsl: bool,
+    pub wsl_distro: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1976,7 +1976,7 @@ pub fn real_process_starter() -> ProcessStarterFn {
                 &spawn_opts.command,
                 spawn_opts.env,
                 &spawn_opts.cwd,
-                spawn_opts.is_wsl,
+                spawn_opts.wsl_distro.as_deref(),
             );
 
             cmd.stdin(Stdio::piped())
@@ -2027,7 +2027,7 @@ mod tests {
             command: "test_cmd".to_string(),
             env: HashMap::new(),
             cwd: ".".to_string(),
-            is_wsl: false,
+            wsl_distro: None,
         }
     }
 
