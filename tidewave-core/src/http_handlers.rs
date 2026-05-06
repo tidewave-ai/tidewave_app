@@ -112,7 +112,7 @@ pub struct DownloadParams {
     #[serde(default)]
     pub extract: Option<String>, // Optional path to extract from archive (for .tar.gz/.tgz files)
     #[serde(default)]
-    pub is_wsl: bool, // If true, convert the final path to WSL format using wslpath
+    pub wsl_distro: Option<String>, // If Some, convert the final path to WSL format using wslpath in that distro
 }
 
 #[derive(Serialize, Clone)]
@@ -242,7 +242,7 @@ pub async fn download_handler(
     let throttle = params.throttle;
     let executable = params.executable;
     let extract = params.extract;
-    let is_wsl = params.is_wsl;
+    let wsl_distro = params.wsl_distro;
 
     // Validate key to prevent path traversal attacks
     if key.contains('/') || key.contains('\\') || key.contains(':') || key.contains("..") {
@@ -381,12 +381,14 @@ pub async fn download_handler(
             return;
         }
 
-        let final_path = if is_wsl {
+        let final_path = if let Some(distro) = wsl_distro.as_deref() {
             // Convert Windows path to WSL path using wslpath
             #[cfg(target_os = "windows")]
             {
                 let windows_path = file_path_for_stream.display().to_string();
                 match tokio::process::Command::new("wsl.exe")
+                    .arg("-d")
+                    .arg(distro)
                     .arg("-e")
                     .arg("wslpath")
                     .arg("-a")
@@ -410,6 +412,7 @@ pub async fn download_handler(
             }
             #[cfg(not(target_os = "windows"))]
             {
+                let _ = distro;
                 file_path_for_stream.display().to_string()
             }
         } else {

@@ -52,13 +52,19 @@ fn load_tls_config(
 }
 
 /// Converts a WSL path to a Windows path using wslpath.
-pub async fn wslpath_to_windows(wsl_path: &str) -> Result<String, String> {
+pub async fn wslpath_to_windows(
+    wsl_path: &str,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] wsl_distro: Option<&str>,
+) -> Result<String, String> {
     use std::process::Stdio;
     use tokio::process::Command;
 
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut cmd = Command::new("wsl.exe");
+        if let Some(distro) = wsl_distro {
+            cmd.arg("-d").arg(distro);
+        }
         cmd.arg("-e")
             .arg("wslpath")
             .arg("-w")
@@ -103,10 +109,10 @@ pub fn recordings_dir() -> PathBuf {
 
 /// Normalizes a path, converting WSL paths to Windows paths if needed.
 #[allow(unused_variables)]
-pub async fn normalize_path(path: &str, is_wsl: bool) -> Result<String, String> {
+pub async fn normalize_path(path: &str, wsl_distro: Option<&str>) -> Result<String, String> {
     #[cfg(target_os = "windows")]
-    if is_wsl {
-        return wslpath_to_windows(path).await;
+    if let Some(distro) = wsl_distro {
+        return wslpath_to_windows(path, Some(distro)).await;
     }
 
     Ok(path.to_string())

@@ -97,7 +97,7 @@ impl WatchFeatureState {
 struct JoinPayload {
     path: String,
     #[serde(default)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 /// Initialize a `watch:<ref>` channel.
@@ -119,7 +119,7 @@ pub async fn init(
     };
 
     // Normalize path (handles WSL path conversion on Windows)
-    let normalized_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let normalized_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(p) => p,
         Err(e) => return InitResult::Error(format!("Failed to normalize path: {}", e)),
     };
@@ -164,7 +164,12 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(&state, &active_watch, &canonical_path, payload.is_wsl);
+        init_watcher(
+            &state,
+            &active_watch,
+            &canonical_path,
+            payload.wsl_distro.as_deref(),
+        );
     }
 
     // Send success reply
@@ -210,7 +215,7 @@ fn init_watcher(
     state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
     canonical_path: &str,
-    is_wsl: bool,
+    wsl_distro: Option<&str>,
 ) {
     let tx = active_watch.tx.clone();
     let canonical_path = canonical_path.to_string();
@@ -219,10 +224,10 @@ fn init_watcher(
     // On Windows with WSL, use poll watcher directly since native watcher
     // doesn't work well with WSL paths
     #[cfg(target_os = "windows")]
-    let use_poll_watcher = is_wsl;
+    let use_poll_watcher = wsl_distro.is_some();
     #[cfg(not(target_os = "windows"))]
     let use_poll_watcher = {
-        let _ = is_wsl;
+        let _ = wsl_distro;
         false
     };
 

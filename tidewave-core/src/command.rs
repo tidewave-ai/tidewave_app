@@ -132,11 +132,11 @@ pub fn create_shell_command(
     cmd: &str,
     env: HashMap<String, String>,
     cwd: &str,
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] is_wsl: bool,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] wsl_distro: Option<&str>,
 ) -> Command {
     #[cfg(target_os = "windows")]
     {
-        if is_wsl {
+        if let Some(distro) = wsl_distro {
             let env_prefix = wsl_env_assignments(&env);
             let full_command = if env_prefix.is_empty() {
                 cmd.to_string()
@@ -146,6 +146,8 @@ pub fn create_shell_command(
 
             let mut command = command_with_limited_env("wsl.exe");
             command
+                .arg("-d")
+                .arg(distro)
                 .arg("--cd")
                 .arg(cwd)
                 .arg("sh")
@@ -199,14 +201,14 @@ pub fn create_cmd_command(
     args: &[String],
     env: HashMap<String, String>,
     cwd: &str,
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] is_wsl: bool,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] wsl_distro: Option<&str>,
 ) -> Command {
     #[cfg(target_os = "windows")]
     {
-        if is_wsl {
+        if let Some(distro) = wsl_distro {
             let env_assignments = wsl_env_assignments(&env);
             let mut command = command_with_limited_env("wsl.exe");
-            command.arg("--cd").arg(cwd);
+            command.arg("-d").arg(distro).arg("--cd").arg(cwd);
             if !env_assignments.is_empty() {
                 command.arg("env");
                 for assignment in &env_assignments {
