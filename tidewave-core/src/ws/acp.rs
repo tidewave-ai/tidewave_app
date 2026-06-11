@@ -333,15 +333,6 @@ pub struct ProcessState {
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
     pub connect_epoch: AtomicU64,
-    /// Whether the agent supports resuming sessions (loadSession, session.fork,
-    /// or session.resume in agentCapabilities). Set from init response.
-    /// When true, the process can be stopped on inactivity since sessions
-    /// can be restored after a restart.
-    pub supports_resuming: RwLock<Option<bool>>,
-    /// Whether the agent supports session/close (session.close in agentCapabilities).
-    /// When true, on disconnect we send session/close instead of session/cancel,
-    /// and remove the session state entirely.
-    pub supports_session_close: RwLock<Option<bool>>,
 }
 
 pub struct SessionState {
@@ -370,17 +361,45 @@ pub struct InitState {
     notify: Notify,
 }
 
+#[derive(Debug, Clone)]
+pub struct InitComplete {
+    pub response: JsonRpcResponse,
+    pub capabilities: AgentCapabilities,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentCapabilities {
+    /// Whether the agent supports resuming sessions (loadSession, session.fork,
+    /// or session.resume in agentCapabilities).
+    /// When true, the process can be stopped on inactivity since sessions
+    /// can be restored after a restart.
+    pub supports_resuming: bool,
+    /// Whether the agent supports session/close (session.close in agentCapabilities).
+    /// When true, on disconnect we send session/close instead of session/cancel,
+    /// and remove the session state entirely.
+    pub supports_session_close: bool,
+}
+
+impl AgentCapabilities {
+    pub fn from_response(response: &JsonRpcResponse) -> Self {
+        Self {
+            supports_resuming: check_supports_resuming(response),
+            supports_session_close: check_supports_session_close(response),
+        }
+    }
+}
+
 enum InitStateInner {
     NotStarted,
     InFlight { request_id: Value },
-    Complete { response: JsonRpcResponse },
+    Complete { init: InitComplete },
     Failed,
 }
 
 pub enum BeginInit {
     Start,
     Wait,
-    Complete(JsonRpcResponse),
+    Complete(InitComplete),
     Failed,
 }
 
@@ -417,8 +436,6 @@ impl ProcessState {
             stdout_buffer: RwLock::new(Vec::new()),
             stderr_buffer: RwLock::new(Vec::new()),
             connect_epoch: AtomicU64::new(0),
-            supports_resuming: RwLock::new(None),
-            supports_session_close: RwLock::new(None),
         }
     }
 
@@ -641,18 +658,18 @@ impl InitState {
                 BeginInit::Start
             }
             InitStateInner::InFlight { .. } => BeginInit::Wait,
-            InitStateInner::Complete { response } => BeginInit::Complete(response.clone()),
+            InitStateInner::Complete { init } => BeginInit::Complete(init.clone()),
             InitStateInner::Failed => BeginInit::Failed,
         }
     }
 
-    pub async fn wait_for_completion(&self) -> Option<JsonRpcResponse> {
+    pub async fn wait_for_completion(&self) -> Option<InitComplete> {
         loop {
             let notified = {
                 let inner = self.inner.lock().await;
 
                 match &*inner {
-                    InitStateInner::Complete { response } => return Some(response.clone()),
+                    InitStateInner::Complete { init } => return Some(init.clone()),
                     InitStateInner::Failed => return None,
                     InitStateInner::NotStarted | InitStateInner::InFlight { .. } => {
                         self.notify.notified()
@@ -664,7 +681,12 @@ impl InitState {
         }
     }
 
-    pub async fn complete_if_current(&self, request_id: &Value, response: JsonRpcResponse) -> bool {
+    pub async fn complete_if_current(
+        &self,
+        request_id: &Value,
+        response: JsonRpcResponse,
+        capabilities: AgentCapabilities,
+    ) -> bool {
         let mut inner = self.inner.lock().await;
 
         let InitStateInner::InFlight {
@@ -678,7 +700,12 @@ impl InitState {
             return false;
         }
 
-        *inner = InitStateInner::Complete { response };
+        *inner = InitStateInner::Complete {
+            init: InitComplete {
+                response,
+                capabilities,
+            },
+        };
         drop(inner);
         self.notify.notify_waiters();
         true
@@ -696,10 +723,7 @@ impl InitState {
     }
 
     pub async fn is_in_flight(&self) -> bool {
-        matches!(
-            *self.inner.lock().await,
-            InitStateInner::InFlight { .. }
-        )
+        matches!(*self.inner.lock().await, InitStateInner::InFlight { .. })
     }
 
     pub async fn fail(&self) {
@@ -711,6 +735,17 @@ impl InitState {
 
     pub async fn is_complete(&self) -> bool {
         matches!(*self.inner.lock().await, InitStateInner::Complete { .. })
+    }
+
+    pub async fn capabilities(&self) -> Option<AgentCapabilities> {
+        let inner = self.inner.lock().await;
+
+        match &*inner {
+            InitStateInner::Complete { init } => Some(init.capabilities),
+            InitStateInner::NotStarted
+            | InitStateInner::InFlight { .. }
+            | InitStateInner::Failed => None,
+        }
     }
 }
 
@@ -1005,8 +1040,11 @@ pub async fn init(
                 let process_key = process_key.clone();
 
                 tokio::spawn(async move {
-                    if process_state.init_state.wait_for_completion().await.is_some()
-                        && *process_state.supports_resuming.read().await == Some(true)
+                    if process_state
+                        .init_state
+                        .wait_for_completion()
+                        .await
+                        .is_some_and(|init| init.capabilities.supports_resuming)
                     {
                         spawn_process_stop_after_inactivity(
                             state_clone,
@@ -1016,7 +1054,12 @@ pub async fn init(
                         );
                     }
                 });
-            } else if *process_state.supports_resuming.read().await == Some(true) {
+            } else if process_state
+                .init_state
+                .capabilities()
+                .await
+                .is_some_and(|capabilities| capabilities.supports_resuming)
+            {
                 spawn_process_stop_after_inactivity(
                     state.clone(),
                     process_state.clone(),
@@ -1068,10 +1111,10 @@ async fn stop_unmapped_session_if_still_disconnected(
 
     // Check if agent supports session/close
     let supports_stop = process_state
-        .supports_session_close
-        .read()
+        .init_state
+        .capabilities()
         .await
-        .unwrap_or(false);
+        .is_some_and(|capabilities| capabilities.supports_session_close);
 
     if supports_stop {
         // Send session/close as a request (no proxy ID mapping — the
@@ -1149,7 +1192,12 @@ fn spawn_process_stop_after_inactivity(
             return;
         }
 
-        if *process_state.supports_resuming.read().await != Some(true) {
+        if !process_state
+            .init_state
+            .capabilities()
+            .await
+            .is_some_and(|capabilities| capabilities.supports_resuming)
+        {
             debug!(
                 "Skipping process stop for {} (agent does not support resuming)",
                 process_key
@@ -1241,8 +1289,8 @@ async fn handle_initialize_request(
     let proxy_id = process_state.generate_proxy_id();
 
     match process_state.init_state.begin(proxy_id.clone()).await {
-        BeginInit::Complete(cached_response) => {
-            let mut response = cached_response;
+        BeginInit::Complete(cached_init) => {
+            let mut response = cached_init.response;
             response.id = request.id.clone();
             send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
         }
@@ -1287,8 +1335,8 @@ async fn handle_initialize_request(
         }
         BeginInit::Wait => {
             // Another client already sent the init request — wait for the response
-            if let Some(cached_response) = process_state.init_state.wait_for_completion().await {
-                let mut response = cached_response;
+            if let Some(cached_init) = process_state.init_state.wait_for_completion().await {
+                let mut response = cached_init.response;
                 response.id = request.id.clone();
                 send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
             } else {
@@ -1948,14 +1996,13 @@ async fn maybe_handle_init_response(
         .is_current_request(&response.id)
         .await
     {
-        // Parse agent capabilities
-        *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
-        *process_state.supports_session_close.write().await =
-            Some(check_supports_session_close(response));
-
         if process_state
             .init_state
-            .complete_if_current(&response.id, client_response.clone())
+            .complete_if_current(
+                &response.id,
+                client_response.clone(),
+                AgentCapabilities::from_response(response),
+            )
             .await
         {
             // Clear buffers
@@ -2010,13 +2057,8 @@ async fn maybe_handle_pending_request(
                     );
                 }
             } else {
-                confirm_claimed_session_response(
-                    process_state,
-                    state,
-                    session_id,
-                    channel_id,
-                )
-                .await;
+                confirm_claimed_session_response(process_state, state, session_id, channel_id)
+                    .await;
             }
         }
         PendingRequest::SessionClose { .. } => {}
@@ -2115,34 +2157,45 @@ async fn handle_disconnected_client_response(
     );
     // Fallback: Client disconnected, try to find session and forward to new channel
     if let Some(session_id) = session_id {
-        let current_channel_id = process_state.session_channel(&session_id).await;
+        if push_response_to_session_channel(process_state, state, &client_response, &session_id)
+            .await
+        {
+            return;
+        }
 
-        if let Some(current_channel_id) = current_channel_id {
-            if let Some(sender) = state.channel_senders.get(&current_channel_id) {
-                push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
-            }
-        } else {
-            // Client disconnected, buffer response
-            let session_state = process_state.session_state(&session_id).await;
+        if let Some(session_state) = process_state.session_state(&session_id).await {
+            let _ = session_state
+                .add_to_buffer(
+                    JsonRpcMessage::Response(client_response.clone()),
+                    client_response.id.to_string(),
+                )
+                .await;
 
-            if let Some(session_state) = session_state {
-                let _ = session_state
-                    .add_to_buffer(
-                        JsonRpcMessage::Response(client_response.clone()),
-                        client_response.id.to_string(),
-                    )
-                    .await;
-
-                let current_channel_id = process_state.session_channel(&session_id).await;
-
-                if let Some(current_channel_id) = current_channel_id {
-                    if let Some(sender) = state.channel_senders.get(&current_channel_id) {
-                        push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
-                    }
-                }
+            if push_response_to_session_channel(process_state, state, &client_response, &session_id)
+                .await
+            {
+                return;
             }
         }
     }
+}
+
+async fn push_response_to_session_channel(
+    process_state: &Arc<ProcessState>,
+    state: &AcpChannelState,
+    client_response: &JsonRpcResponse,
+    session_id: &str,
+) -> bool {
+    let Some(current_channel_id) = process_state.session_channel(session_id).await else {
+        return false;
+    };
+
+    let Some(sender) = state.channel_senders.get(&current_channel_id) else {
+        return false;
+    };
+
+    push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response.clone()));
+    true
 }
 
 async fn handle_process_notification_or_request(
@@ -2681,7 +2734,11 @@ mod tests {
         ));
         assert!(
             init_state
-                .complete_if_current(&request_id, response.clone())
+                .complete_if_current(
+                    &request_id,
+                    response.clone(),
+                    AgentCapabilities::from_response(&response)
+                )
                 .await
         );
 
@@ -2693,8 +2750,10 @@ mod tests {
         .expect("wait should not miss an already completed init")
         .expect("init should be complete");
 
-        assert_eq!(cached.id, response.id);
-        assert_eq!(cached.result, response.result);
+        assert_eq!(cached.response.id, response.id);
+        assert_eq!(cached.response.result, response.result);
+        assert!(!cached.capabilities.supports_resuming);
+        assert!(!cached.capabilities.supports_session_close);
     }
 
     #[tokio::test]
@@ -2853,6 +2912,49 @@ mod tests {
         let payload = sent.payload.as_json();
         assert_eq!(payload["id"], client_id);
         assert_eq!(payload["result"]["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_response_buffered_if_mapped_channel_has_no_sender() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_disconnecting".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        let disconnected_channel_id = Uuid::new_v4();
+        process
+            .insert_session(
+                session_id.clone(),
+                session.clone(),
+                Some(disconnected_channel_id),
+            )
+            .await;
+
+        let client_id = Value::String("session/prompt!sess_disconnecting!!prompt_1".to_string());
+        let proxy_id = process.map_client_id_to_proxy(
+            disconnected_channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            None,
+        );
+
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id,
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+        };
+
+        handle_process_response(&process, &state, &response)
+            .await
+            .expect("response should be handled");
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 1);
+        let JsonRpcMessage::Response(buffered_response) = &buffer[0].message else {
+            panic!("expected buffered response");
+        };
+        assert_eq!(buffered_response.id, client_id);
+        assert_eq!(buffered_response.result, response.result);
     }
 
     #[tokio::test]
