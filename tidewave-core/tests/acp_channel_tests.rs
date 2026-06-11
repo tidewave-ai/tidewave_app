@@ -629,6 +629,97 @@ async fn test_session_resume_rejects_active_session() {
 }
 
 #[tokio::test]
+async fn test_session_resume_rejects_in_flight_resume_for_inactive_session() {
+    let (starter, _test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_inactive".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume1 = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume1)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let first_resume = read_json_line(&mut test_stdout).await;
+    assert_eq!(first_resume["method"], "session/resume");
+
+    let resume2 = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_2",
+        "method": "session/resume",
+        "params": {
+            "sessionId": "sess_inactive"
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", resume2)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected second session/resume to be rejected");
+    let response = msg.payload.as_json();
+    assert_eq!(response["id"], "resume_2");
+    assert_eq!(response["error"]["code"], -32003);
+    assert_eq!(
+        response["error"]["message"],
+        "Session already has an active connection"
+    );
+}
+
+#[tokio::test]
 async fn test_same_session_id_routes_within_each_process() {
     let (starter, mut processes_rx) = create_multi_process_starter();
     let state = AcpChannelState::with_process_starter(starter);

@@ -1023,6 +1023,10 @@ async fn handle_client_request(
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
         "session/load" => handle_acp_session_load(state, channel_id, request, process_key).await,
+        // ACP session resume also needs to atomically claim the session before forwarding.
+        "session/resume" => {
+            handle_acp_session_resume(state, channel_id, request, process_key).await
+        }
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, channel_id, request, process_key).await,
     }
@@ -1196,10 +1200,31 @@ async fn handle_acp_session_load(
     request: &JsonRpcRequest,
     process_key: &ProcessKey,
 ) -> Result<()> {
+    handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
+}
+
+async fn handle_acp_session_resume(
+    state: &AcpChannelState,
+    channel_id: ChannelId,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+) -> Result<()> {
+    handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
+}
+
+async fn handle_acp_session_load_or_resume(
+    state: &AcpChannelState,
+    channel_id: ChannelId,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+) -> Result<()> {
     let session_id = extract_session_id_from_request(request);
 
     if let Some(session_id) = session_id {
         let process_state = ensure_process(state, process_key)?;
+        let lock = process_state.session_lifecycle_lock(&session_id).await;
+        let _guard = lock.lock().await;
+
         match process_state
             .claim_or_insert_session_channel(session_id.clone(), channel_id, process_key)
             .await
@@ -1232,12 +1257,15 @@ async fn handle_acp_session_load(
         }
 
         // Claim this channel for the session BEFORE forwarding the request
-        // This ensures that when the agent sends notifications during session/load,
+        // This ensures that when the agent sends notifications during load/resume,
         // we can route them to the correct websocket
         info!(
-            "Mapped channel {} to session {} for session/load",
-            channel_id, session_id
+            "Mapped channel {} to session {} for {}",
+            channel_id, session_id, request.method
         );
+
+        handle_regular_request(state, channel_id, request, process_key).await?;
+        return Ok(());
     }
 
     // Forward the request to the agent as a regular request
@@ -1283,15 +1311,6 @@ async fn handle_regular_request(
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
-    if request.method == "session/resume" {
-        if let Some(session_id) = &session_id {
-            if !ensure_session_not_active(&process_state, state, channel_id, request, session_id)
-                .await
-            {
-                return Ok(());
-            }
-        }
-    }
 
     let proxy_id =
         process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id.clone());
