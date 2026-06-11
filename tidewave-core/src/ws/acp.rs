@@ -1189,6 +1189,14 @@ async fn handle_regular_request(
 
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
+    if request.method == "session/resume" {
+        if let Some(session_id) = &session_id {
+            if !ensure_session_not_active(state, channel_id, request, session_id) {
+                return Ok(());
+            }
+        }
+    }
+
     let proxy_id =
         process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id.clone());
     let mut proxy_request = request.clone();
