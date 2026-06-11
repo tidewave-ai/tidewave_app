@@ -834,6 +834,134 @@ async fn test_late_resume_response_routes_to_reconnected_session() {
 }
 
 #[tokio::test]
+async fn test_late_successful_resume_response_does_not_claim_disconnected_channel() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_late_successful_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    drop(in_tx1);
+    assert!(
+        wait_for_session_channel(&process_state, &session_id, None).await,
+        "Expected disconnect cleanup to unmap the session before agent response"
+    );
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "result": {
+                "sessionId": "sess_late_successful_resume"
+            }
+        }),
+    )
+    .await;
+
+    assert!(
+        wait_for_inactive_session(&process_state, &session_id).await,
+        "Late session/resume success should not re-own the disconnected channel"
+    );
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let load = json!({
+        "jsonrpc": "2.0",
+        "id": "load_1",
+        "method": "_tidewave.ai/session/load",
+        "params": {
+            "sessionId": "sess_late_successful_resume",
+            "latestId": ""
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", load)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let mut saw_resume_response = false;
+    let mut saw_load_response = false;
+
+    for _ in 0..2 {
+        let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+            .await
+            .expect("Expected buffered resume and Tidewave session/load responses");
+        let response = msg.payload.as_json();
+
+        if response["id"] == "resume_1" {
+            saw_resume_response = true;
+            assert_eq!(response["result"]["sessionId"], "sess_late_successful_resume");
+        }
+
+        if response["id"] == "load_1" {
+            saw_load_response = true;
+            assert_eq!(response["result"]["cancelled"], false);
+        }
+    }
+
+    assert!(saw_resume_response, "Expected buffered session/resume response");
+    assert!(saw_load_response, "Expected Tidewave session/load response");
+}
+
+#[tokio::test]
 async fn test_late_failed_resume_response_does_not_remove_reconnected_session() {
     let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
     let state = AcpChannelState::with_process_starter(starter);

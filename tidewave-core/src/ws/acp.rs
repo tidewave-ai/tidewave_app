@@ -1972,7 +1972,13 @@ async fn maybe_handle_pending_request(
                     );
                 }
             } else {
-                map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
+                confirm_claimed_session_response(
+                    process_state,
+                    state,
+                    session_id,
+                    channel_id,
+                )
+                .await;
             }
         }
         PendingRequest::SessionClose { .. } => {}
@@ -2022,31 +2028,37 @@ async fn create_session_from_agent_response(
     }
 }
 
-async fn map_session_id_to_channel(
+async fn confirm_claimed_session_response(
+    process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     session_id: SessionId,
     channel_id: ChannelId,
-    process_key: &ProcessKey,
 ) {
-    let Ok(process_state) = ensure_process(state, process_key) else {
-        warn!(
-            "Cannot map session {} without process {}",
-            session_id, process_key
+    if !state.channel_senders.contains_key(&channel_id)
+        && process_state
+            .unmap_session_if_owned_by(&session_id, channel_id)
+            .await
+    {
+        debug!(
+            "Confirmed session {} from late load/resume response without active channel",
+            session_id
         );
         return;
-    };
+    }
 
-    let inserted = process_state
-        .insert_session(
-            session_id.clone(),
-            Arc::new(SessionState::new(process_key.clone())),
-            Some(channel_id),
-        )
-        .await;
+    let current_channel = process_state.session_channel(&session_id).await;
 
-    if !inserted && process_state.session_channel(&session_id).await != Some(channel_id) {
+    if current_channel.is_none() {
         warn!(
-            "Unexpectedly got load/resume session response for already known session! {}",
+            "Successful load/resume response for session {} but no channel owns it",
+            session_id
+        );
+        return;
+    }
+
+    if current_channel != Some(channel_id) {
+        warn!(
+            "Successful load/resume response for session {} is now owned by another channel",
             session_id
         );
     }
