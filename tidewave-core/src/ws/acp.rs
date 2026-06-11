@@ -695,6 +695,13 @@ impl InitState {
         )
     }
 
+    pub async fn is_in_flight(&self) -> bool {
+        matches!(
+            *self.inner.lock().await,
+            InitStateInner::InFlight { .. }
+        )
+    }
+
     pub async fn fail(&self) {
         let mut inner = self.inner.lock().await;
         *inner = InitStateInner::Failed;
@@ -987,57 +994,36 @@ pub async fn init(
     });
 
     // If this was the last connected client, spawn a 1-minute inactivity timer
-    // that stops the process (if the agent supports resuming sessions).
+    // that stops the process if the agent supports resuming sessions.
     if let Some(process_state) = state.processes.get(&process_key) {
-        // Check if the agent supports resuming sessions
-        let supports_resuming = process_state
-            .supports_resuming
-            .read()
-            .await
-            .unwrap_or(false);
-
-        if process_state.exit_broadcast.receiver_count() == 0 && supports_resuming {
+        if process_state.exit_broadcast.receiver_count() == 0 {
             let epoch = process_state.connect_epoch.load(Ordering::SeqCst);
-            let process_state = process_state.clone();
-            let process_key = process_key.clone();
-            let state_clone = state.clone();
 
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            if process_state.init_state.is_in_flight().await {
+                let state_clone = state.clone();
+                let process_state = process_state.clone();
+                let process_key = process_key.clone();
 
-                // Acquire the lifecycle lock so we don't race with a new
-                // client that is between process lookup and exit_broadcast
-                // subscribe (where it bumps connect_epoch).
-                let lock = state_clone
-                    .process_lifecycle_locks
-                    .entry(process_key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone();
-                let _guard = lock.lock().await;
-
-                // Re-check epoch now that we hold the lock – a client that
-                // connected while we were waiting will have bumped it.
-                if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
-                    debug!(
-                        "Skipping process stop for {} (client reconnected)",
-                        process_key
-                    );
-                    return;
-                }
-
-                info!(
-                    "Stopping process {} after 1 minute of inactivity",
-                    process_key
+                tokio::spawn(async move {
+                    if process_state.init_state.wait_for_completion().await.is_some()
+                        && *process_state.supports_resuming.read().await == Some(true)
+                    {
+                        spawn_process_stop_after_inactivity(
+                            state_clone,
+                            process_state,
+                            process_key,
+                            epoch,
+                        );
+                    }
+                });
+            } else if *process_state.supports_resuming.read().await == Some(true) {
+                spawn_process_stop_after_inactivity(
+                    state.clone(),
+                    process_state.clone(),
+                    process_key.clone(),
+                    epoch,
                 );
-
-                // Remove from state first so new clients start a fresh process
-                // instead of connecting to one that's about to be killed.
-                state_clone.processes.remove(&process_key);
-
-                if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
-                    let _ = exit_tx.send(());
-                }
-            });
+            }
         }
     }
 
@@ -1132,6 +1118,58 @@ async fn stop_unmapped_session_if_still_disconnected(
             debug!("Sent session/cancel for unmapped session: {}", session_id);
         }
     }
+}
+
+fn spawn_process_stop_after_inactivity(
+    state: AcpChannelState,
+    process_state: Arc<ProcessState>,
+    process_key: ProcessKey,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+        // Acquire the lifecycle lock so we don't race with a new
+        // client that is between process lookup and exit_broadcast
+        // subscribe (where it bumps connect_epoch).
+        let lock = state
+            .process_lifecycle_locks
+            .entry(process_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        // Re-check epoch now that we hold the lock – a client that
+        // connected while we were waiting will have bumped it.
+        if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
+            debug!(
+                "Skipping process stop for {} (client reconnected)",
+                process_key
+            );
+            return;
+        }
+
+        if *process_state.supports_resuming.read().await != Some(true) {
+            debug!(
+                "Skipping process stop for {} (agent does not support resuming)",
+                process_key
+            );
+            return;
+        }
+
+        info!(
+            "Stopping process {} after 1 minute of inactivity",
+            process_key
+        );
+
+        // Remove from state first so new clients start a fresh process
+        // instead of connecting to one that's about to be killed.
+        state.processes.remove(&process_key);
+
+        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+            let _ = exit_tx.send(());
+        }
+    });
 }
 
 // ============================================================================
