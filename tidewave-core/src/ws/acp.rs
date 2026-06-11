@@ -114,7 +114,7 @@ any requests to the new connection.
 use crate::command::{create_shell_command, spawn_command, ChildProcess};
 use crate::phoenix::{InitResult, PhxMessage};
 use anyhow::{anyhow, Result};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -281,17 +281,10 @@ pub struct AcpChannelState {
     pub processes: Arc<DashMap<ProcessKey, Arc<ProcessState>>>,
     /// Channel senders (channel_id -> sender)
     pub channel_senders: Arc<DashMap<ChannelId, ChannelSender>>,
-    /// Sessions (session_id -> session_state)
-    pub sessions: Arc<DashMap<SessionId, Arc<SessionState>>>,
-    /// Session to Channel mapping (session_id -> channel_id)
-    /// Used when we need to forward an ACP message to the correct channel.
-    pub session_to_channel: Arc<DashMap<SessionId, ChannelId>>,
     /// Process starter function for creating new ACP processes
     pub process_starter: ProcessStarterFn,
     /// Locks to prevent multiple concurrent process starts for the same process_key
     pub process_lifecycle_locks: Arc<DashMap<ProcessKey, Arc<Mutex<()>>>>,
-    /// Locks to prevent races between session/close and session reconnect
-    pub session_lifecycle_locks: Arc<DashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
 impl AcpChannelState {
@@ -303,11 +296,8 @@ impl AcpChannelState {
         Self {
             processes: Arc::new(DashMap::new()),
             channel_senders: Arc::new(DashMap::new()),
-            sessions: Arc::new(DashMap::new()),
-            session_to_channel: Arc::new(DashMap::new()),
             process_starter,
             process_lifecycle_locks: Arc::new(DashMap::new()),
-            session_lifecycle_locks: Arc::new(DashMap::new()),
         }
     }
 }
@@ -315,65 +305,119 @@ impl AcpChannelState {
 pub struct ProcessState {
     pub key: ProcessKey,
     pub spawn_opts: TidewaveSpawnOptions,
-    pub child: Arc<RwLock<Option<ChildProcess>>>,
+    pub child: RwLock<Option<ChildProcess>>,
     /// Channel used to forward a message to the ACP process.
-    pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    pub stdin_tx: RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>,
     /// Channel used to signal the exit monitor to kill the process.
-    pub exit_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
+    pub exit_tx: RwLock<Option<mpsc::UnboundedSender<()>>>,
     /// Broadcast channel used to notify all subscribed init loops about process exit.
     pub exit_broadcast: broadcast::Sender<AgentExitEvent>,
-    pub next_proxy_id: Arc<AtomicU64>,
 
-    // ID mapping for multiplexed connections
-    pub client_to_proxy_ids: Arc<DashMap<(ChannelId, Value), Value>>,
-    pub proxy_to_client_ids: Arc<DashMap<Value, (ChannelId, Value)>>,
-    /// In case the client disconnected, the original client for a request ID
-    /// does not exist any more, so we also store the a mapping to the session ID.
-    pub proxy_to_session_ids: Arc<DashMap<Value, (SessionId, Value)>>,
+    // In-flight requests keyed by proxy ID for multiplexed connections.
+    pub next_proxy_id: AtomicU64,
+    pub inflight_requests: DashMap<Value, InflightRequest>,
 
-    /// The cached init response we resend when a client reconnects.
-    pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
-    /// Whether an init request has already been sent to the process.
-    pub init_sent: AtomicBool,
-    /// Notified when the init response is cached, so waiters can grab it.
-    pub init_complete: Arc<Notify>,
+    /// Sessions owned by this ACP process.
+    pub sessions: RwLock<HashMap<SessionId, SessionEntry>>,
+    /// Locks to prevent races between session/close and session reconnect.
+    pub session_lifecycle_locks: RwLock<HashMap<SessionId, Arc<Mutex<()>>>>,
+
+    /// Initialization state shared by all clients connected to this ACP process.
+    pub init_state: InitState,
 
     /// Buffers for stdout/stderr output before init completes.
     /// Used to provide detailed error messages when process exits before init.
-    pub stdout_buffer: Arc<RwLock<Vec<String>>>,
-    pub stderr_buffer: Arc<RwLock<Vec<String>>>,
-
-    // We store the request ID of init, session/new and session/load
-    // because we need to handle their responses in a special way.
-    pub init_request_id: Arc<RwLock<Option<Value>>>,
-    pub new_request_ids: Arc<DashSet<Value>>,
-    pub load_request_ids: Arc<DashMap<Value, SessionId>>,
-    pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
-    pub fork_request_ids: Arc<DashSet<Value>>,
-    /// Client-initiated session/close requests (proxy_id -> session_id).
-    /// Session is removed when the response arrives.
-    pub close_request_ids: Arc<DashMap<Value, SessionId>>,
+    pub stdout_buffer: RwLock<Vec<String>>,
+    pub stderr_buffer: RwLock<Vec<String>>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
-    pub connect_epoch: Arc<AtomicU64>,
-    /// Whether the agent supports resuming sessions (loadSession, session.fork,
-    /// or session.resume in agentCapabilities). Set from init response.
-    /// When true, the process can be stopped on inactivity since sessions
-    /// can be restored after a restart.
-    pub supports_resuming: Arc<RwLock<Option<bool>>>,
-    /// Whether the agent supports session/close (session.close in agentCapabilities).
-    /// When true, on disconnect we send session/close instead of session/cancel,
-    /// and remove the session state entirely.
-    pub supports_session_close: Arc<RwLock<Option<bool>>>,
+    pub connect_epoch: AtomicU64,
 }
 
 pub struct SessionState {
     pub process_key: ProcessKey,
-    pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
-    pub notification_id_counter: Arc<AtomicU64>,
-    pub cancelled: Arc<AtomicBool>,
-    pub cancel_counter: Arc<AtomicU64>,
+    pub message_buffer: RwLock<Vec<BufferedMessage>>,
+    pub notification_id_counter: AtomicU64,
+    pub cancelled: AtomicBool,
+    pub cancel_counter: AtomicU64,
+}
+
+pub struct SessionEntry {
+    pub state: Arc<SessionState>,
+    pub channel_id: Option<ChannelId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InflightRequest {
+    pub channel_id: ChannelId,
+    pub client_id: Value,
+    pub session_id: Option<SessionId>,
+    pub pending: Option<PendingRequest>,
+}
+
+pub struct InitState {
+    inner: Mutex<InitStateInner>,
+    notify: Notify,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitComplete {
+    pub response: JsonRpcResponse,
+    pub capabilities: AgentCapabilities,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentCapabilities {
+    /// Whether the agent supports resuming sessions (loadSession, session.fork,
+    /// or session.resume in agentCapabilities).
+    /// When true, the process can be stopped on inactivity since sessions
+    /// can be restored after a restart.
+    pub supports_resuming: bool,
+    /// Whether the agent supports session/close (session.close in agentCapabilities).
+    /// When true, on disconnect we send session/close instead of session/cancel,
+    /// and remove the session state entirely.
+    pub supports_session_close: bool,
+}
+
+impl AgentCapabilities {
+    pub fn from_response(response: &JsonRpcResponse) -> Self {
+        Self {
+            supports_resuming: check_supports_resuming(response),
+            supports_session_close: check_supports_session_close(response),
+        }
+    }
+}
+
+enum InitStateInner {
+    NotStarted,
+    InFlight { request_id: Value },
+    Complete { init: InitComplete },
+    Failed,
+}
+
+pub enum BeginInit {
+    Start,
+    Wait,
+    Complete(InitComplete),
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingRequest {
+    SessionNew,
+    SessionLoad {
+        session_id: SessionId,
+        created_session: bool,
+    },
+    SessionResume {
+        session_id: SessionId,
+        created_session: bool,
+    },
+    SessionFork,
+    SessionClose {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,28 +432,18 @@ impl ProcessState {
         Self {
             key,
             spawn_opts,
-            child: Arc::new(RwLock::new(None)),
-            stdin_tx: Arc::new(RwLock::new(None)),
-            exit_tx: Arc::new(RwLock::new(None)),
+            child: RwLock::new(None),
+            stdin_tx: RwLock::new(None),
+            exit_tx: RwLock::new(None),
             exit_broadcast,
-            next_proxy_id: Arc::new(AtomicU64::new(1)),
-            client_to_proxy_ids: Arc::new(DashMap::new()),
-            proxy_to_client_ids: Arc::new(DashMap::new()),
-            proxy_to_session_ids: Arc::new(DashMap::new()),
-            cached_init_response: Arc::new(RwLock::new(None)),
-            init_sent: AtomicBool::new(false),
-            init_complete: Arc::new(Notify::new()),
-            stdout_buffer: Arc::new(RwLock::new(Vec::new())),
-            stderr_buffer: Arc::new(RwLock::new(Vec::new())),
-            init_request_id: Arc::new(RwLock::new(None)),
-            new_request_ids: Arc::new(DashSet::<Value>::new()),
-            load_request_ids: Arc::new(DashMap::new()),
-            resume_request_ids: Arc::new(DashMap::new()),
-            fork_request_ids: Arc::new(DashSet::<Value>::new()),
-            close_request_ids: Arc::new(DashMap::new()),
-            connect_epoch: Arc::new(AtomicU64::new(0)),
-            supports_resuming: Arc::new(RwLock::new(None)),
-            supports_session_close: Arc::new(RwLock::new(None)),
+            next_proxy_id: AtomicU64::new(1),
+            inflight_requests: DashMap::new(),
+            sessions: RwLock::new(HashMap::new()),
+            session_lifecycle_locks: RwLock::new(HashMap::new()),
+            init_state: InitState::new(),
+            stdout_buffer: RwLock::new(Vec::new()),
+            stderr_buffer: RwLock::new(Vec::new()),
+            connect_epoch: AtomicU64::new(0),
         }
     }
 
@@ -434,32 +468,307 @@ impl ProcessState {
         channel_id: ChannelId,
         client_id: Value,
         session_id: Option<SessionId>,
+        pending: Option<PendingRequest>,
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
-        self.client_to_proxy_ids
-            .insert((channel_id, client_id.clone()), proxy_id.clone());
-        self.proxy_to_client_ids
-            .insert(proxy_id.clone(), (channel_id, client_id.clone()));
-
-        // If this request has a session_id, also store the session mapping
-        if let Some(session_id) = session_id {
-            self.proxy_to_session_ids
-                .insert(proxy_id.clone(), (session_id, client_id));
-        }
+        self.register_inflight_request(
+            proxy_id.clone(),
+            channel_id,
+            client_id,
+            session_id,
+            pending,
+        );
         proxy_id
     }
 
-    pub fn resolve_proxy_id_to_client(&self, proxy_id: &Value) -> Option<(ChannelId, Value)> {
-        self.proxy_to_client_ids
+    pub fn register_inflight_request(
+        &self,
+        proxy_id: Value,
+        channel_id: ChannelId,
+        client_id: Value,
+        session_id: Option<SessionId>,
+        pending: Option<PendingRequest>,
+    ) {
+        self.inflight_requests.insert(
+            proxy_id,
+            InflightRequest {
+                channel_id,
+                client_id,
+                session_id,
+                pending,
+            },
+        );
+    }
+
+    pub fn inflight_request(&self, proxy_id: &Value) -> Option<InflightRequest> {
+        self.inflight_requests
             .get(proxy_id)
             .map(|entry| entry.value().clone())
     }
 
-    pub fn cleanup_id_mappings(&self, proxy_id: &Value) {
-        if let Some((_, (channel_id, client_id))) = self.proxy_to_client_ids.remove(proxy_id) {
-            self.client_to_proxy_ids.remove(&(channel_id, client_id));
+    pub fn remove_inflight_request(&self, proxy_id: &Value) -> Option<InflightRequest> {
+        self.inflight_requests
+            .remove(proxy_id)
+            .map(|(_, request)| request)
+    }
+
+    pub async fn session_state(&self, session_id: &str) -> Option<Arc<SessionState>> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.state.clone())
+    }
+
+    pub async fn session_channel(&self, session_id: &str) -> Option<ChannelId> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.channel_id)
+    }
+
+    pub async fn has_session_channel(&self, session_id: &str) -> bool {
+        self.session_channel(session_id).await.is_some()
+    }
+
+    pub async fn map_session_channel(&self, session_id: &str, channel_id: ChannelId) {
+        if let Some(entry) = self.sessions.write().await.get_mut(session_id) {
+            entry.channel_id = Some(channel_id);
         }
-        self.proxy_to_session_ids.remove(proxy_id);
+    }
+
+    pub async fn unmap_session_if_owned_by(&self, session_id: &str, channel_id: ChannelId) -> bool {
+        let mut sessions = self.sessions.write().await;
+
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        if entry.channel_id == Some(channel_id) {
+            entry.channel_id = None;
+            return true;
+        }
+
+        false
+    }
+
+    pub async fn claim_or_insert_session_channel(
+        &self,
+        session_id: SessionId,
+        channel_id: ChannelId,
+        process_key: &ProcessKey,
+    ) -> Result<bool, ()> {
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(entry) = sessions.get_mut(&session_id) {
+            if entry.channel_id.is_some() {
+                return Err(());
+            }
+
+            entry.channel_id = Some(channel_id);
+            return Ok(false);
+        }
+
+        sessions.insert(
+            session_id,
+            SessionEntry {
+                state: Arc::new(SessionState::new(process_key.clone())),
+                channel_id: Some(channel_id),
+            },
+        );
+        Ok(true)
+    }
+
+    pub async fn unmap_sessions_for_channel(&self, channel_id: ChannelId) -> Vec<(SessionId, u64)> {
+        let mut sessions = self.sessions.write().await;
+        let mut unmapped = Vec::new();
+
+        for (session_id, entry) in sessions.iter_mut() {
+            if entry.channel_id == Some(channel_id) {
+                entry.channel_id = None;
+                unmapped.push((
+                    session_id.clone(),
+                    entry.state.cancel_counter.load(Ordering::Relaxed),
+                ));
+            }
+        }
+
+        unmapped
+    }
+
+    pub async fn insert_session(
+        &self,
+        session_id: SessionId,
+        session_state: Arc<SessionState>,
+        channel_id: Option<ChannelId>,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(&session_id) {
+            return false;
+        }
+
+        sessions.insert(
+            session_id,
+            SessionEntry {
+                state: session_state,
+                channel_id,
+            },
+        );
+        true
+    }
+
+    pub async fn remove_session(&self, session_id: &str) {
+        self.sessions.write().await.remove(session_id);
+        self.session_lifecycle_locks
+            .write()
+            .await
+            .remove(session_id);
+    }
+
+    pub async fn remove_session_if_unowned_or_owned_by(
+        &self,
+        session_id: &str,
+        channel_id: ChannelId,
+    ) -> bool {
+        let should_remove = {
+            let mut sessions = self.sessions.write().await;
+
+            let should_remove = sessions.get(session_id).is_some_and(|entry| {
+                entry.channel_id.is_none() || entry.channel_id == Some(channel_id)
+            });
+
+            if should_remove {
+                sessions.remove(session_id);
+            }
+
+            should_remove
+        };
+
+        if should_remove {
+            self.session_lifecycle_locks
+                .write()
+                .await
+                .remove(session_id);
+        }
+
+        should_remove
+    }
+
+    pub async fn session_lifecycle_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.session_lifecycle_locks.write().await;
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+impl InitState {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(InitStateInner::NotStarted),
+            notify: Notify::new(),
+        }
+    }
+
+    pub async fn begin(&self, request_id: Value) -> BeginInit {
+        let mut inner = self.inner.lock().await;
+
+        match &*inner {
+            InitStateInner::NotStarted => {
+                *inner = InitStateInner::InFlight { request_id };
+                BeginInit::Start
+            }
+            InitStateInner::InFlight { .. } => BeginInit::Wait,
+            InitStateInner::Complete { init } => BeginInit::Complete(init.clone()),
+            InitStateInner::Failed => BeginInit::Failed,
+        }
+    }
+
+    pub async fn wait_for_completion(&self) -> Option<InitComplete> {
+        loop {
+            let notified = {
+                let inner = self.inner.lock().await;
+
+                match &*inner {
+                    InitStateInner::Complete { init } => return Some(init.clone()),
+                    InitStateInner::Failed => return None,
+                    InitStateInner::NotStarted | InitStateInner::InFlight { .. } => {
+                        self.notify.notified()
+                    }
+                }
+            };
+
+            notified.await;
+        }
+    }
+
+    pub async fn complete_if_current(
+        &self,
+        request_id: &Value,
+        response: JsonRpcResponse,
+        capabilities: AgentCapabilities,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+
+        let InitStateInner::InFlight {
+            request_id: current_request_id,
+        } = &*inner
+        else {
+            return false;
+        };
+
+        if current_request_id != request_id {
+            return false;
+        }
+
+        *inner = InitStateInner::Complete {
+            init: InitComplete {
+                response,
+                capabilities,
+            },
+        };
+        drop(inner);
+        self.notify.notify_waiters();
+        true
+    }
+
+    pub async fn is_current_request(&self, request_id: &Value) -> bool {
+        let inner = self.inner.lock().await;
+
+        matches!(
+            &*inner,
+            InitStateInner::InFlight {
+                request_id: current_request_id,
+            } if current_request_id == request_id
+        )
+    }
+
+    pub async fn is_in_flight(&self) -> bool {
+        matches!(*self.inner.lock().await, InitStateInner::InFlight { .. })
+    }
+
+    pub async fn fail(&self) {
+        let mut inner = self.inner.lock().await;
+        *inner = InitStateInner::Failed;
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn is_complete(&self) -> bool {
+        matches!(*self.inner.lock().await, InitStateInner::Complete { .. })
+    }
+
+    pub async fn capabilities(&self) -> Option<AgentCapabilities> {
+        let inner = self.inner.lock().await;
+
+        match &*inner {
+            InitStateInner::Complete { init } => Some(init.capabilities),
+            InitStateInner::NotStarted
+            | InitStateInner::InFlight { .. }
+            | InitStateInner::Failed => None,
+        }
     }
 }
 
@@ -467,10 +776,10 @@ impl SessionState {
     pub fn new(process_key: ProcessKey) -> Self {
         Self {
             process_key,
-            message_buffer: Arc::new(RwLock::new(Vec::new())),
-            notification_id_counter: Arc::new(AtomicU64::new(1)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            cancel_counter: Arc::new(AtomicU64::new(0)),
+            message_buffer: RwLock::new(Vec::new()),
+            notification_id_counter: AtomicU64::new(1),
+            cancelled: AtomicBool::new(false),
+            cancel_counter: AtomicU64::new(0),
         }
     }
 
@@ -609,7 +918,6 @@ pub async fn init(
             }
             Err(e) => {
                 drop(guard);
-                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error(format!("failed to start process: {}", e));
             }
@@ -630,7 +938,6 @@ pub async fn init(
             None => {
                 // Process already gone
                 drop(guard);
-                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error("process exited before channel init".to_string());
             }
@@ -638,7 +945,14 @@ pub async fn init(
     };
 
     drop(guard);
-    state.process_lifecycle_locks.remove(&process_key);
+
+    let process_state = match state.processes.get(&process_key) {
+        Some(process) => process.clone(),
+        None => {
+            state.channel_senders.remove(&channel_id);
+            return InitResult::Error("process exited before channel init".to_string());
+        }
+    };
 
     // Send success reply
     let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({})));
@@ -719,184 +1033,214 @@ pub async fn init(
 
     state.channel_senders.remove(&channel_id);
 
-    // Capture sessions for this channel and remove mappings.
-    // We first collect all session IDs that map to this channel, then look up
-    // their state separately. This is important because the process exit handler
-    // might have already removed sessions from state.sessions, but we still need
-    // to clean up session_to_channel.
-    let session_ids_for_channel: Vec<SessionId> = state
-        .session_to_channel
-        .iter()
-        .filter(|entry| *entry.value() == channel_id)
-        .map(|entry| entry.key().clone())
-        .collect();
-
-    // Now get the cancel counters for sessions that still exist
-    let mut sessions_for_channel = Vec::new();
-    for session_id in &session_ids_for_channel {
-        state.session_to_channel.remove(session_id);
-        if let Some(session) = state.sessions.get(session_id) {
-            sessions_for_channel.push((
-                session_id.clone(),
-                session.cancel_counter.load(Ordering::Relaxed),
-            ));
-        }
-    }
+    // Capture sessions for this channel and remove channel ownership.
+    let sessions_for_channel = process_state.unmap_sessions_for_channel(channel_id).await;
 
     // Spawn a task to send session/cancel or session/close after 10 seconds
-    let state_clone = state.clone();
+    let process_state_clone = process_state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
         for (session_id, counter) in sessions_for_channel {
-            // Check if session is still unmapped (not reconnected)
-            if state_clone.session_to_channel.contains_key(&session_id) {
-                debug!("Skipping session/cancel for {} (reconnected)", session_id);
-                continue;
-            }
-
-            let Some(session_state) = state_clone.sessions.get(&session_id) else {
-                continue;
-            };
-
-            // Check if cancel_counter matches (session hasn't been reloaded)
-            if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
-                debug!(
-                    "Skipping session/cancel for {} because counter does not match!",
-                    session_id
-                );
-                continue;
-            }
-
-            // Acquire session lock to prevent races between stop and reconnect
-            let lock = state_clone
-                .session_lifecycle_locks
-                .entry(session_id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-            let _guard = lock.lock().await;
-
-            // Session is still unmapped
-            let process_key = session_state.process_key.clone();
-            let Some(process_state) = state_clone.processes.get(&process_key) else {
-                continue;
-            };
-
-            // Check if agent supports session/close
-            let supports_stop = process_state
-                .supports_session_close
-                .read()
-                .await
-                .unwrap_or(false);
-
-            if supports_stop {
-                // Drop the DashMap ref before removing to avoid deadlock
-                drop(session_state);
-
-                // Send session/close as a request (no proxy ID mapping — the
-                // response will be silently ignored since there is no client).
-                let proxy_id = process_state.generate_proxy_id();
-                let stop_request = JsonRpcRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: proxy_id,
-                    method: "session/close".to_string(),
-                    params: Some(json!({
-                        "sessionId": session_id
-                    })),
-                };
-
-                if let Err(e) = process_state
-                    .send_to_process(JsonRpcMessage::Request(stop_request))
-                    .await
-                {
-                    error!("Failed to send session/close for {}: {}", session_id, e);
-                } else {
-                    debug!("Sent session/close for unmapped session: {}", session_id);
-                }
-
-                // Remove session state entirely — session is permanently gone
-                state_clone.sessions.remove(&session_id);
-                state_clone.session_lifecycle_locks.remove(&session_id);
-            } else {
-                // Mark session as cancelled (keep state for potential reconnect)
-                session_state.cancelled.store(true, Ordering::SeqCst);
-
-                let cancel_notification = JsonRpcNotification {
-                    jsonrpc: "2.0".to_string(),
-                    method: "session/cancel".to_string(),
-                    params: Some(json!({
-                        "sessionId": session_id
-                    })),
-                };
-
-                if let Err(e) = process_state
-                    .send_to_process(JsonRpcMessage::Notification(cancel_notification))
-                    .await
-                {
-                    error!("Failed to send session/cancel for {}: {}", session_id, e);
-                } else {
-                    debug!("Sent session/cancel for unmapped session: {}", session_id);
-                }
-            }
+            stop_unmapped_session_if_still_disconnected(
+                process_state_clone.clone(),
+                session_id,
+                counter,
+            )
+            .await;
         }
     });
 
     // If this was the last connected client, spawn a 1-minute inactivity timer
-    // that stops the process (if the agent supports resuming sessions).
+    // that stops the process if the agent supports resuming sessions.
     if let Some(process_state) = state.processes.get(&process_key) {
-        // Check if the agent supports resuming sessions
-        let supports_resuming = process_state
-            .supports_resuming
-            .read()
-            .await
-            .unwrap_or(false);
-
-        if process_state.exit_broadcast.receiver_count() == 0 && supports_resuming {
+        if process_state.exit_broadcast.receiver_count() == 0 {
             let epoch = process_state.connect_epoch.load(Ordering::SeqCst);
-            let process_state = process_state.clone();
-            let process_key = process_key.clone();
-            let state_clone = state.clone();
 
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            if process_state.init_state.is_in_flight().await {
+                let state_clone = state.clone();
+                let process_state = process_state.clone();
+                let process_key = process_key.clone();
 
-                // Acquire the lifecycle lock so we don't race with a new
-                // client that is between process lookup and exit_broadcast
-                // subscribe (where it bumps connect_epoch).
-                let lock = state_clone
-                    .process_lifecycle_locks
-                    .entry(process_key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone();
-                let _guard = lock.lock().await;
-
-                // Re-check epoch now that we hold the lock – a client that
-                // connected while we were waiting will have bumped it.
-                if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
-                    debug!(
-                        "Skipping process stop for {} (client reconnected)",
-                        process_key
-                    );
-                    return;
-                }
-
-                info!(
-                    "Stopping process {} after 1 minute of inactivity",
-                    process_key
+                tokio::spawn(async move {
+                    if process_state
+                        .init_state
+                        .wait_for_completion()
+                        .await
+                        .is_some_and(|init| init.capabilities.supports_resuming)
+                    {
+                        spawn_process_stop_after_inactivity(
+                            state_clone,
+                            process_state,
+                            process_key,
+                            epoch,
+                        );
+                    }
+                });
+            } else if process_state
+                .init_state
+                .capabilities()
+                .await
+                .is_some_and(|capabilities| capabilities.supports_resuming)
+            {
+                spawn_process_stop_after_inactivity(
+                    state.clone(),
+                    process_state.clone(),
+                    process_key.clone(),
+                    epoch,
                 );
-
-                // Remove from state first so new clients start a fresh process
-                // instead of connecting to one that's about to be killed.
-                state_clone.processes.remove(&process_key);
-
-                if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
-                    let _ = exit_tx.send(());
-                }
-            });
+            }
         }
     }
 
     result
+}
+
+async fn stop_unmapped_session_if_still_disconnected(
+    process_state: Arc<ProcessState>,
+    session_id: SessionId,
+    counter: u64,
+) {
+    // Check if session is still unmapped (not reconnected)
+    if process_state.has_session_channel(&session_id).await {
+        debug!("Skipping session/cancel for {} (reconnected)", session_id);
+        return;
+    }
+
+    let Some(session_state) = process_state.session_state(&session_id).await else {
+        return;
+    };
+
+    // Check if cancel_counter matches (session hasn't been reloaded)
+    if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
+        debug!(
+            "Skipping session/cancel for {} because counter does not match!",
+            session_id
+        );
+        return;
+    }
+
+    // Acquire session lock to prevent races between stop and reconnect
+    let lock = process_state.session_lifecycle_lock(&session_id).await;
+    let _guard = lock.lock().await;
+
+    if process_state.has_session_channel(&session_id).await {
+        debug!(
+            "Skipping session/cancel for {} (reconnected after lifecycle lock)",
+            session_id
+        );
+        return;
+    }
+
+    // Check if agent supports session/close
+    let supports_stop = process_state
+        .init_state
+        .capabilities()
+        .await
+        .is_some_and(|capabilities| capabilities.supports_session_close);
+
+    if supports_stop {
+        // Send session/close as a request (no proxy ID mapping — the
+        // response will be silently ignored since there is no client).
+        let proxy_id = process_state.generate_proxy_id();
+        let stop_request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id,
+            method: "session/close".to_string(),
+            params: Some(json!({
+                "sessionId": session_id
+            })),
+        };
+
+        if let Err(e) = process_state
+            .send_to_process(JsonRpcMessage::Request(stop_request))
+            .await
+        {
+            error!("Failed to send session/close for {}: {}", session_id, e);
+        } else {
+            debug!("Sent session/close for unmapped session: {}", session_id);
+        }
+
+        // Remove session state entirely — session is permanently gone
+        process_state.remove_session(&session_id).await;
+    } else {
+        // Mark session as cancelled (keep state for potential reconnect)
+        session_state.cancelled.store(true, Ordering::SeqCst);
+
+        let cancel_notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/cancel".to_string(),
+            params: Some(json!({
+                "sessionId": session_id
+            })),
+        };
+
+        if let Err(e) = process_state
+            .send_to_process(JsonRpcMessage::Notification(cancel_notification))
+            .await
+        {
+            error!("Failed to send session/cancel for {}: {}", session_id, e);
+        } else {
+            debug!("Sent session/cancel for unmapped session: {}", session_id);
+        }
+    }
+}
+
+fn spawn_process_stop_after_inactivity(
+    state: AcpChannelState,
+    process_state: Arc<ProcessState>,
+    process_key: ProcessKey,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+        // Acquire the lifecycle lock so we don't race with a new
+        // client that is between process lookup and exit_broadcast
+        // subscribe (where it bumps connect_epoch).
+        let lock = state
+            .process_lifecycle_locks
+            .entry(process_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        // Re-check epoch now that we hold the lock – a client that
+        // connected while we were waiting will have bumped it.
+        if process_state.connect_epoch.load(Ordering::SeqCst) != epoch {
+            debug!(
+                "Skipping process stop for {} (client reconnected)",
+                process_key
+            );
+            return;
+        }
+
+        if !process_state
+            .init_state
+            .capabilities()
+            .await
+            .is_some_and(|capabilities| capabilities.supports_resuming)
+        {
+            debug!(
+                "Skipping process stop for {} (agent does not support resuming)",
+                process_key
+            );
+            return;
+        }
+
+        info!(
+            "Stopping process {} after 1 minute of inactivity",
+            process_key
+        );
+
+        // Remove from state first so new clients start a fresh process
+        // instead of connecting to one that's about to be killed.
+        state.processes.remove(&process_key);
+
+        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
+            let _ = exit_tx.send(());
+        }
+    });
 }
 
 // ============================================================================
@@ -941,10 +1285,16 @@ async fn handle_client_request(
         "initialize" => handle_initialize_request(state, channel_id, request, process_key).await,
         // Our custom session load handler
         "_tidewave.ai/session/load" => {
-            handle_tidewave_session_load(state, channel_id, request).await
+            handle_tidewave_session_load(state, channel_id, request, process_key).await
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
-        "session/load" => handle_acp_session_load(state, channel_id, request, process_key).await,
+        "session/load" => {
+            handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
+        }
+        // ACP session resume also needs to atomically claim the session before forwarding.
+        "session/resume" => {
+            handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
+        }
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, channel_id, request, process_key).await,
     }
@@ -959,53 +1309,15 @@ async fn handle_initialize_request(
     // Process was already started during channel join
     let process_state = ensure_process(state, process_key)?;
 
-    // Fast path: already have a cached init response
-    if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
-        let mut response = cached_response.clone();
-        response.id = request.id.clone();
-        send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-        return Ok(());
-    }
+    let proxy_id = process_state.generate_proxy_id();
 
-    // Try to be the one that sends the init request
-    if process_state
-        .init_sent
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        // We won the race — send the init request to the process
-        let session_id = extract_session_id_from_request(request);
-        let proxy_id =
-            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id);
-        let mut proxy_request = request.clone();
-        proxy_request.id = proxy_id.clone();
-
-        *process_state.init_request_id.write().await = Some(proxy_id);
-
-        if let Err(e) = process_state
-            .send_to_process(JsonRpcMessage::Request(proxy_request))
-            .await
-        {
-            error!("Failed to send initialize request to process: {}", e);
-            send_agent_exit(
-                state,
-                channel_id,
-                "communication_error",
-                "Failed to communicate with process",
-                None,
-                None,
-            );
-        }
-    } else {
-        // Another client already sent the init request — wait for the response
-        process_state.init_complete.notified().await;
-
-        if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
-            let mut response = cached_response.clone();
+    match process_state.init_state.begin(proxy_id.clone()).await {
+        BeginInit::Complete(cached_init) => {
+            let mut response = cached_init.response;
             response.id = request.id.clone();
             send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-        } else {
-            // Init completed but no cached response (error case, e.g. process died)
+        }
+        BeginInit::Failed => {
             send_agent_exit(
                 state,
                 channel_id,
@@ -1014,6 +1326,53 @@ async fn handle_initialize_request(
                 None,
                 None,
             );
+        }
+        BeginInit::Start => {
+            // We won the race — send the init request to the process
+            let session_id = extract_session_id_from_request(request);
+            process_state.register_inflight_request(
+                proxy_id.clone(),
+                channel_id,
+                request.id.clone(),
+                session_id,
+                None,
+            );
+            let mut proxy_request = request.clone();
+            proxy_request.id = proxy_id;
+
+            if let Err(e) = process_state
+                .send_to_process(JsonRpcMessage::Request(proxy_request))
+                .await
+            {
+                process_state.init_state.fail().await;
+                error!("Failed to send initialize request to process: {}", e);
+                send_agent_exit(
+                    state,
+                    channel_id,
+                    "communication_error",
+                    "Failed to communicate with process",
+                    None,
+                    None,
+                );
+            }
+        }
+        BeginInit::Wait => {
+            // Another client already sent the init request — wait for the response
+            if let Some(cached_init) = process_state.init_state.wait_for_completion().await {
+                let mut response = cached_init.response;
+                response.id = request.id.clone();
+                send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
+            } else {
+                // Init completed but no cached response (error case, e.g. process died)
+                send_agent_exit(
+                    state,
+                    channel_id,
+                    "init_error",
+                    "Process init failed",
+                    None,
+                    None,
+                );
+            }
         }
     }
 
@@ -1024,22 +1383,21 @@ async fn handle_tidewave_session_load(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
+    process_key: &ProcessKey,
 ) -> Result<()> {
+    let process_state = ensure_process(state, process_key)?;
     let params: TidewaveSessionLoadRequest =
         serde_json::from_value(request.params.clone().unwrap_or(Value::Null))
             .map_err(|e| anyhow!("Invalid session/load params: {}", e))?;
 
     // Acquire session lock to prevent races with session/close on disconnect
-    let lock = state
-        .session_lifecycle_locks
-        .entry(params.session_id.clone())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
+    let lock = process_state
+        .session_lifecycle_lock(&params.session_id)
+        .await;
     let _guard = lock.lock().await;
 
-    let session_state = match state.sessions.get(&params.session_id) {
-        Some(session) => {
-            let s = session.clone();
+    let session_state = match process_state.session_state(&params.session_id).await {
+        Some(s) => {
             s.cancel_counter.fetch_add(1, Ordering::SeqCst);
             s
         }
@@ -1058,7 +1416,15 @@ async fn handle_tidewave_session_load(
         }
     };
 
-    if !ensure_session_not_active(state, channel_id, request, &params.session_id) {
+    if !ensure_session_not_active(
+        &process_state,
+        state,
+        channel_id,
+        request,
+        &params.session_id,
+    )
+    .await
+    {
         return Ok(());
     }
 
@@ -1083,9 +1449,9 @@ async fn handle_tidewave_session_load(
 
             // NOW register the session mapping while still holding the lock
             // This ensures no messages arrive between catchup and registration
-            state
-                .session_to_channel
-                .insert(params.session_id.clone(), channel_id);
+            process_state
+                .map_session_channel(&params.session_id, channel_id)
+                .await;
         } // Lock released here - new messages can now be buffered AND sent directly
 
         let response_data = TidewaveSessionLoadResponse {
@@ -1105,7 +1471,7 @@ async fn handle_tidewave_session_load(
     Ok(())
 }
 
-async fn handle_acp_session_load(
+async fn handle_acp_session_load_or_resume(
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
@@ -1114,36 +1480,64 @@ async fn handle_acp_session_load(
     let session_id = extract_session_id_from_request(request);
 
     if let Some(session_id) = session_id {
-        if !ensure_session_not_active(state, channel_id, request, &session_id) {
-            return Ok(());
-        }
+        let process_state = ensure_process(state, process_key)?;
+        let lock = process_state.session_lifecycle_lock(&session_id).await;
+        let _guard = lock.lock().await;
 
-        if state.sessions.contains_key(&session_id) {
-            info!(
-                "session/load for existing session {} on channel {}",
-                session_id, channel_id
-            );
-        } else {
-            let session_state = Arc::new(SessionState::new(process_key.clone()));
-            state.sessions.insert(session_id.clone(), session_state);
+        let created_session = match process_state
+            .claim_or_insert_session_channel(session_id.clone(), channel_id, process_key)
+            .await
+        {
+            Ok(false) => {
+                info!(
+                    "session/load for existing session {} on channel {}",
+                    session_id, channel_id
+                );
+                false
+            }
+            Ok(true) => {
+                info!(
+                    "Created new session {} for session/load on channel {}",
+                    session_id, channel_id
+                );
+                true
+            }
+            Err(()) => {
+                send_error_response(
+                    state,
+                    channel_id,
+                    &request.id,
+                    JsonRpcError {
+                        code: -32003,
+                        message: "Session already has an active connection".to_string(),
+                        data: None,
+                    },
+                );
+                return Ok(());
+            }
+        };
 
-            info!(
-                "Created new session {} for session/load on channel {}",
-                session_id, channel_id
-            );
-        }
-
-        // Map this channel to the session BEFORE forwarding the request
-        // This ensures that when the agent sends notifications during session/load,
+        // Claim this channel for the session BEFORE forwarding the request
+        // This ensures that when the agent sends notifications during load/resume,
         // we can route them to the correct websocket
-        state
-            .session_to_channel
-            .insert(session_id.clone(), channel_id);
-
         info!(
-            "Mapped channel {} to session {} for session/load",
-            channel_id, session_id
+            "Mapped channel {} to session {} for {}",
+            channel_id, session_id, request.method
         );
+
+        let pending = match request.method.as_str() {
+            "session/load" => Some(PendingRequest::SessionLoad {
+                session_id: session_id.clone(),
+                created_session,
+            }),
+            "session/resume" => Some(PendingRequest::SessionResume {
+                session_id: session_id.clone(),
+                created_session,
+            }),
+            _ => None,
+        };
+        forward_request_to_process(state, channel_id, request, process_key, pending).await?;
+        return Ok(());
     }
 
     // Forward the request to the agent as a regular request
@@ -1185,50 +1579,52 @@ async fn handle_regular_request(
     request: &JsonRpcRequest,
     process_key: &ProcessKey,
 ) -> Result<()> {
-    let process_state = ensure_process(state, process_key)?;
-
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
-    let proxy_id =
-        process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id.clone());
-    let mut proxy_request = request.clone();
-    proxy_request.id = proxy_id.clone();
 
-    match request.method.as_str() {
+    let pending = match request.method.as_str() {
         // We intercept new sessions to map the sessionId to the channel
-        "session/new" => {
-            process_state.new_request_ids.insert(proxy_id.clone());
-        }
+        "session/new" => Some(PendingRequest::SessionNew),
         // We intercept load requests since we need to handle the unsuccessful case
         // and clear the session mapping.
-        "session/load" => {
-            if let Some(session_id) = session_id {
-                process_state
-                    .load_request_ids
-                    .insert(proxy_id.clone(), session_id);
-            }
-        }
+        "session/load" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionLoad {
+                session_id,
+                created_session: false,
+            }),
         // We intercept resume / fork sessions to map the sessionId to the channel
-        "session/resume" => {
-            if let Some(session_id) = session_id {
-                process_state
-                    .resume_request_ids
-                    .insert(proxy_id.clone(), session_id);
-            }
-        }
-        "session/fork" => {
-            process_state.fork_request_ids.insert(proxy_id.clone());
-        }
+        "session/resume" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionResume {
+                session_id,
+                created_session: false,
+            }),
+        "session/fork" => Some(PendingRequest::SessionFork),
         // We intercept session/close to remove session state on response.
-        "session/close" => {
-            if let Some(session_id) = session_id {
-                process_state
-                    .close_request_ids
-                    .insert(proxy_id.clone(), session_id);
-            }
-        }
-        _ => (),
-    }
+        "session/close" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionClose { session_id }),
+        _ => None,
+    };
+
+    forward_request_to_process(state, channel_id, request, process_key, pending).await
+}
+
+async fn forward_request_to_process(
+    state: &AcpChannelState,
+    channel_id: ChannelId,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+    pending: Option<PendingRequest>,
+) -> Result<()> {
+    let process_state = ensure_process(state, process_key)?;
+    let session_id = extract_session_id_from_request(request);
+
+    let proxy_id =
+        process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id, pending);
+    let mut proxy_request = request.clone();
+    proxy_request.id = proxy_id.clone();
 
     // Forward to process
     if let Err(e) = process_state
@@ -1248,7 +1644,9 @@ async fn handle_client_notification(
     process_key: &ProcessKey,
 ) -> Result<()> {
     match notification.method.as_str() {
-        "_tidewave.ai/ack" => handle_ack_notification(state, channel_id, notification).await,
+        "_tidewave.ai/ack" => {
+            handle_ack_notification(state, channel_id, notification, process_key).await
+        }
         _ => forward_notification_to_process(state, notification, process_key).await,
     }
 }
@@ -1257,16 +1655,18 @@ async fn handle_ack_notification(
     state: &AcpChannelState,
     channel_id: ChannelId,
     notification: &JsonRpcNotification,
+    process_key: &ProcessKey,
 ) -> Result<()> {
+    let process_state = ensure_process(state, process_key)?;
     let params: TidewaveAckNotification =
         serde_json::from_value(notification.params.clone().unwrap_or(Value::Null))
             .map_err(|e| anyhow!("Invalid ack params: {}", e))?;
 
     // Find the specific session to prune
-    if let Some(session_state) = state.sessions.get(&params.session_id) {
+    if let Some(session_state) = process_state.session_state(&params.session_id).await {
         // Verify this websocket is actually connected to this session
-        if let Some(mapped_channel_id) = state.session_to_channel.get(&params.session_id) {
-            if *mapped_channel_id == channel_id {
+        if let Some(mapped_channel_id) = process_state.session_channel(&params.session_id).await {
+            if mapped_channel_id == channel_id {
                 session_state.prune_buffer(&params.latest_id).await;
             } else {
                 warn!(
@@ -1358,12 +1758,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             } else {
                 debug!("Received non-JSON line from process: {}", line);
                 // Buffer if init hasn't completed yet
-                if process_state_clone
-                    .cached_init_response
-                    .read()
-                    .await
-                    .is_none()
-                {
+                if !process_state_clone.init_state.is_complete().await {
                     process_state_clone.stdout_buffer.write().await.push(line);
                 }
             }
@@ -1378,12 +1773,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
         while let Ok(Some(line)) = lines.next_line().await {
             debug!("Process stderr: {}", line);
             // Buffer if init hasn't completed yet
-            if process_state_stderr
-                .cached_init_response
-                .read()
-                .await
-                .is_none()
-            {
+            if !process_state_stderr.init_state.is_complete().await {
                 process_state_stderr.stderr_buffer.write().await.push(line);
             }
         }
@@ -1437,12 +1827,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
         let (error_type, exit_message) = exit_reason;
 
         // If init never completed, include buffered output in the exit notification
-        let (stdout, stderr) = if process_state_exit
-            .cached_init_response
-            .read()
-            .await
-            .is_none()
-        {
+        let (stdout, stderr) = if !process_state_exit.init_state.is_complete().await {
             let stdout_buf = process_state_exit.stdout_buffer.read().await;
             let stderr_buf = process_state_exit.stderr_buffer.read().await;
             (
@@ -1478,26 +1863,22 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             stderr,
         });
 
-        // Clean up sessions
-        let sessions_to_remove: Vec<SessionId> = state_exit
-            .sessions
-            .iter()
-            .filter(|entry| entry.value().process_key == process_state_exit.key)
-            .map(|entry| entry.key().clone())
-            .collect();
+        let sessions_to_remove = process_state_exit.sessions.read().await.len();
+        process_state_exit.sessions.write().await.clear();
+        process_state_exit
+            .session_lifecycle_locks
+            .write()
+            .await
+            .clear();
 
-        for session_id in &sessions_to_remove {
-            state_exit.sessions.remove(session_id);
-        }
-
-        // Notify any waiters for init response so they don't hang forever
-        process_state_exit.init_complete.notify_waiters();
+        // Notify any waiters for init response so they don't hang forever.
+        process_state_exit.init_state.fail().await;
 
         state_exit.processes.remove(&process_state_exit.key);
 
         debug!(
             "Process exit handler ended, cleaned up {} sessions",
-            sessions_to_remove.len()
+            sessions_to_remove
         );
     });
 
@@ -1559,13 +1940,14 @@ fn send_agent_exit(
 
 /// Helper function to ensure a session is not already active on another channel.
 /// Returns false if the session is already active (and sends an error response to the client).
-fn ensure_session_not_active(
+async fn ensure_session_not_active(
+    process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     channel_id: ChannelId,
     request: &JsonRpcRequest,
     session_id: &str,
 ) -> bool {
-    if state.session_to_channel.contains_key(session_id) {
+    if process_state.has_session_channel(session_id).await {
         send_error_response(
             state,
             channel_id,
@@ -1604,7 +1986,7 @@ async fn handle_process_message(
             handle_process_response(process_state, state, response).await
         }
         JsonRpcMessage::Request(_) | JsonRpcMessage::Notification(_) => {
-            handle_process_notification_or_request(state, message).await
+            handle_process_notification_or_request(process_state, state, message).await
         }
     }
 }
@@ -1615,48 +1997,42 @@ async fn handle_process_response(
     state: &AcpChannelState,
     response: &JsonRpcResponse,
 ) -> Result<()> {
-    // Handle responses - map proxy ID back to client ID
-    if let Some((channel_id, client_id)) = process_state.resolve_proxy_id_to_client(&response.id) {
+    if let Some(inflight_request) = process_state.remove_inflight_request(&response.id) {
         // Create response with original client ID
         let mut client_response = response.clone();
-        client_response.id = client_id;
+        client_response.id = inflight_request.client_id.clone();
 
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        maybe_handle_session_load_resume(
+        let response_session_id = maybe_handle_pending_request(
             process_state,
             state,
-            channel_id,
-            response,
+            inflight_request.channel_id,
+            inflight_request.pending.clone(),
             &client_response,
         )
         .await?;
-        maybe_handle_session_new_response(
-            process_state,
-            state,
-            response,
-            &client_response,
-            channel_id,
-        )
-        .await;
+        let disconnected_session_id = response_session_id.or(inflight_request.session_id.clone());
 
-        if let Some(sender) = state.channel_senders.get(&channel_id) {
+        if let Some(sender) = state.channel_senders.get(&inflight_request.channel_id) {
             push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
         } else {
-            handle_disconnected_client_response(process_state, state, response).await;
+            handle_disconnected_client_response(
+                process_state,
+                state,
+                client_response,
+                disconnected_session_id,
+            )
+            .await;
         }
 
-        // Remove session state after forwarding a successful session/close response
-        if let Some((_, session_id)) = process_state.close_request_ids.remove(&response.id) {
-            state.sessions.remove(&session_id);
-            state.session_to_channel.remove(&session_id);
-            state.session_lifecycle_locks.remove(&session_id);
+        // Remove session state after forwarding a session/close response.
+        if let Some(PendingRequest::SessionClose { session_id }) = inflight_request.pending {
+            process_state.remove_session(&session_id).await;
             info!(
                 "Removed session {} after session/close response",
                 session_id
             );
         }
-
-        process_state.cleanup_id_mappings(&response.id);
     }
 
     Ok(())
@@ -1668,101 +2044,167 @@ async fn maybe_handle_init_response(
     response: &JsonRpcResponse,
     client_response: &mut JsonRpcResponse,
 ) {
-    let init_request_id = process_state.init_request_id.read().await;
-    if init_request_id.as_ref() == Some(&response.id) {
-        drop(init_request_id); // Release read lock
-
-        // Parse agent capabilities
-        *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
-        *process_state.supports_session_close.write().await =
-            Some(check_supports_session_close(response));
-
-        // Store init response for future inits
-        *process_state.cached_init_response.write().await = Some(client_response.clone());
-        // Notify any waiters that the init response is now cached
-        process_state.init_complete.notify_waiters();
-        // Clear buffers
-        *process_state.stderr_buffer.write().await = Vec::new();
-        *process_state.stdout_buffer.write().await = Vec::new();
-    }
-}
-
-/// Handle load/resume response - check if successful and kill session
-async fn maybe_handle_session_load_resume(
-    process_state: &Arc<ProcessState>,
-    state: &AcpChannelState,
-    channel_id: ChannelId,
-    response: &JsonRpcResponse,
-    client_response: &JsonRpcResponse,
-) -> Result<()> {
-    if let Some((_proxy_id, session_id)) = process_state
-        .load_request_ids
-        .remove(&response.id)
-        .or_else(|| process_state.resume_request_ids.remove(&response.id))
-    {
-        if client_response.error.is_some() {
-            info!("Failed to load session, removing mapping! {}", session_id);
-            state.sessions.remove(&session_id);
-            state.session_to_channel.remove(&session_id);
-            if let Some(sender) = state.channel_senders.get(&channel_id) {
-                push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response.clone()));
-            }
-            return Err(anyhow!(
-                "Failed to load session, removing mapping! {}",
-                session_id
-            ));
-        } else {
-            map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle session/new response - create new session
-async fn maybe_handle_session_new_response(
-    process_state: &Arc<ProcessState>,
-    state: &AcpChannelState,
-    response: &JsonRpcResponse,
-    client_response: &JsonRpcResponse,
-    channel_id: ChannelId,
-) {
-    // check if new or fork - both are treated the same
     if process_state
-        .new_request_ids
-        .remove(&response.id)
-        .or_else(|| process_state.fork_request_ids.remove(&response.id))
-        .is_some()
+        .init_state
+        .is_current_request(&response.id)
+        .await
     {
-        if let Some(result) = &client_response.result {
-            if let Ok(session_response) =
-                serde_json::from_value::<NewSessionResponse>(result.clone())
-            {
-                map_session_id_to_channel(
-                    state,
-                    session_response.session_id,
-                    channel_id,
-                    &process_state.key,
-                )
-                .await;
-            }
+        if process_state
+            .init_state
+            .complete_if_current(
+                &response.id,
+                client_response.clone(),
+                AgentCapabilities::from_response(response),
+            )
+            .await
+        {
+            // Clear buffers
+            *process_state.stderr_buffer.write().await = Vec::new();
+            *process_state.stdout_buffer.write().await = Vec::new();
         }
     }
 }
 
-async fn map_session_id_to_channel(
+async fn maybe_handle_pending_request(
+    process_state: &Arc<ProcessState>,
+    state: &AcpChannelState,
+    channel_id: ChannelId,
+    pending_request: Option<PendingRequest>,
+    client_response: &JsonRpcResponse,
+) -> Result<Option<SessionId>> {
+    let Some(pending_request) = pending_request else {
+        return Ok(None);
+    };
+
+    let mut response_session_id = None;
+
+    match pending_request {
+        PendingRequest::SessionNew | PendingRequest::SessionFork => {
+            if let Some(result) = &client_response.result {
+                if let Ok(session_response) =
+                    serde_json::from_value::<NewSessionResponse>(result.clone())
+                {
+                    response_session_id = Some(session_response.session_id.clone());
+                    create_session_from_agent_response(
+                        state,
+                        session_response.session_id,
+                        channel_id,
+                        &process_state.key,
+                    )
+                    .await;
+                }
+            }
+        }
+        PendingRequest::SessionLoad {
+            session_id,
+            created_session,
+        }
+        | PendingRequest::SessionResume {
+            session_id,
+            created_session,
+        } => {
+            if client_response.error.is_some() {
+                if created_session {
+                    if process_state
+                        .remove_session_if_unowned_or_owned_by(&session_id, channel_id)
+                        .await
+                    {
+                        info!("Failed to load session, removing mapping! {}", session_id);
+                    } else {
+                        info!(
+                            "Failed to load session {}, but it is now owned by another channel",
+                            session_id
+                        );
+                    }
+                } else if process_state
+                    .unmap_session_if_owned_by(&session_id, channel_id)
+                    .await
+                {
+                    info!("Failed to load session, releasing claim! {}", session_id);
+                }
+            } else {
+                confirm_claimed_session_response(process_state, state, session_id, channel_id)
+                    .await;
+            }
+        }
+        PendingRequest::SessionClose { .. } => {}
+    }
+
+    Ok(response_session_id)
+}
+
+async fn create_session_from_agent_response(
     state: &AcpChannelState,
     session_id: SessionId,
     channel_id: ChannelId,
     process_key: &ProcessKey,
 ) {
-    if !state.sessions.contains_key(&session_id) {
-        let session_state = Arc::new(SessionState::new(process_key.clone()));
-        state.sessions.insert(session_id.clone(), session_state);
-        state.session_to_channel.insert(session_id, channel_id);
-    } else {
+    let Ok(process_state) = ensure_process(state, process_key) else {
         warn!(
-            "Unexpectedly got new/load/fork session response for already known session! {}",
+            "Cannot map session {} without process {}",
+            session_id, process_key
+        );
+        return;
+    };
+
+    let inserted = process_state
+        .insert_session(
+            session_id.clone(),
+            Arc::new(SessionState::new(process_key.clone())),
+            Some(channel_id),
+        )
+        .await;
+
+    if !state.channel_senders.contains_key(&channel_id)
+        && process_state
+            .unmap_session_if_owned_by(&session_id, channel_id)
+            .await
+    {
+        debug!(
+            "Created session {} from late agent response without active channel",
+            session_id
+        );
+    }
+
+    if !inserted && process_state.session_channel(&session_id).await != Some(channel_id) {
+        warn!(
+            "Unexpectedly got new/fork session response for already known session! {}",
+            session_id
+        );
+    }
+}
+
+async fn confirm_claimed_session_response(
+    process_state: &Arc<ProcessState>,
+    state: &AcpChannelState,
+    session_id: SessionId,
+    channel_id: ChannelId,
+) {
+    if !state.channel_senders.contains_key(&channel_id)
+        && process_state
+            .unmap_session_if_owned_by(&session_id, channel_id)
+            .await
+    {
+        debug!(
+            "Confirmed session {} from late load/resume response without active channel",
+            session_id
+        );
+        return;
+    }
+
+    let current_channel = process_state.session_channel(&session_id).await;
+
+    if current_channel.is_none() {
+        warn!(
+            "Successful load/resume response for session {} but no channel owns it",
+            session_id
+        );
+        return;
+    }
+
+    if current_channel != Some(channel_id) {
+        warn!(
+            "Successful load/resume response for session {} is now owned by another channel",
             session_id
         );
     }
@@ -1772,43 +2214,58 @@ async fn map_session_id_to_channel(
 async fn handle_disconnected_client_response(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
-    response: &JsonRpcResponse,
+    client_response: JsonRpcResponse,
+    session_id: Option<SessionId>,
 ) {
-    debug!("Missing original channel for request {}", response.id);
+    debug!(
+        "Missing original channel for request {}",
+        client_response.id
+    );
     // Fallback: Client disconnected, try to find session and forward to new channel
-    let session_info = process_state
-        .proxy_to_session_ids
-        .get(&response.id)
-        .map(|entry| entry.value().clone());
-
-    if let Some((session_id, client_id)) = session_info {
-        let mut client_response = response.clone();
-        client_response.id = client_id.clone();
-
-        if let Some(current_channel_id) = state.session_to_channel.get(&session_id) {
-            let current_channel_id = *current_channel_id;
-            if let Some(sender) = state.channel_senders.get(&current_channel_id) {
-                push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
-            }
-        } else {
-            // Client disconnected, buffer response
-            if let Some(session_state) = state.sessions.get(&session_id) {
-                let session_state = session_state.clone();
-                let _ = session_state
-                    .add_to_buffer(
-                        JsonRpcMessage::Response(client_response),
-                        client_id.to_string(),
-                    )
-                    .await;
-            }
+    if let Some(session_id) = session_id {
+        if push_response_to_session_channel(process_state, state, &client_response, &session_id)
+            .await
+        {
+            return;
         }
 
-        // Clean up the session mapping
-        process_state.proxy_to_session_ids.remove(&response.id);
+        if let Some(session_state) = process_state.session_state(&session_id).await {
+            let _ = session_state
+                .add_to_buffer(
+                    JsonRpcMessage::Response(client_response.clone()),
+                    client_response.id.to_string(),
+                )
+                .await;
+
+            if push_response_to_session_channel(process_state, state, &client_response, &session_id)
+                .await
+            {
+                return;
+            }
+        }
     }
 }
 
+async fn push_response_to_session_channel(
+    process_state: &Arc<ProcessState>,
+    state: &AcpChannelState,
+    client_response: &JsonRpcResponse,
+    session_id: &str,
+) -> bool {
+    let Some(current_channel_id) = process_state.session_channel(session_id).await else {
+        return false;
+    };
+
+    let Some(sender) = state.channel_senders.get(&current_channel_id) else {
+        return false;
+    };
+
+    push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response.clone()));
+    true
+}
+
 async fn handle_process_notification_or_request(
+    process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     message: JsonRpcMessage,
 ) -> Result<()> {
@@ -1816,9 +2273,7 @@ async fn handle_process_notification_or_request(
     let session_id = extract_session_id_from_message(&message);
 
     if let Some(session_id) = session_id {
-        if let Some(session_state) = state.sessions.get(&session_id) {
-            let session_state = session_state.clone();
-
+        if let Some(session_state) = process_state.session_state(&session_id).await {
             // Add notification ID if this is a notification
             let mut routed_message = message.clone();
             let buffer_id = if let JsonRpcMessage::Notification(ref mut n) = routed_message {
@@ -1839,7 +2294,7 @@ async fn handle_process_notification_or_request(
                 .await;
 
             // Route to appropriate WebSocket based on session_id
-            if let Some(channel_id) = state.session_to_channel.get(&session_id) {
+            if let Some(channel_id) = process_state.session_channel(&session_id).await {
                 if let Some(sender) = state.channel_senders.get(&channel_id) {
                     push_jsonrpc(&sender, &routed_message);
                 }
@@ -2322,6 +2777,73 @@ mod tests {
     }
 
     // ============================================================================
+    // InitState Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_init_state_wait_after_completion_returns_cached_response() {
+        let init_state = InitState::new();
+        let request_id = Value::String("proxy_init".to_string());
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request_id.clone(),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {}
+            })),
+            error: None,
+        };
+
+        assert!(matches!(
+            init_state.begin(request_id.clone()).await,
+            BeginInit::Start
+        ));
+        assert!(
+            init_state
+                .complete_if_current(
+                    &request_id,
+                    response.clone(),
+                    AgentCapabilities::from_response(&response)
+                )
+                .await
+        );
+
+        let cached = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            init_state.wait_for_completion(),
+        )
+        .await
+        .expect("wait should not miss an already completed init")
+        .expect("init should be complete");
+
+        assert_eq!(cached.response.id, response.id);
+        assert_eq!(cached.response.result, response.result);
+        assert!(!cached.capabilities.supports_resuming);
+        assert!(!cached.capabilities.supports_session_close);
+    }
+
+    #[tokio::test]
+    async fn test_init_state_wait_after_failure_returns_none() {
+        let init_state = InitState::new();
+
+        assert!(matches!(
+            init_state
+                .begin(Value::String("proxy_init".to_string()))
+                .await,
+            BeginInit::Start
+        ));
+        init_state.fail().await;
+
+        let failed = tokio::time::timeout(tokio::time::Duration::from_millis(100), async {
+            init_state.wait_for_completion().await
+        })
+        .await
+        .expect("wait should not hang after init failure");
+
+        assert!(failed.is_none());
+    }
+
+    // ============================================================================
     // ProcessState ID Mapping Tests
     // ============================================================================
 
@@ -2344,14 +2866,16 @@ mod tests {
         let ws_id = Uuid::new_v4();
         let client_id = Value::String("client_1".to_string());
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None);
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None, None);
 
         // Should be able to resolve back
-        let resolved = process.resolve_proxy_id_to_client(&proxy_id);
-        assert!(resolved.is_some());
-        let (resolved_ws, resolved_client) = resolved.unwrap();
-        assert_eq!(resolved_ws, ws_id);
-        assert_eq!(resolved_client, client_id);
+        let inflight_request = process.inflight_request(&proxy_id);
+        assert!(inflight_request.is_some());
+        let inflight_request = inflight_request.unwrap();
+        assert_eq!(inflight_request.channel_id, ws_id);
+        assert_eq!(inflight_request.client_id, client_id);
+        assert_eq!(inflight_request.session_id, None);
+        assert!(inflight_request.pending.is_none());
     }
 
     #[tokio::test]
@@ -2361,15 +2885,18 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id =
-            process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+        let proxy_id = process.map_client_id_to_proxy(
+            ws_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            None,
+        );
 
         // Should have session mapping
-        let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
-        assert!(session_mapping.is_some());
-        let (mapped_session, mapped_client) = session_mapping.unwrap().clone();
-        assert_eq!(mapped_session, session_id);
-        assert_eq!(mapped_client, client_id);
+        let inflight_request = process.inflight_request(&proxy_id).unwrap();
+        assert_eq!(inflight_request.channel_id, ws_id);
+        assert_eq!(inflight_request.client_id, client_id);
+        assert_eq!(inflight_request.session_id, Some(session_id));
     }
 
     #[tokio::test]
@@ -2379,18 +2906,206 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id));
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id), None);
 
-        // Verify mappings exist
-        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_some());
-        assert!(process.proxy_to_session_ids.contains_key(&proxy_id));
+        // Verify mapping exists
+        assert!(process.inflight_request(&proxy_id).is_some());
 
         // Cleanup
-        process.cleanup_id_mappings(&proxy_id);
+        process.remove_inflight_request(&proxy_id);
 
-        // Verify mappings are removed
-        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
-        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+        // Verify mapping is removed
+        assert!(process.inflight_request(&proxy_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_response_sent_if_session_reconnects_while_buffering() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_reconnect".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        process
+            .insert_session(session_id.clone(), session.clone(), None)
+            .await;
+
+        let original_channel_id = Uuid::new_v4();
+        let reconnected_channel_id = Uuid::new_v4();
+        let client_id = Value::String("session/prompt!sess_reconnect!!prompt_1".to_string());
+        let proxy_id = process.map_client_id_to_proxy(
+            original_channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.channel_senders.insert(
+            reconnected_channel_id,
+            ChannelSender {
+                tx,
+                topic: "acp:test".to_string(),
+                join_ref: Some("j2".to_string()),
+            },
+        );
+
+        let buffer_guard = session.message_buffer.write().await;
+        let process_clone = process.clone();
+        let state_clone = state.clone();
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id.clone(),
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+        };
+        let response_task = tokio::spawn(async move {
+            handle_process_response(&process_clone, &state_clone, &response)
+                .await
+                .expect("response should be handled");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        process
+            .map_session_channel(&session_id, reconnected_channel_id)
+            .await;
+        drop(buffer_guard);
+        response_task.await.expect("response task panicked");
+
+        let sent = tokio::time::timeout(tokio::time::Duration::from_millis(250), rx.recv())
+            .await
+            .expect("Expected response to be sent to reconnected channel")
+            .expect("Channel sender closed");
+        assert_eq!(sent.event, "jsonrpc");
+        let payload = sent.payload.as_json();
+        assert_eq!(payload["id"], client_id);
+        assert_eq!(payload["result"]["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_response_buffered_if_mapped_channel_has_no_sender() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_disconnecting".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        let disconnected_channel_id = Uuid::new_v4();
+        process
+            .insert_session(
+                session_id.clone(),
+                session.clone(),
+                Some(disconnected_channel_id),
+            )
+            .await;
+
+        let client_id = Value::String("session/prompt!sess_disconnecting!!prompt_1".to_string());
+        let proxy_id = process.map_client_id_to_proxy(
+            disconnected_channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            None,
+        );
+
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id,
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+        };
+
+        handle_process_response(&process, &state, &response)
+            .await
+            .expect("response should be handled");
+
+        let buffer = session.message_buffer.read().await;
+        assert_eq!(buffer.len(), 1);
+        let JsonRpcMessage::Response(buffered_response) = &buffer[0].message else {
+            panic!("expected buffered response");
+        };
+        assert_eq!(buffered_response.id, client_id);
+        assert_eq!(buffered_response.result, response.result);
+    }
+
+    #[tokio::test]
+    async fn test_failed_session_load_cleans_proxy_id_mappings() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_failed_load".to_string();
+        let channel_id = Uuid::new_v4();
+        let client_id = Value::String("session/load!sess_failed_load!!load_1".to_string());
+        let proxy_id = process.map_client_id_to_proxy(
+            channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            Some(PendingRequest::SessionLoad {
+                session_id: session_id.clone(),
+                created_session: true,
+            }),
+        );
+
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        process
+            .insert_session(session_id.clone(), session, Some(channel_id))
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.channel_senders.insert(
+            channel_id,
+            ChannelSender {
+                tx,
+                topic: "acp:test".to_string(),
+                join_ref: Some("j1".to_string()),
+            },
+        );
+
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32002,
+                message: "Session not found".to_string(),
+                data: None,
+            }),
+        };
+
+        handle_process_response(&process, &state, &response)
+            .await
+            .expect("Failed session/load response should be handled");
+
+        assert!(process.inflight_request(&proxy_id).is_none());
+        assert!(!process.sessions.read().await.contains_key(&session_id));
+
+        let sent = rx.recv().await.expect("Expected response to be forwarded");
+        assert_eq!(sent.event, "jsonrpc");
+        let payload = sent.payload.as_json();
+        assert_eq!(payload["id"], client_id);
+        assert_eq!(payload["error"]["message"], "Session not found");
+    }
+
+    #[tokio::test]
+    async fn test_delayed_cancel_skips_session_that_reconnects_while_waiting_for_lock() {
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_reconnected".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        process
+            .insert_session(session_id.clone(), session.clone(), None)
+            .await;
+
+        let lock = process.session_lifecycle_lock(&session_id).await;
+        let guard = lock.lock().await;
+        let process_clone = process.clone();
+        let session_id_clone = session_id.clone();
+        let stop_task = tokio::spawn(async move {
+            stop_unmapped_session_if_still_disconnected(process_clone, session_id_clone, 0).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        process
+            .map_session_channel(&session_id, Uuid::new_v4())
+            .await;
+        drop(guard);
+
+        stop_task.await.expect("stop task panicked");
+        assert!(!session.cancelled.load(Ordering::SeqCst));
+        assert!(process.session_state(&session_id).await.is_some());
     }
 
     #[tokio::test]
@@ -2402,22 +3117,20 @@ mod tests {
         let client_id1 = Value::String("1".to_string());
         let client_id2 = Value::String("1".to_string());
 
-        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None);
-        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None);
+        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None, None);
+        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None, None);
 
         // Should have different proxy IDs
         assert_ne!(proxy_id1, proxy_id2);
 
         // Both should resolve correctly
-        let (resolved_ws1, resolved_client1) =
-            process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
-        let (resolved_ws2, resolved_client2) =
-            process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+        let resolved1 = process.inflight_request(&proxy_id1).unwrap();
+        let resolved2 = process.inflight_request(&proxy_id2).unwrap();
 
-        assert_eq!(resolved_ws1, ws_id1);
-        assert_eq!(resolved_client1, client_id1);
-        assert_eq!(resolved_ws2, ws_id2);
-        assert_eq!(resolved_client2, client_id2);
+        assert_eq!(resolved1.channel_id, ws_id1);
+        assert_eq!(resolved1.client_id, client_id1);
+        assert_eq!(resolved2.channel_id, ws_id2);
+        assert_eq!(resolved2.client_id, client_id2);
     }
 
     // ============================================================================

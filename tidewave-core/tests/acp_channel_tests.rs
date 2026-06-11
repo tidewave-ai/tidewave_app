@@ -1,6 +1,6 @@
 mod common;
 
-use common::{create_fake_phoenix_socket, recv_phoenix_msg, send_phoenix_msg};
+use common::{create_fake_phoenix_socket, recv_phoenix_msg, send_phoenix_msg, wait_for_event};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tidewave_core::phoenix::PhxMessage;
@@ -8,6 +8,7 @@ use tidewave_core::ws::acp::*;
 use tidewave_core::ws::connection::unit_testable_ws_handler;
 use tidewave_core::ws::WsState;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::sync::mpsc;
 
 // ============================================================================
 // Tests
@@ -389,6 +390,32 @@ async fn test_concurrent_channel_joins() {
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn test_process_lifecycle_lock_is_not_removed_after_join() {
+    let (starter, _test_stdin, _test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+    assert!(state.process_lifecycle_locks.contains_key("test_acp:."));
+}
+
 /// Test that concurrent init requests from two clients only send one init to the process
 #[tokio::test]
 async fn test_concurrent_init_requests() {
@@ -511,9 +538,994 @@ async fn test_concurrent_init_requests() {
     );
 }
 
+#[tokio::test]
+async fn test_session_resume_rejects_active_session() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state);
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_1",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let new_req = read_json_line(&mut test_stdout).await;
+    assert_eq!(new_req["method"], "session/new");
+    let new_proxy_id = new_req["id"].clone();
+    let new_response = json!({
+        "jsonrpc": "2.0",
+        "id": new_proxy_id,
+        "result": {
+            "sessionId": "sess_active"
+        }
+    });
+    write_json_line(&mut test_stdin, &new_response).await;
+    let _ = recv_phoenix_msg(&mut out_rx1).await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": "sess_active"
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected session/resume to be rejected");
+    let response = msg.payload.as_json();
+    assert_eq!(response["id"], "resume_1");
+    assert_eq!(response["error"]["code"], -32003);
+    assert_eq!(
+        response["error"]["message"],
+        "Session already has an active connection"
+    );
+}
+
+#[tokio::test]
+async fn test_session_resume_rejects_in_flight_resume_for_inactive_session() {
+    let (starter, _test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_inactive".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume1 = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume1)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let first_resume = read_json_line(&mut test_stdout).await;
+    assert_eq!(first_resume["method"], "session/resume");
+
+    let resume2 = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_2",
+        "method": "session/resume",
+        "params": {
+            "sessionId": "sess_inactive"
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", resume2)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected second session/resume to be rejected");
+    let response = msg.payload.as_json();
+    assert_eq!(response["id"], "resume_2");
+    assert_eq!(response["error"]["code"], -32003);
+    assert_eq!(
+        response["error"]["message"],
+        "Session already has an active connection"
+    );
+}
+
+#[tokio::test]
+async fn test_late_resume_response_routes_to_reconnected_session() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_late_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    drop(in_tx1);
+    assert!(
+        wait_for_session_channel(&process_state, &session_id, None).await,
+        "Expected disconnect cleanup to unmap the session before reconnect"
+    );
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let load = json!({
+        "jsonrpc": "2.0",
+        "id": "load_1",
+        "method": "_tidewave.ai/session/load",
+        "params": {
+            "sessionId": "sess_late_resume",
+            "latestId": ""
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", load)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected Tidewave session/load response");
+    let response = msg.payload.as_json();
+    assert_eq!(response["id"], "load_1");
+    assert_eq!(response["result"]["cancelled"], false);
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "result": {
+                "sessionId": "sess_late_resume"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected late session/resume response on reconnected channel");
+    let response = msg.payload.as_json();
+    assert_eq!(response["id"], "resume_1");
+    assert_eq!(response["result"]["sessionId"], "sess_late_resume");
+}
+
+#[tokio::test]
+async fn test_late_successful_resume_response_does_not_claim_disconnected_channel() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_late_successful_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    drop(in_tx1);
+    assert!(
+        wait_for_session_channel(&process_state, &session_id, None).await,
+        "Expected disconnect cleanup to unmap the session before agent response"
+    );
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "result": {
+                "sessionId": "sess_late_successful_resume"
+            }
+        }),
+    )
+    .await;
+
+    assert!(
+        wait_for_inactive_session(&process_state, &session_id).await,
+        "Late session/resume success should not re-own the disconnected channel"
+    );
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let load = json!({
+        "jsonrpc": "2.0",
+        "id": "load_1",
+        "method": "_tidewave.ai/session/load",
+        "params": {
+            "sessionId": "sess_late_successful_resume",
+            "latestId": ""
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", load)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let mut saw_resume_response = false;
+    let mut saw_load_response = false;
+
+    for _ in 0..2 {
+        let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+            .await
+            .expect("Expected buffered resume and Tidewave session/load responses");
+        let response = msg.payload.as_json();
+
+        if response["id"] == "resume_1" {
+            saw_resume_response = true;
+            assert_eq!(
+                response["result"]["sessionId"],
+                "sess_late_successful_resume"
+            );
+        }
+
+        if response["id"] == "load_1" {
+            saw_load_response = true;
+            assert_eq!(response["result"]["cancelled"], false);
+        }
+    }
+
+    assert!(
+        saw_resume_response,
+        "Expected buffered session/resume response"
+    );
+    assert!(saw_load_response, "Expected Tidewave session/load response");
+}
+
+#[tokio::test]
+async fn test_late_failed_resume_response_does_not_remove_reconnected_session() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_failed_late_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    drop(in_tx1);
+    assert!(
+        wait_for_session_channel(&process_state, &session_id, None).await,
+        "Expected disconnect cleanup to unmap the session before reconnect"
+    );
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let load = json!({
+        "jsonrpc": "2.0",
+        "id": "load_1",
+        "method": "_tidewave.ai/session/load",
+        "params": {
+            "sessionId": "sess_failed_late_resume",
+            "latestId": ""
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", load)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected Tidewave session/load response");
+    assert_eq!(msg.payload.as_json()["id"], "load_1");
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "error": {
+                "code": -32002,
+                "message": "Session not found"
+            }
+        }),
+    )
+    .await;
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_failed_late_resume",
+                "update": "still_connected"
+            }
+        }),
+    )
+    .await;
+
+    let mut received_update = false;
+    for _ in 0..2 {
+        let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+            .await
+            .expect("Expected JSON-RPC message on reconnected channel");
+        if msg.payload.as_json()["params"]["update"] == "still_connected" {
+            received_update = true;
+            break;
+        }
+    }
+
+    assert!(
+        received_update,
+        "Expected reconnected session to keep receiving updates"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_resume_keeps_existing_inactive_session() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_failed_existing_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "error": {
+                "code": -32000,
+                "message": "Temporary resume failure"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx, "jsonrpc", 250)
+        .await
+        .expect("Expected failed resume response");
+    assert_eq!(msg.payload.as_json()["id"], "resume_1");
+    assert_eq!(
+        msg.payload.as_json()["error"]["message"],
+        "Temporary resume failure"
+    );
+
+    assert!(
+        wait_for_inactive_session(&process_state, "sess_failed_existing_resume").await,
+        "Failed resume should release, not delete, an existing inactive session"
+    );
+}
+
+#[tokio::test]
+async fn test_session_close_response_removes_lifecycle_lock() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_close_lock_cleanup".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+    let _lock = process_state.session_lifecycle_lock(&session_id).await;
+
+    let close = json!({
+        "jsonrpc": "2.0",
+        "id": "close_1",
+        "method": "session/close",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", close)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let close_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(close_request["method"], "session/close");
+    let close_proxy_id = close_request["id"].clone();
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": close_proxy_id,
+            "result": {}
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx, "jsonrpc", 250)
+        .await
+        .expect("Expected session/close response");
+    assert_eq!(msg.payload.as_json()["id"], "close_1");
+    assert!(process_state
+        .session_state("sess_close_lock_cleanup")
+        .await
+        .is_none());
+    assert!(
+        !process_state
+            .session_lifecycle_locks
+            .read()
+            .await
+            .contains_key("sess_close_lock_cleanup"),
+        "Removing a session should also remove its lifecycle lock"
+    );
+}
+
+#[tokio::test]
+async fn test_late_session_new_response_does_not_claim_disconnected_channel() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_1",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+
+    let new_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(new_request["method"], "session/new");
+    let new_proxy_id = new_request["id"].clone();
+
+    drop(in_tx1);
+    assert!(
+        wait_for_event(&mut out_rx1, "jsonrpc", 100).await.is_none(),
+        "Disconnected client should not receive the late session/new response"
+    );
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_proxy_id,
+            "result": {
+                "sessionId": "sess_late_new"
+            }
+        }),
+    )
+    .await;
+
+    assert!(
+        wait_for_inactive_session(&process_state, "sess_late_new").await,
+        "Late session/new response should keep the session available for reconnect"
+    );
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+
+    let load = json!({
+        "jsonrpc": "2.0",
+        "id": "load_1",
+        "method": "_tidewave.ai/session/load",
+        "params": {
+            "sessionId": "sess_late_new",
+            "latestId": ""
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", load)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+
+    let mut load_response = None;
+    for _ in 0..2 {
+        let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+            .await
+            .expect("Expected JSON-RPC message after session/load");
+        if msg.payload.as_json()["id"] == "load_1" {
+            load_response = Some(msg);
+            break;
+        }
+    }
+
+    let load_response = load_response.expect("Expected Tidewave session/load response");
+    let response = load_response.payload.as_json();
+    assert_eq!(response["id"], "load_1");
+    assert_eq!(response["result"]["cancelled"], false);
+}
+
+#[tokio::test]
+async fn test_same_session_id_routes_within_each_process() {
+    let (starter, mut processes_rx) = create_multi_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state);
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts_with_command("agent_a"))
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+    let mut process_a = processes_rx.recv().await.expect("Expected agent_a process");
+    assert_eq!(process_a.command, "agent_a");
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts_with_command("agent_b"))
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+    let mut process_b = processes_rx.recv().await.expect("Expected agent_b process");
+    assert_eq!(process_b.command, "agent_b");
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_a",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+    let new_req = read_json_line(&mut process_a.stdout).await;
+    let new_proxy_id = new_req["id"].clone();
+    write_json_line(
+        &mut process_a.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_proxy_id,
+            "result": {
+                "sessionId": "sess_shared"
+            }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(&mut out_rx1).await;
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_b",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+    let new_req = read_json_line(&mut process_b.stdout).await;
+    let new_proxy_id = new_req["id"].clone();
+    write_json_line(
+        &mut process_b.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_proxy_id,
+            "result": {
+                "sessionId": "sess_shared"
+            }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(&mut out_rx2).await;
+
+    write_json_line(
+        &mut process_a.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_shared",
+                "update": "from_a"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx1, "jsonrpc", 250)
+        .await
+        .expect("Expected client 1 to receive agent_a update");
+    assert_eq!(msg.payload.as_json()["params"]["update"], "from_a");
+    assert!(
+        wait_for_event(&mut out_rx2, "jsonrpc", 100).await.is_none(),
+        "client 2 should not receive agent_a update"
+    );
+
+    write_json_line(
+        &mut process_b.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_shared",
+                "update": "from_b"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected client 2 to receive agent_b update");
+    assert_eq!(msg.payload.as_json()["params"]["update"], "from_b");
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
+
+struct FakeProcess {
+    command: String,
+    stdin: DuplexStream,
+    stdout: DuplexStream,
+}
 
 /// Creates a fake process starter that returns duplex stream pairs
 fn create_fake_process_starter() -> (
@@ -574,6 +1586,39 @@ fn create_fake_process_starter() -> (
     (starter, test_stdin, test_stdout, started_rx)
 }
 
+fn create_multi_process_starter() -> (ProcessStarterFn, mpsc::UnboundedReceiver<FakeProcess>) {
+    let (process_tx, process_rx) = mpsc::unbounded_channel();
+
+    let starter: ProcessStarterFn = Arc::new(move |spawn_opts: TidewaveSpawnOptions| {
+        let process_tx = process_tx.clone();
+
+        Box::pin(async move {
+            let (process_stdin, test_stdin) = tokio::io::duplex(8192);
+            let (test_stdout, process_stdout) = tokio::io::duplex(8192);
+
+            process_tx
+                .send(FakeProcess {
+                    command: spawn_opts.command,
+                    stdin: test_stdin,
+                    stdout: test_stdout,
+                })
+                .expect("Failed to send fake process handles");
+
+            let (stderr_write, stderr_read) = tokio::io::duplex(1024);
+            drop(stderr_write);
+
+            Ok::<ProcessIo, anyhow::Error>((
+                Box::new(process_stdout),
+                Box::new(BufReader::new(process_stdin)),
+                Box::new(BufReader::new(stderr_read)),
+                None,
+            ))
+        })
+    });
+
+    (starter, process_rx)
+}
+
 /// Reads a JSON line from a stream (expects newline-terminated JSON)
 async fn read_json_line(stream: &mut DuplexStream) -> Value {
     let mut reader = BufReader::new(stream);
@@ -598,10 +1643,52 @@ async fn write_json_line(stream: &mut DuplexStream, value: &Value) {
     stream.flush().await.expect("Failed to flush");
 }
 
+async fn wait_for_session_channel(
+    process_state: &ProcessState,
+    session_id: &str,
+    expected: Option<ChannelId>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+
+    loop {
+        if process_state.session_channel(session_id).await == expected {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_inactive_session(process_state: &ProcessState, session_id: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+
+    loop {
+        if process_state.session_state(session_id).await.is_some()
+            && process_state.session_channel(session_id).await.is_none()
+        {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Helper to create spawn options for channel join
 fn spawn_opts() -> Value {
+    spawn_opts_with_command("test_acp")
+}
+
+fn spawn_opts_with_command(command: &str) -> Value {
     json!({
-        "command": "test_acp",
+        "command": command,
         "env": {},
         "cwd": "."
     })
