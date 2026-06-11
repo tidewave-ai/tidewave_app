@@ -313,13 +313,9 @@ pub struct ProcessState {
     /// Broadcast channel used to notify all subscribed init loops about process exit.
     pub exit_broadcast: broadcast::Sender<AgentExitEvent>,
 
-    // ID mapping for multiplexed connections
+    // In-flight requests keyed by proxy ID for multiplexed connections.
     pub next_proxy_id: AtomicU64,
-    pub client_to_proxy_ids: DashMap<(ChannelId, Value), Value>,
-    pub proxy_to_client_ids: DashMap<Value, (ChannelId, Value)>,
-    /// In case the client disconnected, the original client for a request ID
-    /// does not exist any more, so we also store the a mapping to the session ID.
-    pub proxy_to_session_ids: DashMap<Value, (SessionId, Value)>,
+    pub inflight_requests: DashMap<Value, InflightRequest>,
 
     /// Sessions owned by this ACP process.
     pub sessions: RwLock<HashMap<SessionId, SessionEntry>>,
@@ -338,9 +334,8 @@ pub struct ProcessState {
     pub stdout_buffer: RwLock<Vec<String>>,
     pub stderr_buffer: RwLock<Vec<String>>,
 
-    // Requests that need side effects when their response arrives.
+    // Request ID for the initialize request whose response should be cached.
     pub init_request_id: RwLock<Option<Value>>,
-    pub pending_requests: DashMap<Value, PendingRequest>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
@@ -370,6 +365,14 @@ pub struct SessionEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct InflightRequest {
+    pub channel_id: ChannelId,
+    pub client_id: Value,
+    pub session_id: Option<SessionId>,
+    pub pending: Option<PendingRequest>,
+}
+
+#[derive(Debug, Clone)]
 pub enum PendingRequest {
     SessionNew,
     SessionLoad { session_id: SessionId },
@@ -395,9 +398,7 @@ impl ProcessState {
             exit_tx: RwLock::new(None),
             exit_broadcast,
             next_proxy_id: AtomicU64::new(1),
-            client_to_proxy_ids: DashMap::new(),
-            proxy_to_client_ids: DashMap::new(),
-            proxy_to_session_ids: DashMap::new(),
+            inflight_requests: DashMap::new(),
             sessions: RwLock::new(HashMap::new()),
             session_lifecycle_locks: RwLock::new(HashMap::new()),
             cached_init_response: RwLock::new(None),
@@ -406,7 +407,6 @@ impl ProcessState {
             stdout_buffer: RwLock::new(Vec::new()),
             stderr_buffer: RwLock::new(Vec::new()),
             init_request_id: RwLock::new(None),
-            pending_requests: DashMap::new(),
             connect_epoch: AtomicU64::new(0),
             supports_resuming: RwLock::new(None),
             supports_session_close: RwLock::new(None),
@@ -434,32 +434,31 @@ impl ProcessState {
         channel_id: ChannelId,
         client_id: Value,
         session_id: Option<SessionId>,
+        pending: Option<PendingRequest>,
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
-        self.client_to_proxy_ids
-            .insert((channel_id, client_id.clone()), proxy_id.clone());
-        self.proxy_to_client_ids
-            .insert(proxy_id.clone(), (channel_id, client_id.clone()));
-
-        // If this request has a session_id, also store the session mapping
-        if let Some(session_id) = session_id {
-            self.proxy_to_session_ids
-                .insert(proxy_id.clone(), (session_id, client_id));
-        }
+        self.inflight_requests.insert(
+            proxy_id.clone(),
+            InflightRequest {
+                channel_id,
+                client_id,
+                session_id,
+                pending,
+            },
+        );
         proxy_id
     }
 
-    pub fn resolve_proxy_id_to_client(&self, proxy_id: &Value) -> Option<(ChannelId, Value)> {
-        self.proxy_to_client_ids
+    pub fn inflight_request(&self, proxy_id: &Value) -> Option<InflightRequest> {
+        self.inflight_requests
             .get(proxy_id)
             .map(|entry| entry.value().clone())
     }
 
-    pub fn cleanup_id_mappings(&self, proxy_id: &Value) {
-        if let Some((_, (channel_id, client_id))) = self.proxy_to_client_ids.remove(proxy_id) {
-            self.client_to_proxy_ids.remove(&(channel_id, client_id));
-        }
-        self.proxy_to_session_ids.remove(proxy_id);
+    pub fn remove_inflight_request(&self, proxy_id: &Value) -> Option<InflightRequest> {
+        self.inflight_requests
+            .remove(proxy_id)
+            .map(|(_, request)| request)
     }
 
     pub async fn session_state(&self, session_id: &str) -> Option<Arc<SessionState>> {
@@ -1094,7 +1093,7 @@ async fn handle_initialize_request(
         // We won the race — send the init request to the process
         let session_id = extract_session_id_from_request(request);
         let proxy_id =
-            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id);
+            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id, None);
         let mut proxy_request = request.clone();
         proxy_request.id = proxy_id.clone();
 
@@ -1330,52 +1329,30 @@ async fn handle_regular_request(
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
 
-    let proxy_id =
-        process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id.clone());
-    let mut proxy_request = request.clone();
-    proxy_request.id = proxy_id.clone();
-
-    match request.method.as_str() {
+    let pending = match request.method.as_str() {
         // We intercept new sessions to map the sessionId to the channel
-        "session/new" => {
-            process_state
-                .pending_requests
-                .insert(proxy_id.clone(), PendingRequest::SessionNew);
-        }
+        "session/new" => Some(PendingRequest::SessionNew),
         // We intercept load requests since we need to handle the unsuccessful case
         // and clear the session mapping.
-        "session/load" => {
-            if let Some(session_id) = session_id {
-                process_state
-                    .pending_requests
-                    .insert(proxy_id.clone(), PendingRequest::SessionLoad { session_id });
-            }
-        }
+        "session/load" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionLoad { session_id }),
         // We intercept resume / fork sessions to map the sessionId to the channel
-        "session/resume" => {
-            if let Some(session_id) = session_id {
-                process_state.pending_requests.insert(
-                    proxy_id.clone(),
-                    PendingRequest::SessionResume { session_id },
-                );
-            }
-        }
-        "session/fork" => {
-            process_state
-                .pending_requests
-                .insert(proxy_id.clone(), PendingRequest::SessionFork);
-        }
+        "session/resume" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionResume { session_id }),
+        "session/fork" => Some(PendingRequest::SessionFork),
         // We intercept session/close to remove session state on response.
-        "session/close" => {
-            if let Some(session_id) = session_id {
-                process_state.pending_requests.insert(
-                    proxy_id.clone(),
-                    PendingRequest::SessionClose { session_id },
-                );
-            }
-        }
-        _ => (),
-    }
+        "session/close" => session_id
+            .clone()
+            .map(|session_id| PendingRequest::SessionClose { session_id }),
+        _ => None,
+    };
+
+    let proxy_id =
+        process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id, pending);
+    let mut proxy_request = request.clone();
+    proxy_request.id = proxy_id.clone();
 
     // Forward to process
     if let Err(e) = process_state
@@ -1763,42 +1740,41 @@ async fn handle_process_response(
     state: &AcpChannelState,
     response: &JsonRpcResponse,
 ) -> Result<()> {
-    // Handle responses - map proxy ID back to client ID
-    if let Some((channel_id, client_id)) = process_state.resolve_proxy_id_to_client(&response.id) {
+    if let Some(inflight_request) = process_state.remove_inflight_request(&response.id) {
         // Create response with original client ID
         let mut client_response = response.clone();
-        client_response.id = client_id;
+        client_response.id = inflight_request.client_id.clone();
 
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        let pending_request = process_state
-            .pending_requests
-            .remove(&response.id)
-            .map(|(_, pending_request)| pending_request);
         maybe_handle_pending_request(
             process_state,
             state,
-            channel_id,
-            pending_request.clone(),
+            inflight_request.channel_id,
+            inflight_request.pending.clone(),
             &client_response,
         )
         .await?;
 
-        if let Some(sender) = state.channel_senders.get(&channel_id) {
+        if let Some(sender) = state.channel_senders.get(&inflight_request.channel_id) {
             push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
         } else {
-            handle_disconnected_client_response(process_state, state, response).await;
+            handle_disconnected_client_response(
+                process_state,
+                state,
+                client_response,
+                inflight_request.session_id,
+            )
+            .await;
         }
 
         // Remove session state after forwarding a session/close response.
-        if let Some(PendingRequest::SessionClose { session_id }) = pending_request {
+        if let Some(PendingRequest::SessionClose { session_id }) = inflight_request.pending {
             process_state.remove_session(&session_id).await;
             info!(
                 "Removed session {} after session/close response",
                 session_id
             );
         }
-
-        process_state.cleanup_id_mappings(&response.id);
     }
 
     Ok(())
@@ -1914,19 +1890,15 @@ async fn map_session_id_to_channel(
 async fn handle_disconnected_client_response(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
-    response: &JsonRpcResponse,
+    client_response: JsonRpcResponse,
+    session_id: Option<SessionId>,
 ) {
-    debug!("Missing original channel for request {}", response.id);
+    debug!(
+        "Missing original channel for request {}",
+        client_response.id
+    );
     // Fallback: Client disconnected, try to find session and forward to new channel
-    let session_info = process_state
-        .proxy_to_session_ids
-        .get(&response.id)
-        .map(|entry| entry.value().clone());
-
-    if let Some((session_id, client_id)) = session_info {
-        let mut client_response = response.clone();
-        client_response.id = client_id.clone();
-
+    if let Some(session_id) = session_id {
         let current_channel_id = process_state.session_channel(&session_id).await;
 
         if let Some(current_channel_id) = current_channel_id {
@@ -1941,7 +1913,7 @@ async fn handle_disconnected_client_response(
                 let _ = session_state
                     .add_to_buffer(
                         JsonRpcMessage::Response(client_response.clone()),
-                        client_id.to_string(),
+                        client_response.id.to_string(),
                     )
                     .await;
 
@@ -1954,9 +1926,6 @@ async fn handle_disconnected_client_response(
                 }
             }
         }
-
-        // Clean up the session mapping
-        process_state.proxy_to_session_ids.remove(&response.id);
     }
 }
 
@@ -2495,14 +2464,16 @@ mod tests {
         let ws_id = Uuid::new_v4();
         let client_id = Value::String("client_1".to_string());
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None);
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id.clone(), None, None);
 
         // Should be able to resolve back
-        let resolved = process.resolve_proxy_id_to_client(&proxy_id);
-        assert!(resolved.is_some());
-        let (resolved_ws, resolved_client) = resolved.unwrap();
-        assert_eq!(resolved_ws, ws_id);
-        assert_eq!(resolved_client, client_id);
+        let inflight_request = process.inflight_request(&proxy_id);
+        assert!(inflight_request.is_some());
+        let inflight_request = inflight_request.unwrap();
+        assert_eq!(inflight_request.channel_id, ws_id);
+        assert_eq!(inflight_request.client_id, client_id);
+        assert_eq!(inflight_request.session_id, None);
+        assert!(inflight_request.pending.is_none());
     }
 
     #[tokio::test]
@@ -2512,15 +2483,18 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id =
-            process.map_client_id_to_proxy(ws_id, client_id.clone(), Some(session_id.clone()));
+        let proxy_id = process.map_client_id_to_proxy(
+            ws_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            None,
+        );
 
         // Should have session mapping
-        let session_mapping = process.proxy_to_session_ids.get(&proxy_id);
-        assert!(session_mapping.is_some());
-        let (mapped_session, mapped_client) = session_mapping.unwrap().clone();
-        assert_eq!(mapped_session, session_id);
-        assert_eq!(mapped_client, client_id);
+        let inflight_request = process.inflight_request(&proxy_id).unwrap();
+        assert_eq!(inflight_request.channel_id, ws_id);
+        assert_eq!(inflight_request.client_id, client_id);
+        assert_eq!(inflight_request.session_id, Some(session_id));
     }
 
     #[tokio::test]
@@ -2530,18 +2504,16 @@ mod tests {
         let client_id = Value::String("client_1".to_string());
         let session_id = "sess_123".to_string();
 
-        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id));
+        let proxy_id = process.map_client_id_to_proxy(ws_id, client_id, Some(session_id), None);
 
-        // Verify mappings exist
-        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_some());
-        assert!(process.proxy_to_session_ids.contains_key(&proxy_id));
+        // Verify mapping exists
+        assert!(process.inflight_request(&proxy_id).is_some());
 
         // Cleanup
-        process.cleanup_id_mappings(&proxy_id);
+        process.remove_inflight_request(&proxy_id);
 
-        // Verify mappings are removed
-        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
-        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+        // Verify mapping is removed
+        assert!(process.inflight_request(&proxy_id).is_none());
     }
 
     #[tokio::test]
@@ -2561,6 +2533,7 @@ mod tests {
             original_channel_id,
             client_id.clone(),
             Some(session_id.clone()),
+            None,
         );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2583,7 +2556,9 @@ mod tests {
             error: None,
         };
         let response_task = tokio::spawn(async move {
-            handle_disconnected_client_response(&process_clone, &state_clone, &response).await;
+            handle_process_response(&process_clone, &state_clone, &response)
+                .await
+                .expect("response should be handled");
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -2610,13 +2585,13 @@ mod tests {
         let session_id = "sess_failed_load".to_string();
         let channel_id = Uuid::new_v4();
         let client_id = Value::String("session/load!sess_failed_load!!load_1".to_string());
-        let proxy_id =
-            process.map_client_id_to_proxy(channel_id, client_id.clone(), Some(session_id.clone()));
-        process.pending_requests.insert(
-            proxy_id.clone(),
-            PendingRequest::SessionLoad {
+        let proxy_id = process.map_client_id_to_proxy(
+            channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+            Some(PendingRequest::SessionLoad {
                 session_id: session_id.clone(),
-            },
+            }),
         );
 
         let session = Arc::new(SessionState::new(process.key.clone()));
@@ -2649,8 +2624,7 @@ mod tests {
             .await
             .expect("Failed session/load response should be handled");
 
-        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
-        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+        assert!(process.inflight_request(&proxy_id).is_none());
         assert!(!process.sessions.read().await.contains_key(&session_id));
 
         let sent = rx.recv().await.expect("Expected response to be forwarded");
@@ -2697,22 +2671,20 @@ mod tests {
         let client_id1 = Value::String("1".to_string());
         let client_id2 = Value::String("1".to_string());
 
-        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None);
-        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None);
+        let proxy_id1 = process.map_client_id_to_proxy(ws_id1, client_id1.clone(), None, None);
+        let proxy_id2 = process.map_client_id_to_proxy(ws_id2, client_id2.clone(), None, None);
 
         // Should have different proxy IDs
         assert_ne!(proxy_id1, proxy_id2);
 
         // Both should resolve correctly
-        let (resolved_ws1, resolved_client1) =
-            process.resolve_proxy_id_to_client(&proxy_id1).unwrap();
-        let (resolved_ws2, resolved_client2) =
-            process.resolve_proxy_id_to_client(&proxy_id2).unwrap();
+        let resolved1 = process.inflight_request(&proxy_id1).unwrap();
+        let resolved2 = process.inflight_request(&proxy_id2).unwrap();
 
-        assert_eq!(resolved_ws1, ws_id1);
-        assert_eq!(resolved_client1, client_id1);
-        assert_eq!(resolved_ws2, ws_id2);
-        assert_eq!(resolved_client2, client_id2);
+        assert_eq!(resolved1.channel_id, ws_id1);
+        assert_eq!(resolved1.client_id, client_id1);
+        assert_eq!(resolved2.channel_id, ws_id2);
+        assert_eq!(resolved2.client_id, client_id2);
     }
 
     // ============================================================================
