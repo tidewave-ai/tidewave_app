@@ -1712,13 +1712,6 @@ async fn maybe_handle_session_load_resume(
             info!("Failed to load session, removing mapping! {}", session_id);
             state.sessions.remove(&session_id);
             state.session_to_channel.remove(&session_id);
-            if let Some(sender) = state.channel_senders.get(&channel_id) {
-                push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response.clone()));
-            }
-            return Err(anyhow!(
-                "Failed to load session, removing mapping! {}",
-                session_id
-            ));
         } else {
             map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
         }
@@ -2463,6 +2456,62 @@ mod tests {
         let payload = sent.payload.as_json();
         assert_eq!(payload["id"], client_id);
         assert_eq!(payload["result"]["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn test_failed_session_load_cleans_proxy_id_mappings() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_failed_load".to_string();
+        let channel_id = Uuid::new_v4();
+        let client_id = Value::String("session/load!sess_failed_load!!load_1".to_string());
+        let proxy_id =
+            process.map_client_id_to_proxy(channel_id, client_id.clone(), Some(session_id.clone()));
+        process
+            .load_request_ids
+            .insert(proxy_id.clone(), session_id.clone());
+
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        state.sessions.insert(session_id.clone(), session);
+        state
+            .session_to_channel
+            .insert(session_id.clone(), channel_id);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.channel_senders.insert(
+            channel_id,
+            ChannelSender {
+                tx,
+                topic: "acp:test".to_string(),
+                join_ref: Some("j1".to_string()),
+            },
+        );
+
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32002,
+                message: "Session not found".to_string(),
+                data: None,
+            }),
+        };
+
+        handle_process_response(&process, &state, &response)
+            .await
+            .expect("Failed session/load response should be handled");
+
+        assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
+        assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+        assert!(!state.sessions.contains_key(&session_id));
+        assert!(!state.session_to_channel.contains_key(&session_id));
+
+        let sent = rx.recv().await.expect("Expected response to be forwarded");
+        assert_eq!(sent.event, "jsonrpc");
+        let payload = sent.payload.as_json();
+        assert_eq!(payload["id"], client_id);
+        assert_eq!(payload["error"]["message"], "Session not found");
     }
 
     #[tokio::test]
