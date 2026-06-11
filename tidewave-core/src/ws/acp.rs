@@ -838,84 +838,12 @@ pub async fn init(
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
         for (session_id, counter) in sessions_for_channel {
-            // Check if session is still unmapped (not reconnected)
-            if process_state_clone.has_session_channel(&session_id).await {
-                debug!("Skipping session/cancel for {} (reconnected)", session_id);
-                continue;
-            }
-
-            let Some(session_state) = process_state_clone.session_state(&session_id).await else {
-                continue;
-            };
-
-            // Check if cancel_counter matches (session hasn't been reloaded)
-            if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
-                debug!(
-                    "Skipping session/cancel for {} because counter does not match!",
-                    session_id
-                );
-                continue;
-            }
-
-            // Acquire session lock to prevent races between stop and reconnect
-            let lock = process_state_clone
-                .session_lifecycle_lock(&session_id)
-                .await;
-            let _guard = lock.lock().await;
-
-            // Session is still unmapped
-            // Check if agent supports session/close
-            let supports_stop = process_state_clone
-                .supports_session_close
-                .read()
-                .await
-                .unwrap_or(false);
-
-            if supports_stop {
-                // Send session/close as a request (no proxy ID mapping — the
-                // response will be silently ignored since there is no client).
-                let proxy_id = process_state_clone.generate_proxy_id();
-                let stop_request = JsonRpcRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: proxy_id,
-                    method: "session/close".to_string(),
-                    params: Some(json!({
-                        "sessionId": session_id
-                    })),
-                };
-
-                if let Err(e) = process_state_clone
-                    .send_to_process(JsonRpcMessage::Request(stop_request))
-                    .await
-                {
-                    error!("Failed to send session/close for {}: {}", session_id, e);
-                } else {
-                    debug!("Sent session/close for unmapped session: {}", session_id);
-                }
-
-                // Remove session state entirely — session is permanently gone
-                process_state_clone.remove_session(&session_id).await;
-            } else {
-                // Mark session as cancelled (keep state for potential reconnect)
-                session_state.cancelled.store(true, Ordering::SeqCst);
-
-                let cancel_notification = JsonRpcNotification {
-                    jsonrpc: "2.0".to_string(),
-                    method: "session/cancel".to_string(),
-                    params: Some(json!({
-                        "sessionId": session_id
-                    })),
-                };
-
-                if let Err(e) = process_state_clone
-                    .send_to_process(JsonRpcMessage::Notification(cancel_notification))
-                    .await
-                {
-                    error!("Failed to send session/cancel for {}: {}", session_id, e);
-                } else {
-                    debug!("Sent session/cancel for unmapped session: {}", session_id);
-                }
-            }
+            stop_unmapped_session_if_still_disconnected(
+                process_state_clone.clone(),
+                session_id,
+                counter,
+            )
+            .await;
         }
     });
 
@@ -975,6 +903,96 @@ pub async fn init(
     }
 
     result
+}
+
+async fn stop_unmapped_session_if_still_disconnected(
+    process_state: Arc<ProcessState>,
+    session_id: SessionId,
+    counter: u64,
+) {
+    // Check if session is still unmapped (not reconnected)
+    if process_state.has_session_channel(&session_id).await {
+        debug!("Skipping session/cancel for {} (reconnected)", session_id);
+        return;
+    }
+
+    let Some(session_state) = process_state.session_state(&session_id).await else {
+        return;
+    };
+
+    // Check if cancel_counter matches (session hasn't been reloaded)
+    if session_state.cancel_counter.load(Ordering::Relaxed) != counter {
+        debug!(
+            "Skipping session/cancel for {} because counter does not match!",
+            session_id
+        );
+        return;
+    }
+
+    // Acquire session lock to prevent races between stop and reconnect
+    let lock = process_state.session_lifecycle_lock(&session_id).await;
+    let _guard = lock.lock().await;
+
+    if process_state.has_session_channel(&session_id).await {
+        debug!(
+            "Skipping session/cancel for {} (reconnected after lifecycle lock)",
+            session_id
+        );
+        return;
+    }
+
+    // Check if agent supports session/close
+    let supports_stop = process_state
+        .supports_session_close
+        .read()
+        .await
+        .unwrap_or(false);
+
+    if supports_stop {
+        // Send session/close as a request (no proxy ID mapping — the
+        // response will be silently ignored since there is no client).
+        let proxy_id = process_state.generate_proxy_id();
+        let stop_request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id,
+            method: "session/close".to_string(),
+            params: Some(json!({
+                "sessionId": session_id
+            })),
+        };
+
+        if let Err(e) = process_state
+            .send_to_process(JsonRpcMessage::Request(stop_request))
+            .await
+        {
+            error!("Failed to send session/close for {}: {}", session_id, e);
+        } else {
+            debug!("Sent session/close for unmapped session: {}", session_id);
+        }
+
+        // Remove session state entirely — session is permanently gone
+        process_state.remove_session(&session_id).await;
+    } else {
+        // Mark session as cancelled (keep state for potential reconnect)
+        session_state.cancelled.store(true, Ordering::SeqCst);
+
+        let cancel_notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/cancel".to_string(),
+            params: Some(json!({
+                "sessionId": session_id
+            })),
+        };
+
+        if let Err(e) = process_state
+            .send_to_process(JsonRpcMessage::Notification(cancel_notification))
+            .await
+        {
+            error!("Failed to send session/cancel for {}: {}", session_id, e);
+        } else {
+            debug!("Sent session/cancel for unmapped session: {}", session_id);
+        }
+    }
 }
 
 // ============================================================================
@@ -2639,6 +2657,34 @@ mod tests {
         let payload = sent.payload.as_json();
         assert_eq!(payload["id"], client_id);
         assert_eq!(payload["error"]["message"], "Session not found");
+    }
+
+    #[tokio::test]
+    async fn test_delayed_cancel_skips_session_that_reconnects_while_waiting_for_lock() {
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_reconnected".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        process
+            .insert_session(session_id.clone(), session.clone(), None)
+            .await;
+
+        let lock = process.session_lifecycle_lock(&session_id).await;
+        let guard = lock.lock().await;
+        let process_clone = process.clone();
+        let session_id_clone = session_id.clone();
+        let stop_task = tokio::spawn(async move {
+            stop_unmapped_session_if_still_disconnected(process_clone, session_id_clone, 0).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        process
+            .map_session_channel(&session_id, Uuid::new_v4())
+            .await;
+        drop(guard);
+
+        stop_task.await.expect("stop task panicked");
+        assert!(!session.cancelled.load(Ordering::SeqCst));
+        assert!(process.session_state(&session_id).await.is_some());
     }
 
     #[tokio::test]
