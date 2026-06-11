@@ -8,6 +8,7 @@ use tidewave_core::ws::acp::*;
 use tidewave_core::ws::connection::unit_testable_ws_handler;
 use tidewave_core::ws::WsState;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::sync::mpsc;
 
 // ============================================================================
 // Tests
@@ -601,9 +602,152 @@ async fn test_session_resume_rejects_active_session() {
     );
 }
 
+#[tokio::test]
+async fn test_same_session_id_routes_within_each_process() {
+    let (starter, mut processes_rx) = create_multi_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let ws_state1 = WsState::new().with_acp_state(state.clone());
+    let ws_state2 = WsState::new().with_acp_state(state);
+
+    let (out_tx1, mut out_rx1, in_tx1, in_rx1) = create_fake_phoenix_socket();
+    let (out_tx2, mut out_rx2, in_tx2, in_rx2) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx1, in_rx1, ws_state1, uuid::Uuid::new_v4()).await;
+    });
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx2, in_rx2, ws_state2, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg1 = PhxMessage::new("acp:test1", "phx_join", spawn_opts_with_command("agent_a"))
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &join_msg1);
+    let reply1 = recv_phoenix_msg(&mut out_rx1)
+        .await
+        .expect("Expected join reply for client 1");
+    assert_eq!(reply1.payload.as_json()["status"], "ok");
+    let mut process_a = processes_rx.recv().await.expect("Expected agent_a process");
+    assert_eq!(process_a.command, "agent_a");
+
+    let join_msg2 = PhxMessage::new("acp:test2", "phx_join", spawn_opts_with_command("agent_b"))
+        .with_ref("1")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &join_msg2);
+    let reply2 = recv_phoenix_msg(&mut out_rx2)
+        .await
+        .expect("Expected join reply for client 2");
+    assert_eq!(reply2.payload.as_json()["status"], "ok");
+    let mut process_b = processes_rx.recv().await.expect("Expected agent_b process");
+    assert_eq!(process_b.command, "agent_b");
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_a",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test1", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx1, &push_msg);
+    let new_req = read_json_line(&mut process_a.stdout).await;
+    let new_proxy_id = new_req["id"].clone();
+    write_json_line(
+        &mut process_a.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_proxy_id,
+            "result": {
+                "sessionId": "sess_shared"
+            }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(&mut out_rx1).await;
+
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_b",
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp",
+            "mcpServers": []
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test2", "jsonrpc", session_new)
+        .with_ref("2")
+        .with_join_ref("j2");
+    send_phoenix_msg(&in_tx2, &push_msg);
+    let new_req = read_json_line(&mut process_b.stdout).await;
+    let new_proxy_id = new_req["id"].clone();
+    write_json_line(
+        &mut process_b.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_proxy_id,
+            "result": {
+                "sessionId": "sess_shared"
+            }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(&mut out_rx2).await;
+
+    write_json_line(
+        &mut process_a.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_shared",
+                "update": "from_a"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx1, "jsonrpc", 250)
+        .await
+        .expect("Expected client 1 to receive agent_a update");
+    assert_eq!(msg.payload.as_json()["params"]["update"], "from_a");
+    assert!(
+        wait_for_event(&mut out_rx2, "jsonrpc", 100).await.is_none(),
+        "client 2 should not receive agent_a update"
+    );
+
+    write_json_line(
+        &mut process_b.stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_shared",
+                "update": "from_b"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx2, "jsonrpc", 250)
+        .await
+        .expect("Expected client 2 to receive agent_b update");
+    assert_eq!(msg.payload.as_json()["params"]["update"], "from_b");
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
+
+struct FakeProcess {
+    command: String,
+    stdin: DuplexStream,
+    stdout: DuplexStream,
+}
 
 /// Creates a fake process starter that returns duplex stream pairs
 fn create_fake_process_starter() -> (
@@ -664,6 +808,39 @@ fn create_fake_process_starter() -> (
     (starter, test_stdin, test_stdout, started_rx)
 }
 
+fn create_multi_process_starter() -> (ProcessStarterFn, mpsc::UnboundedReceiver<FakeProcess>) {
+    let (process_tx, process_rx) = mpsc::unbounded_channel();
+
+    let starter: ProcessStarterFn = Arc::new(move |spawn_opts: TidewaveSpawnOptions| {
+        let process_tx = process_tx.clone();
+
+        Box::pin(async move {
+            let (process_stdin, test_stdin) = tokio::io::duplex(8192);
+            let (test_stdout, process_stdout) = tokio::io::duplex(8192);
+
+            process_tx
+                .send(FakeProcess {
+                    command: spawn_opts.command,
+                    stdin: test_stdin,
+                    stdout: test_stdout,
+                })
+                .expect("Failed to send fake process handles");
+
+            let (stderr_write, stderr_read) = tokio::io::duplex(1024);
+            drop(stderr_write);
+
+            Ok::<ProcessIo, anyhow::Error>((
+                Box::new(process_stdout),
+                Box::new(BufReader::new(process_stdin)),
+                Box::new(BufReader::new(stderr_read)),
+                None,
+            ))
+        })
+    });
+
+    (starter, process_rx)
+}
+
 /// Reads a JSON line from a stream (expects newline-terminated JSON)
 async fn read_json_line(stream: &mut DuplexStream) -> Value {
     let mut reader = BufReader::new(stream);
@@ -690,8 +867,12 @@ async fn write_json_line(stream: &mut DuplexStream, value: &Value) {
 
 /// Helper to create spawn options for channel join
 fn spawn_opts() -> Value {
+    spawn_opts_with_command("test_acp")
+}
+
+fn spawn_opts_with_command(command: &str) -> Value {
     json!({
-        "command": "test_acp",
+        "command": command,
         "env": {},
         "cwd": "."
     })
