@@ -714,7 +714,6 @@ pub async fn init(
             }
             Err(e) => {
                 drop(guard);
-                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error(format!("failed to start process: {}", e));
             }
@@ -735,7 +734,6 @@ pub async fn init(
             None => {
                 // Process already gone
                 drop(guard);
-                state.process_lifecycle_locks.remove(&process_key);
                 state.channel_senders.remove(&channel_id);
                 return InitResult::Error("process exited before channel init".to_string());
             }
@@ -743,7 +741,6 @@ pub async fn init(
     };
 
     drop(guard);
-    state.process_lifecycle_locks.remove(&process_key);
 
     let process_state = match state.processes.get(&process_key) {
         Some(process) => process.clone(),

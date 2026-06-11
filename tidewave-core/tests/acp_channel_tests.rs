@@ -390,6 +390,32 @@ async fn test_concurrent_channel_joins() {
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn test_process_lifecycle_lock_is_not_removed_after_join() {
+    let (starter, _test_stdin, _test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+    assert!(state.process_lifecycle_locks.contains_key("test_acp:."));
+}
+
 /// Test that concurrent init requests from two clients only send one init to the process
 #[tokio::test]
 async fn test_concurrent_init_requests() {
