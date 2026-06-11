@@ -557,6 +557,24 @@ impl ProcessState {
         self.sessions.write().await.remove(session_id);
     }
 
+    pub async fn remove_session_if_unowned_or_owned_by(
+        &self,
+        session_id: &str,
+        channel_id: ChannelId,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+
+        let should_remove = sessions.get(session_id).is_some_and(|entry| {
+            entry.channel_id.is_none() || entry.channel_id == Some(channel_id)
+        });
+
+        if should_remove {
+            sessions.remove(session_id);
+        }
+
+        should_remove
+    }
+
     pub async fn session_lifecycle_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.session_lifecycle_locks.write().await;
         locks
@@ -1038,10 +1056,12 @@ async fn handle_client_request(
             handle_tidewave_session_load(state, channel_id, request, process_key).await
         }
         // ACP session load. We need to intercept it because we need to update the session mapping.
-        "session/load" => handle_acp_session_load(state, channel_id, request, process_key).await,
+        "session/load" => {
+            handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
+        }
         // ACP session resume also needs to atomically claim the session before forwarding.
         "session/resume" => {
-            handle_acp_session_resume(state, channel_id, request, process_key).await
+            handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
         }
         // Any other requests only perform proxy_id mapping and are otherwise forwarded as is.
         _ => handle_regular_request(state, channel_id, request, process_key).await,
@@ -1208,24 +1228,6 @@ async fn handle_tidewave_session_load(
     }
 
     Ok(())
-}
-
-async fn handle_acp_session_load(
-    state: &AcpChannelState,
-    channel_id: ChannelId,
-    request: &JsonRpcRequest,
-    process_key: &ProcessKey,
-) -> Result<()> {
-    handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
-}
-
-async fn handle_acp_session_resume(
-    state: &AcpChannelState,
-    channel_id: ChannelId,
-    request: &JsonRpcRequest,
-    process_key: &ProcessKey,
-) -> Result<()> {
-    handle_acp_session_load_or_resume(state, channel_id, request, process_key).await
 }
 
 async fn handle_acp_session_load_or_resume(
@@ -1857,8 +1859,17 @@ async fn maybe_handle_pending_request(
         PendingRequest::SessionLoad { session_id }
         | PendingRequest::SessionResume { session_id } => {
             if client_response.error.is_some() {
-                info!("Failed to load session, removing mapping! {}", session_id);
-                process_state.remove_session(&session_id).await;
+                if process_state
+                    .remove_session_if_unowned_or_owned_by(&session_id, channel_id)
+                    .await
+                {
+                    info!("Failed to load session, removing mapping! {}", session_id);
+                } else {
+                    info!(
+                        "Failed to load session {}, but it is now owned by another channel",
+                        session_id
+                    );
+                }
             } else {
                 map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
             }
