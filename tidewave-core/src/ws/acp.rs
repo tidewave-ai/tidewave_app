@@ -114,7 +114,7 @@ any requests to the new connection.
 use crate::command::{create_shell_command, spawn_command, ChildProcess};
 use crate::phoenix::{InitResult, PhxMessage};
 use anyhow::{anyhow, Result};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -338,16 +338,9 @@ pub struct ProcessState {
     pub stdout_buffer: RwLock<Vec<String>>,
     pub stderr_buffer: RwLock<Vec<String>>,
 
-    // We store the request ID of init, session/new and session/load
-    // because we need to handle their responses in a special way.
+    // Requests that need side effects when their response arrives.
     pub init_request_id: RwLock<Option<Value>>,
-    pub new_request_ids: DashSet<Value>,
-    pub load_request_ids: DashMap<Value, SessionId>,
-    pub resume_request_ids: DashMap<Value, SessionId>,
-    pub fork_request_ids: DashSet<Value>,
-    /// Client-initiated session/close requests (proxy_id -> session_id).
-    /// Session is removed when the response arrives.
-    pub close_request_ids: DashMap<Value, SessionId>,
+    pub pending_requests: DashMap<Value, PendingRequest>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
@@ -374,6 +367,15 @@ pub struct SessionState {
 pub struct SessionEntry {
     pub state: Arc<SessionState>,
     pub channel_id: Option<ChannelId>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingRequest {
+    SessionNew,
+    SessionLoad { session_id: SessionId },
+    SessionResume { session_id: SessionId },
+    SessionFork,
+    SessionClose { session_id: SessionId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,11 +406,7 @@ impl ProcessState {
             stdout_buffer: RwLock::new(Vec::new()),
             stderr_buffer: RwLock::new(Vec::new()),
             init_request_id: RwLock::new(None),
-            new_request_ids: DashSet::<Value>::new(),
-            load_request_ids: DashMap::new(),
-            resume_request_ids: DashMap::new(),
-            fork_request_ids: DashSet::<Value>::new(),
-            close_request_ids: DashMap::new(),
+            pending_requests: DashMap::new(),
             connect_epoch: AtomicU64::new(0),
             supports_resuming: RwLock::new(None),
             supports_session_close: RwLock::new(None),
@@ -1338,34 +1336,40 @@ async fn handle_regular_request(
     match request.method.as_str() {
         // We intercept new sessions to map the sessionId to the channel
         "session/new" => {
-            process_state.new_request_ids.insert(proxy_id.clone());
+            process_state
+                .pending_requests
+                .insert(proxy_id.clone(), PendingRequest::SessionNew);
         }
         // We intercept load requests since we need to handle the unsuccessful case
         // and clear the session mapping.
         "session/load" => {
             if let Some(session_id) = session_id {
                 process_state
-                    .load_request_ids
-                    .insert(proxy_id.clone(), session_id);
+                    .pending_requests
+                    .insert(proxy_id.clone(), PendingRequest::SessionLoad { session_id });
             }
         }
         // We intercept resume / fork sessions to map the sessionId to the channel
         "session/resume" => {
             if let Some(session_id) = session_id {
-                process_state
-                    .resume_request_ids
-                    .insert(proxy_id.clone(), session_id);
+                process_state.pending_requests.insert(
+                    proxy_id.clone(),
+                    PendingRequest::SessionResume { session_id },
+                );
             }
         }
         "session/fork" => {
-            process_state.fork_request_ids.insert(proxy_id.clone());
+            process_state
+                .pending_requests
+                .insert(proxy_id.clone(), PendingRequest::SessionFork);
         }
         // We intercept session/close to remove session state on response.
         "session/close" => {
             if let Some(session_id) = session_id {
-                process_state
-                    .close_request_ids
-                    .insert(proxy_id.clone(), session_id);
+                process_state.pending_requests.insert(
+                    proxy_id.clone(),
+                    PendingRequest::SessionClose { session_id },
+                );
             }
         }
         _ => (),
@@ -1764,22 +1768,18 @@ async fn handle_process_response(
         client_response.id = client_id;
 
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        maybe_handle_session_load_resume(
+        let pending_request = process_state
+            .pending_requests
+            .remove(&response.id)
+            .map(|(_, pending_request)| pending_request);
+        maybe_handle_pending_request(
             process_state,
             state,
             channel_id,
-            response,
+            pending_request.clone(),
             &client_response,
         )
         .await?;
-        maybe_handle_session_new_response(
-            process_state,
-            state,
-            response,
-            &client_response,
-            channel_id,
-        )
-        .await;
 
         if let Some(sender) = state.channel_senders.get(&channel_id) {
             push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
@@ -1787,8 +1787,8 @@ async fn handle_process_response(
             handle_disconnected_client_response(process_state, state, response).await;
         }
 
-        // Remove session state after forwarding a successful session/close response
-        if let Some((_, session_id)) = process_state.close_request_ids.remove(&response.id) {
+        // Remove session state after forwarding a session/close response.
+        if let Some(PendingRequest::SessionClose { session_id }) = pending_request {
             process_state.remove_session(&session_id).await;
             info!(
                 "Removed session {} after session/close response",
@@ -1827,59 +1827,46 @@ async fn maybe_handle_init_response(
     }
 }
 
-/// Handle load/resume response - check if successful and kill session
-async fn maybe_handle_session_load_resume(
+async fn maybe_handle_pending_request(
     process_state: &Arc<ProcessState>,
     state: &AcpChannelState,
     channel_id: ChannelId,
-    response: &JsonRpcResponse,
+    pending_request: Option<PendingRequest>,
     client_response: &JsonRpcResponse,
 ) -> Result<()> {
-    if let Some((_proxy_id, session_id)) = process_state
-        .load_request_ids
-        .remove(&response.id)
-        .or_else(|| process_state.resume_request_ids.remove(&response.id))
-    {
-        if client_response.error.is_some() {
-            info!("Failed to load session, removing mapping! {}", session_id);
-            process_state.remove_session(&session_id).await;
-        } else {
-            map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
+    let Some(pending_request) = pending_request else {
+        return Ok(());
+    };
+
+    match pending_request {
+        PendingRequest::SessionNew | PendingRequest::SessionFork => {
+            if let Some(result) = &client_response.result {
+                if let Ok(session_response) =
+                    serde_json::from_value::<NewSessionResponse>(result.clone())
+                {
+                    map_session_id_to_channel(
+                        state,
+                        session_response.session_id,
+                        channel_id,
+                        &process_state.key,
+                    )
+                    .await;
+                }
+            }
         }
+        PendingRequest::SessionLoad { session_id }
+        | PendingRequest::SessionResume { session_id } => {
+            if client_response.error.is_some() {
+                info!("Failed to load session, removing mapping! {}", session_id);
+                process_state.remove_session(&session_id).await;
+            } else {
+                map_session_id_to_channel(state, session_id, channel_id, &process_state.key).await;
+            }
+        }
+        PendingRequest::SessionClose { .. } => {}
     }
 
     Ok(())
-}
-
-/// Handle session/new response - create new session
-async fn maybe_handle_session_new_response(
-    process_state: &Arc<ProcessState>,
-    state: &AcpChannelState,
-    response: &JsonRpcResponse,
-    client_response: &JsonRpcResponse,
-    channel_id: ChannelId,
-) {
-    // check if new or fork - both are treated the same
-    if process_state
-        .new_request_ids
-        .remove(&response.id)
-        .or_else(|| process_state.fork_request_ids.remove(&response.id))
-        .is_some()
-    {
-        if let Some(result) = &client_response.result {
-            if let Ok(session_response) =
-                serde_json::from_value::<NewSessionResponse>(result.clone())
-            {
-                map_session_id_to_channel(
-                    state,
-                    session_response.session_id,
-                    channel_id,
-                    &process_state.key,
-                )
-                .await;
-            }
-        }
-    }
 }
 
 async fn map_session_id_to_channel(
@@ -2614,9 +2601,12 @@ mod tests {
         let client_id = Value::String("session/load!sess_failed_load!!load_1".to_string());
         let proxy_id =
             process.map_client_id_to_proxy(channel_id, client_id.clone(), Some(session_id.clone()));
-        process
-            .load_request_ids
-            .insert(proxy_id.clone(), session_id.clone());
+        process.pending_requests.insert(
+            proxy_id.clone(),
+            PendingRequest::SessionLoad {
+                session_id: session_id.clone(),
+            },
+        );
 
         let session = Arc::new(SessionState::new(process.key.clone()));
         process
