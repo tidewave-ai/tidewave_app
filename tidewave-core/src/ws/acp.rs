@@ -305,21 +305,21 @@ impl AcpChannelState {
 pub struct ProcessState {
     pub key: ProcessKey,
     pub spawn_opts: TidewaveSpawnOptions,
-    pub child: Arc<RwLock<Option<ChildProcess>>>,
+    pub child: RwLock<Option<ChildProcess>>,
     /// Channel used to forward a message to the ACP process.
-    pub stdin_tx: Arc<RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    pub stdin_tx: RwLock<Option<mpsc::UnboundedSender<JsonRpcMessage>>>,
     /// Channel used to signal the exit monitor to kill the process.
-    pub exit_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
+    pub exit_tx: RwLock<Option<mpsc::UnboundedSender<()>>>,
     /// Broadcast channel used to notify all subscribed init loops about process exit.
     pub exit_broadcast: broadcast::Sender<AgentExitEvent>,
 
     // ID mapping for multiplexed connections
-    pub next_proxy_id: Arc<AtomicU64>,
-    pub client_to_proxy_ids: Arc<DashMap<(ChannelId, Value), Value>>,
-    pub proxy_to_client_ids: Arc<DashMap<Value, (ChannelId, Value)>>,
+    pub next_proxy_id: AtomicU64,
+    pub client_to_proxy_ids: DashMap<(ChannelId, Value), Value>,
+    pub proxy_to_client_ids: DashMap<Value, (ChannelId, Value)>,
     /// In case the client disconnected, the original client for a request ID
     /// does not exist any more, so we also store the a mapping to the session ID.
-    pub proxy_to_session_ids: Arc<DashMap<Value, (SessionId, Value)>>,
+    pub proxy_to_session_ids: DashMap<Value, (SessionId, Value)>,
 
     /// Sessions owned by this ACP process.
     pub sessions: RwLock<HashMap<SessionId, SessionEntry>>,
@@ -327,48 +327,48 @@ pub struct ProcessState {
     pub session_lifecycle_locks: RwLock<HashMap<SessionId, Arc<Mutex<()>>>>,
 
     /// The cached init response we resend when a client reconnects.
-    pub cached_init_response: Arc<RwLock<Option<JsonRpcResponse>>>,
+    pub cached_init_response: RwLock<Option<JsonRpcResponse>>,
     /// Whether an init request has already been sent to the process.
     pub init_sent: AtomicBool,
     /// Notified when the init response is cached, so waiters can grab it.
-    pub init_complete: Arc<Notify>,
+    pub init_complete: Notify,
 
     /// Buffers for stdout/stderr output before init completes.
     /// Used to provide detailed error messages when process exits before init.
-    pub stdout_buffer: Arc<RwLock<Vec<String>>>,
-    pub stderr_buffer: Arc<RwLock<Vec<String>>>,
+    pub stdout_buffer: RwLock<Vec<String>>,
+    pub stderr_buffer: RwLock<Vec<String>>,
 
     // We store the request ID of init, session/new and session/load
     // because we need to handle their responses in a special way.
-    pub init_request_id: Arc<RwLock<Option<Value>>>,
-    pub new_request_ids: Arc<DashSet<Value>>,
-    pub load_request_ids: Arc<DashMap<Value, SessionId>>,
-    pub resume_request_ids: Arc<DashMap<Value, SessionId>>,
-    pub fork_request_ids: Arc<DashSet<Value>>,
+    pub init_request_id: RwLock<Option<Value>>,
+    pub new_request_ids: DashSet<Value>,
+    pub load_request_ids: DashMap<Value, SessionId>,
+    pub resume_request_ids: DashMap<Value, SessionId>,
+    pub fork_request_ids: DashSet<Value>,
     /// Client-initiated session/close requests (proxy_id -> session_id).
     /// Session is removed when the response arrives.
-    pub close_request_ids: Arc<DashMap<Value, SessionId>>,
+    pub close_request_ids: DashMap<Value, SessionId>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
-    pub connect_epoch: Arc<AtomicU64>,
+    pub connect_epoch: AtomicU64,
     /// Whether the agent supports resuming sessions (loadSession, session.fork,
     /// or session.resume in agentCapabilities). Set from init response.
     /// When true, the process can be stopped on inactivity since sessions
     /// can be restored after a restart.
-    pub supports_resuming: Arc<RwLock<Option<bool>>>,
+    pub supports_resuming: RwLock<Option<bool>>,
     /// Whether the agent supports session/close (session.close in agentCapabilities).
     /// When true, on disconnect we send session/close instead of session/cancel,
     /// and remove the session state entirely.
-    pub supports_session_close: Arc<RwLock<Option<bool>>>,
+    pub supports_session_close: RwLock<Option<bool>>,
 }
 
 pub struct SessionState {
     pub process_key: ProcessKey,
-    pub message_buffer: Arc<RwLock<Vec<BufferedMessage>>>,
-    pub notification_id_counter: Arc<AtomicU64>,
-    pub cancelled: Arc<AtomicBool>,
-    pub cancel_counter: Arc<AtomicU64>,
+    pub message_buffer: RwLock<Vec<BufferedMessage>>,
+    pub notification_id_counter: AtomicU64,
+    pub cancelled: AtomicBool,
+    pub cancel_counter: AtomicU64,
 }
 
 pub struct SessionEntry {
@@ -388,30 +388,30 @@ impl ProcessState {
         Self {
             key,
             spawn_opts,
-            child: Arc::new(RwLock::new(None)),
-            stdin_tx: Arc::new(RwLock::new(None)),
-            exit_tx: Arc::new(RwLock::new(None)),
+            child: RwLock::new(None),
+            stdin_tx: RwLock::new(None),
+            exit_tx: RwLock::new(None),
             exit_broadcast,
-            next_proxy_id: Arc::new(AtomicU64::new(1)),
-            client_to_proxy_ids: Arc::new(DashMap::new()),
-            proxy_to_client_ids: Arc::new(DashMap::new()),
-            proxy_to_session_ids: Arc::new(DashMap::new()),
+            next_proxy_id: AtomicU64::new(1),
+            client_to_proxy_ids: DashMap::new(),
+            proxy_to_client_ids: DashMap::new(),
+            proxy_to_session_ids: DashMap::new(),
             sessions: RwLock::new(HashMap::new()),
             session_lifecycle_locks: RwLock::new(HashMap::new()),
-            cached_init_response: Arc::new(RwLock::new(None)),
+            cached_init_response: RwLock::new(None),
             init_sent: AtomicBool::new(false),
-            init_complete: Arc::new(Notify::new()),
-            stdout_buffer: Arc::new(RwLock::new(Vec::new())),
-            stderr_buffer: Arc::new(RwLock::new(Vec::new())),
-            init_request_id: Arc::new(RwLock::new(None)),
-            new_request_ids: Arc::new(DashSet::<Value>::new()),
-            load_request_ids: Arc::new(DashMap::new()),
-            resume_request_ids: Arc::new(DashMap::new()),
-            fork_request_ids: Arc::new(DashSet::<Value>::new()),
-            close_request_ids: Arc::new(DashMap::new()),
-            connect_epoch: Arc::new(AtomicU64::new(0)),
-            supports_resuming: Arc::new(RwLock::new(None)),
-            supports_session_close: Arc::new(RwLock::new(None)),
+            init_complete: Notify::new(),
+            stdout_buffer: RwLock::new(Vec::new()),
+            stderr_buffer: RwLock::new(Vec::new()),
+            init_request_id: RwLock::new(None),
+            new_request_ids: DashSet::<Value>::new(),
+            load_request_ids: DashMap::new(),
+            resume_request_ids: DashMap::new(),
+            fork_request_ids: DashSet::<Value>::new(),
+            close_request_ids: DashMap::new(),
+            connect_epoch: AtomicU64::new(0),
+            supports_resuming: RwLock::new(None),
+            supports_session_close: RwLock::new(None),
         }
     }
 
@@ -572,10 +572,10 @@ impl SessionState {
     pub fn new(process_key: ProcessKey) -> Self {
         Self {
             process_key,
-            message_buffer: Arc::new(RwLock::new(Vec::new())),
-            notification_id_counter: Arc::new(AtomicU64::new(1)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            cancel_counter: Arc::new(AtomicU64::new(0)),
+            message_buffer: RwLock::new(Vec::new()),
+            notification_id_counter: AtomicU64::new(1),
+            cancelled: AtomicBool::new(false),
+            cancel_counter: AtomicU64::new(0),
         }
     }
 
