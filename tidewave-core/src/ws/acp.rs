@@ -487,6 +487,21 @@ impl ProcessState {
         }
     }
 
+    pub async fn unmap_session_if_owned_by(&self, session_id: &str, channel_id: ChannelId) -> bool {
+        let mut sessions = self.sessions.write().await;
+
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        if entry.channel_id == Some(channel_id) {
+            entry.channel_id = None;
+            return true;
+        }
+
+        false
+    }
+
     pub async fn claim_or_insert_session_channel(
         &self,
         session_id: SessionId,
@@ -1746,7 +1761,7 @@ async fn handle_process_response(
         client_response.id = inflight_request.client_id.clone();
 
         maybe_handle_init_response(process_state, response, &mut client_response).await;
-        maybe_handle_pending_request(
+        let response_session_id = maybe_handle_pending_request(
             process_state,
             state,
             inflight_request.channel_id,
@@ -1754,6 +1769,7 @@ async fn handle_process_response(
             &client_response,
         )
         .await?;
+        let disconnected_session_id = response_session_id.or(inflight_request.session_id.clone());
 
         if let Some(sender) = state.channel_senders.get(&inflight_request.channel_id) {
             push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
@@ -1762,7 +1778,7 @@ async fn handle_process_response(
                 process_state,
                 state,
                 client_response,
-                inflight_request.session_id,
+                disconnected_session_id,
             )
             .await;
         }
@@ -1811,10 +1827,12 @@ async fn maybe_handle_pending_request(
     channel_id: ChannelId,
     pending_request: Option<PendingRequest>,
     client_response: &JsonRpcResponse,
-) -> Result<()> {
+) -> Result<Option<SessionId>> {
     let Some(pending_request) = pending_request else {
-        return Ok(());
+        return Ok(None);
     };
+
+    let mut response_session_id = None;
 
     match pending_request {
         PendingRequest::SessionNew | PendingRequest::SessionFork => {
@@ -1822,7 +1840,8 @@ async fn maybe_handle_pending_request(
                 if let Ok(session_response) =
                     serde_json::from_value::<NewSessionResponse>(result.clone())
                 {
-                    map_session_id_to_channel(
+                    response_session_id = Some(session_response.session_id.clone());
+                    create_session_from_agent_response(
                         state,
                         session_response.session_id,
                         channel_id,
@@ -1853,7 +1872,48 @@ async fn maybe_handle_pending_request(
         PendingRequest::SessionClose { .. } => {}
     }
 
-    Ok(())
+    Ok(response_session_id)
+}
+
+async fn create_session_from_agent_response(
+    state: &AcpChannelState,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    process_key: &ProcessKey,
+) {
+    let Ok(process_state) = ensure_process(state, process_key) else {
+        warn!(
+            "Cannot map session {} without process {}",
+            session_id, process_key
+        );
+        return;
+    };
+
+    let inserted = process_state
+        .insert_session(
+            session_id.clone(),
+            Arc::new(SessionState::new(process_key.clone())),
+            Some(channel_id),
+        )
+        .await;
+
+    if !state.channel_senders.contains_key(&channel_id)
+        && process_state
+            .unmap_session_if_owned_by(&session_id, channel_id)
+            .await
+    {
+        debug!(
+            "Created session {} from late agent response without active channel",
+            session_id
+        );
+    }
+
+    if !inserted && process_state.session_channel(&session_id).await != Some(channel_id) {
+        warn!(
+            "Unexpectedly got new/fork session response for already known session! {}",
+            session_id
+        );
+    }
 }
 
 async fn map_session_id_to_channel(
@@ -1880,7 +1940,7 @@ async fn map_session_id_to_channel(
 
     if !inserted && process_state.session_channel(&session_id).await != Some(channel_id) {
         warn!(
-            "Unexpectedly got new/load/fork session response for already known session! {}",
+            "Unexpectedly got load/resume session response for already known session! {}",
             session_id
         );
     }
