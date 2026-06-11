@@ -406,10 +406,18 @@ pub enum BeginInit {
 #[derive(Debug, Clone)]
 pub enum PendingRequest {
     SessionNew,
-    SessionLoad { session_id: SessionId },
-    SessionResume { session_id: SessionId },
+    SessionLoad {
+        session_id: SessionId,
+        created_session: bool,
+    },
+    SessionResume {
+        session_id: SessionId,
+        created_session: bool,
+    },
     SessionFork,
-    SessionClose { session_id: SessionId },
+    SessionClose {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,6 +620,10 @@ impl ProcessState {
 
     pub async fn remove_session(&self, session_id: &str) {
         self.sessions.write().await.remove(session_id);
+        self.session_lifecycle_locks
+            .write()
+            .await
+            .remove(session_id);
     }
 
     pub async fn remove_session_if_unowned_or_owned_by(
@@ -619,14 +631,25 @@ impl ProcessState {
         session_id: &str,
         channel_id: ChannelId,
     ) -> bool {
-        let mut sessions = self.sessions.write().await;
+        let should_remove = {
+            let mut sessions = self.sessions.write().await;
 
-        let should_remove = sessions.get(session_id).is_some_and(|entry| {
-            entry.channel_id.is_none() || entry.channel_id == Some(channel_id)
-        });
+            let should_remove = sessions.get(session_id).is_some_and(|entry| {
+                entry.channel_id.is_none() || entry.channel_id == Some(channel_id)
+            });
+
+            if should_remove {
+                sessions.remove(session_id);
+            }
+
+            should_remove
+        };
 
         if should_remove {
-            sessions.remove(session_id);
+            self.session_lifecycle_locks
+                .write()
+                .await
+                .remove(session_id);
         }
 
         should_remove
@@ -1461,7 +1484,7 @@ async fn handle_acp_session_load_or_resume(
         let lock = process_state.session_lifecycle_lock(&session_id).await;
         let _guard = lock.lock().await;
 
-        match process_state
+        let created_session = match process_state
             .claim_or_insert_session_channel(session_id.clone(), channel_id, process_key)
             .await
         {
@@ -1470,12 +1493,14 @@ async fn handle_acp_session_load_or_resume(
                     "session/load for existing session {} on channel {}",
                     session_id, channel_id
                 );
+                false
             }
             Ok(true) => {
                 info!(
                     "Created new session {} for session/load on channel {}",
                     session_id, channel_id
                 );
+                true
             }
             Err(()) => {
                 send_error_response(
@@ -1490,7 +1515,7 @@ async fn handle_acp_session_load_or_resume(
                 );
                 return Ok(());
             }
-        }
+        };
 
         // Claim this channel for the session BEFORE forwarding the request
         // This ensures that when the agent sends notifications during load/resume,
@@ -1500,7 +1525,18 @@ async fn handle_acp_session_load_or_resume(
             channel_id, session_id, request.method
         );
 
-        handle_regular_request(state, channel_id, request, process_key).await?;
+        let pending = match request.method.as_str() {
+            "session/load" => Some(PendingRequest::SessionLoad {
+                session_id: session_id.clone(),
+                created_session,
+            }),
+            "session/resume" => Some(PendingRequest::SessionResume {
+                session_id: session_id.clone(),
+                created_session,
+            }),
+            _ => None,
+        };
+        forward_request_to_process(state, channel_id, request, process_key, pending).await?;
         return Ok(());
     }
 
@@ -1543,8 +1579,6 @@ async fn handle_regular_request(
     request: &JsonRpcRequest,
     process_key: &ProcessKey,
 ) -> Result<()> {
-    let process_state = ensure_process(state, process_key)?;
-
     // Map client ID to proxy ID
     let session_id = extract_session_id_from_request(request);
 
@@ -1555,11 +1589,17 @@ async fn handle_regular_request(
         // and clear the session mapping.
         "session/load" => session_id
             .clone()
-            .map(|session_id| PendingRequest::SessionLoad { session_id }),
+            .map(|session_id| PendingRequest::SessionLoad {
+                session_id,
+                created_session: false,
+            }),
         // We intercept resume / fork sessions to map the sessionId to the channel
         "session/resume" => session_id
             .clone()
-            .map(|session_id| PendingRequest::SessionResume { session_id }),
+            .map(|session_id| PendingRequest::SessionResume {
+                session_id,
+                created_session: false,
+            }),
         "session/fork" => Some(PendingRequest::SessionFork),
         // We intercept session/close to remove session state on response.
         "session/close" => session_id
@@ -1567,6 +1607,19 @@ async fn handle_regular_request(
             .map(|session_id| PendingRequest::SessionClose { session_id }),
         _ => None,
     };
+
+    forward_request_to_process(state, channel_id, request, process_key, pending).await
+}
+
+async fn forward_request_to_process(
+    state: &AcpChannelState,
+    channel_id: ChannelId,
+    request: &JsonRpcRequest,
+    process_key: &ProcessKey,
+    pending: Option<PendingRequest>,
+) -> Result<()> {
+    let process_state = ensure_process(state, process_key)?;
+    let session_id = extract_session_id_from_request(request);
 
     let proxy_id =
         process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id, pending);
@@ -2042,19 +2095,32 @@ async fn maybe_handle_pending_request(
                 }
             }
         }
-        PendingRequest::SessionLoad { session_id }
-        | PendingRequest::SessionResume { session_id } => {
+        PendingRequest::SessionLoad {
+            session_id,
+            created_session,
+        }
+        | PendingRequest::SessionResume {
+            session_id,
+            created_session,
+        } => {
             if client_response.error.is_some() {
-                if process_state
-                    .remove_session_if_unowned_or_owned_by(&session_id, channel_id)
+                if created_session {
+                    if process_state
+                        .remove_session_if_unowned_or_owned_by(&session_id, channel_id)
+                        .await
+                    {
+                        info!("Failed to load session, removing mapping! {}", session_id);
+                    } else {
+                        info!(
+                            "Failed to load session {}, but it is now owned by another channel",
+                            session_id
+                        );
+                    }
+                } else if process_state
+                    .unmap_session_if_owned_by(&session_id, channel_id)
                     .await
                 {
-                    info!("Failed to load session, removing mapping! {}", session_id);
-                } else {
-                    info!(
-                        "Failed to load session {}, but it is now owned by another channel",
-                        session_id
-                    );
+                    info!("Failed to load session, releasing claim! {}", session_id);
                 }
             } else {
                 confirm_claimed_session_response(process_state, state, session_id, channel_id)
@@ -2970,6 +3036,7 @@ mod tests {
             Some(session_id.clone()),
             Some(PendingRequest::SessionLoad {
                 session_id: session_id.clone(),
+                created_session: true,
             }),
         );
 

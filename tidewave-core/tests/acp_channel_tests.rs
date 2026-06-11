@@ -948,7 +948,10 @@ async fn test_late_successful_resume_response_does_not_claim_disconnected_channe
 
         if response["id"] == "resume_1" {
             saw_resume_response = true;
-            assert_eq!(response["result"]["sessionId"], "sess_late_successful_resume");
+            assert_eq!(
+                response["result"]["sessionId"],
+                "sess_late_successful_resume"
+            );
         }
 
         if response["id"] == "load_1" {
@@ -957,7 +960,10 @@ async fn test_late_successful_resume_response_does_not_claim_disconnected_channe
         }
     }
 
-    assert!(saw_resume_response, "Expected buffered session/resume response");
+    assert!(
+        saw_resume_response,
+        "Expected buffered session/resume response"
+    );
     assert!(saw_load_response, "Expected Tidewave session/load response");
 }
 
@@ -1093,6 +1099,167 @@ async fn test_late_failed_resume_response_does_not_remove_reconnected_session() 
     assert!(
         received_update,
         "Expected reconnected session to keep receiving updates"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_resume_keeps_existing_inactive_session() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_failed_existing_resume".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+
+    let resume = json!({
+        "jsonrpc": "2.0",
+        "id": "resume_1",
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", resume)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let resume_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(resume_request["method"], "session/resume");
+    let resume_proxy_id = resume_request["id"].clone();
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": resume_proxy_id,
+            "error": {
+                "code": -32000,
+                "message": "Temporary resume failure"
+            }
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx, "jsonrpc", 250)
+        .await
+        .expect("Expected failed resume response");
+    assert_eq!(msg.payload.as_json()["id"], "resume_1");
+    assert_eq!(
+        msg.payload.as_json()["error"]["message"],
+        "Temporary resume failure"
+    );
+
+    assert!(
+        wait_for_inactive_session(&process_state, "sess_failed_existing_resume").await,
+        "Failed resume should release, not delete, an existing inactive session"
+    );
+}
+
+#[tokio::test]
+async fn test_session_close_response_removes_lifecycle_lock() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+    let ws_state = WsState::new().with_acp_state(state.clone());
+
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_key = "test_acp:.".to_string();
+    let process_state = state
+        .processes
+        .get(&process_key)
+        .expect("Expected process to exist")
+        .clone();
+    let session_id = "sess_close_lock_cleanup".to_string();
+    let session = Arc::new(SessionState::new(process_key));
+    process_state
+        .insert_session(session_id.clone(), session, None)
+        .await;
+    let _lock = process_state.session_lifecycle_lock(&session_id).await;
+
+    let close = json!({
+        "jsonrpc": "2.0",
+        "id": "close_1",
+        "method": "session/close",
+        "params": {
+            "sessionId": session_id
+        }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", close)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let close_request = read_json_line(&mut test_stdout).await;
+    assert_eq!(close_request["method"], "session/close");
+    let close_proxy_id = close_request["id"].clone();
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": close_proxy_id,
+            "result": {}
+        }),
+    )
+    .await;
+
+    let msg = wait_for_event(&mut out_rx, "jsonrpc", 250)
+        .await
+        .expect("Expected session/close response");
+    assert_eq!(msg.payload.as_json()["id"], "close_1");
+    assert!(process_state
+        .session_state("sess_close_lock_cleanup")
+        .await
+        .is_none());
+    assert!(
+        !process_state
+            .session_lifecycle_locks
+            .read()
+            .await
+            .contains_key("sess_close_lock_cleanup"),
+        "Removing a session should also remove its lifecycle lock"
     );
 }
 
