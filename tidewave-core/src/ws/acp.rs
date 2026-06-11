@@ -322,20 +322,13 @@ pub struct ProcessState {
     /// Locks to prevent races between session/close and session reconnect.
     pub session_lifecycle_locks: RwLock<HashMap<SessionId, Arc<Mutex<()>>>>,
 
-    /// The cached init response we resend when a client reconnects.
-    pub cached_init_response: RwLock<Option<JsonRpcResponse>>,
-    /// Whether an init request has already been sent to the process.
-    pub init_sent: AtomicBool,
-    /// Notified when the init response is cached, so waiters can grab it.
-    pub init_complete: Notify,
+    /// Initialization state shared by all clients connected to this ACP process.
+    pub init_state: InitState,
 
     /// Buffers for stdout/stderr output before init completes.
     /// Used to provide detailed error messages when process exits before init.
     pub stdout_buffer: RwLock<Vec<String>>,
     pub stderr_buffer: RwLock<Vec<String>>,
-
-    // Request ID for the initialize request whose response should be cached.
-    pub init_request_id: RwLock<Option<Value>>,
 
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
@@ -372,6 +365,25 @@ pub struct InflightRequest {
     pub pending: Option<PendingRequest>,
 }
 
+pub struct InitState {
+    inner: Mutex<InitStateInner>,
+    notify: Notify,
+}
+
+enum InitStateInner {
+    NotStarted,
+    InFlight { request_id: Value },
+    Complete { response: JsonRpcResponse },
+    Failed,
+}
+
+pub enum BeginInit {
+    Start,
+    Wait,
+    Complete(JsonRpcResponse),
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum PendingRequest {
     SessionNew,
@@ -401,12 +413,9 @@ impl ProcessState {
             inflight_requests: DashMap::new(),
             sessions: RwLock::new(HashMap::new()),
             session_lifecycle_locks: RwLock::new(HashMap::new()),
-            cached_init_response: RwLock::new(None),
-            init_sent: AtomicBool::new(false),
-            init_complete: Notify::new(),
+            init_state: InitState::new(),
             stdout_buffer: RwLock::new(Vec::new()),
             stderr_buffer: RwLock::new(Vec::new()),
-            init_request_id: RwLock::new(None),
             connect_epoch: AtomicU64::new(0),
             supports_resuming: RwLock::new(None),
             supports_session_close: RwLock::new(None),
@@ -437,8 +446,26 @@ impl ProcessState {
         pending: Option<PendingRequest>,
     ) -> Value {
         let proxy_id = self.generate_proxy_id();
-        self.inflight_requests.insert(
+        self.register_inflight_request(
             proxy_id.clone(),
+            channel_id,
+            client_id,
+            session_id,
+            pending,
+        );
+        proxy_id
+    }
+
+    pub fn register_inflight_request(
+        &self,
+        proxy_id: Value,
+        channel_id: ChannelId,
+        client_id: Value,
+        session_id: Option<SessionId>,
+        pending: Option<PendingRequest>,
+    ) {
+        self.inflight_requests.insert(
+            proxy_id,
             InflightRequest {
                 channel_id,
                 client_id,
@@ -446,7 +473,6 @@ impl ProcessState {
                 pending,
             },
         );
-        proxy_id
     }
 
     pub fn inflight_request(&self, proxy_id: &Value) -> Option<InflightRequest> {
@@ -595,6 +621,89 @@ impl ProcessState {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+}
+
+impl InitState {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(InitStateInner::NotStarted),
+            notify: Notify::new(),
+        }
+    }
+
+    pub async fn begin(&self, request_id: Value) -> BeginInit {
+        let mut inner = self.inner.lock().await;
+
+        match &*inner {
+            InitStateInner::NotStarted => {
+                *inner = InitStateInner::InFlight { request_id };
+                BeginInit::Start
+            }
+            InitStateInner::InFlight { .. } => BeginInit::Wait,
+            InitStateInner::Complete { response } => BeginInit::Complete(response.clone()),
+            InitStateInner::Failed => BeginInit::Failed,
+        }
+    }
+
+    pub async fn wait_for_completion(&self) -> Option<JsonRpcResponse> {
+        loop {
+            let notified = {
+                let inner = self.inner.lock().await;
+
+                match &*inner {
+                    InitStateInner::Complete { response } => return Some(response.clone()),
+                    InitStateInner::Failed => return None,
+                    InitStateInner::NotStarted | InitStateInner::InFlight { .. } => {
+                        self.notify.notified()
+                    }
+                }
+            };
+
+            notified.await;
+        }
+    }
+
+    pub async fn complete_if_current(&self, request_id: &Value, response: JsonRpcResponse) -> bool {
+        let mut inner = self.inner.lock().await;
+
+        let InitStateInner::InFlight {
+            request_id: current_request_id,
+        } = &*inner
+        else {
+            return false;
+        };
+
+        if current_request_id != request_id {
+            return false;
+        }
+
+        *inner = InitStateInner::Complete { response };
+        drop(inner);
+        self.notify.notify_waiters();
+        true
+    }
+
+    pub async fn is_current_request(&self, request_id: &Value) -> bool {
+        let inner = self.inner.lock().await;
+
+        matches!(
+            &*inner,
+            InitStateInner::InFlight {
+                request_id: current_request_id,
+            } if current_request_id == request_id
+        )
+    }
+
+    pub async fn fail(&self) {
+        let mut inner = self.inner.lock().await;
+        *inner = InitStateInner::Failed;
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn is_complete(&self) -> bool {
+        matches!(*self.inner.lock().await, InitStateInner::Complete { .. })
     }
 }
 
@@ -1091,53 +1200,15 @@ async fn handle_initialize_request(
     // Process was already started during channel join
     let process_state = ensure_process(state, process_key)?;
 
-    // Fast path: already have a cached init response
-    if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
-        let mut response = cached_response.clone();
-        response.id = request.id.clone();
-        send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-        return Ok(());
-    }
+    let proxy_id = process_state.generate_proxy_id();
 
-    // Try to be the one that sends the init request
-    if process_state
-        .init_sent
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        // We won the race — send the init request to the process
-        let session_id = extract_session_id_from_request(request);
-        let proxy_id =
-            process_state.map_client_id_to_proxy(channel_id, request.id.clone(), session_id, None);
-        let mut proxy_request = request.clone();
-        proxy_request.id = proxy_id.clone();
-
-        *process_state.init_request_id.write().await = Some(proxy_id);
-
-        if let Err(e) = process_state
-            .send_to_process(JsonRpcMessage::Request(proxy_request))
-            .await
-        {
-            error!("Failed to send initialize request to process: {}", e);
-            send_agent_exit(
-                state,
-                channel_id,
-                "communication_error",
-                "Failed to communicate with process",
-                None,
-                None,
-            );
-        }
-    } else {
-        // Another client already sent the init request — wait for the response
-        process_state.init_complete.notified().await;
-
-        if let Some(cached_response) = process_state.cached_init_response.read().await.as_ref() {
-            let mut response = cached_response.clone();
+    match process_state.init_state.begin(proxy_id.clone()).await {
+        BeginInit::Complete(cached_response) => {
+            let mut response = cached_response;
             response.id = request.id.clone();
             send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
-        } else {
-            // Init completed but no cached response (error case, e.g. process died)
+        }
+        BeginInit::Failed => {
             send_agent_exit(
                 state,
                 channel_id,
@@ -1146,6 +1217,53 @@ async fn handle_initialize_request(
                 None,
                 None,
             );
+        }
+        BeginInit::Start => {
+            // We won the race — send the init request to the process
+            let session_id = extract_session_id_from_request(request);
+            process_state.register_inflight_request(
+                proxy_id.clone(),
+                channel_id,
+                request.id.clone(),
+                session_id,
+                None,
+            );
+            let mut proxy_request = request.clone();
+            proxy_request.id = proxy_id;
+
+            if let Err(e) = process_state
+                .send_to_process(JsonRpcMessage::Request(proxy_request))
+                .await
+            {
+                process_state.init_state.fail().await;
+                error!("Failed to send initialize request to process: {}", e);
+                send_agent_exit(
+                    state,
+                    channel_id,
+                    "communication_error",
+                    "Failed to communicate with process",
+                    None,
+                    None,
+                );
+            }
+        }
+        BeginInit::Wait => {
+            // Another client already sent the init request — wait for the response
+            if let Some(cached_response) = process_state.init_state.wait_for_completion().await {
+                let mut response = cached_response;
+                response.id = request.id.clone();
+                send_to_channel(state, channel_id, JsonRpcMessage::Response(response));
+            } else {
+                // Init completed but no cached response (error case, e.g. process died)
+                send_agent_exit(
+                    state,
+                    channel_id,
+                    "init_error",
+                    "Process init failed",
+                    None,
+                    None,
+                );
+            }
         }
     }
 
@@ -1501,12 +1619,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             } else {
                 debug!("Received non-JSON line from process: {}", line);
                 // Buffer if init hasn't completed yet
-                if process_state_clone
-                    .cached_init_response
-                    .read()
-                    .await
-                    .is_none()
-                {
+                if !process_state_clone.init_state.is_complete().await {
                     process_state_clone.stdout_buffer.write().await.push(line);
                 }
             }
@@ -1521,12 +1634,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
         while let Ok(Some(line)) = lines.next_line().await {
             debug!("Process stderr: {}", line);
             // Buffer if init hasn't completed yet
-            if process_state_stderr
-                .cached_init_response
-                .read()
-                .await
-                .is_none()
-            {
+            if !process_state_stderr.init_state.is_complete().await {
                 process_state_stderr.stderr_buffer.write().await.push(line);
             }
         }
@@ -1580,12 +1688,7 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
         let (error_type, exit_message) = exit_reason;
 
         // If init never completed, include buffered output in the exit notification
-        let (stdout, stderr) = if process_state_exit
-            .cached_init_response
-            .read()
-            .await
-            .is_none()
-        {
+        let (stdout, stderr) = if !process_state_exit.init_state.is_complete().await {
             let stdout_buf = process_state_exit.stdout_buffer.read().await;
             let stderr_buf = process_state_exit.stderr_buffer.read().await;
             (
@@ -1629,8 +1732,8 @@ async fn start_acp_process(process_state: Arc<ProcessState>, state: AcpChannelSt
             .await
             .clear();
 
-        // Notify any waiters for init response so they don't hang forever
-        process_state_exit.init_complete.notify_waiters();
+        // Notify any waiters for init response so they don't hang forever.
+        process_state_exit.init_state.fail().await;
 
         state_exit.processes.remove(&process_state_exit.key);
 
@@ -1802,22 +1905,25 @@ async fn maybe_handle_init_response(
     response: &JsonRpcResponse,
     client_response: &mut JsonRpcResponse,
 ) {
-    let init_request_id = process_state.init_request_id.read().await;
-    if init_request_id.as_ref() == Some(&response.id) {
-        drop(init_request_id); // Release read lock
-
+    if process_state
+        .init_state
+        .is_current_request(&response.id)
+        .await
+    {
         // Parse agent capabilities
         *process_state.supports_resuming.write().await = Some(check_supports_resuming(response));
         *process_state.supports_session_close.write().await =
             Some(check_supports_session_close(response));
 
-        // Store init response for future inits
-        *process_state.cached_init_response.write().await = Some(client_response.clone());
-        // Notify any waiters that the init response is now cached
-        process_state.init_complete.notify_waiters();
-        // Clear buffers
-        *process_state.stderr_buffer.write().await = Vec::new();
-        *process_state.stdout_buffer.write().await = Vec::new();
+        if process_state
+            .init_state
+            .complete_if_current(&response.id, client_response.clone())
+            .await
+        {
+            // Clear buffers
+            *process_state.stderr_buffer.write().await = Vec::new();
+            *process_state.stdout_buffer.write().await = Vec::new();
+        }
     }
 }
 
@@ -2499,6 +2605,67 @@ mod tests {
             JsonRpcMessage::Notification(_) => {}
             _ => panic!("Expected notification"),
         }
+    }
+
+    // ============================================================================
+    // InitState Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_init_state_wait_after_completion_returns_cached_response() {
+        let init_state = InitState::new();
+        let request_id = Value::String("proxy_init".to_string());
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request_id.clone(),
+            result: Some(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {}
+            })),
+            error: None,
+        };
+
+        assert!(matches!(
+            init_state.begin(request_id.clone()).await,
+            BeginInit::Start
+        ));
+        assert!(
+            init_state
+                .complete_if_current(&request_id, response.clone())
+                .await
+        );
+
+        let cached = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            init_state.wait_for_completion(),
+        )
+        .await
+        .expect("wait should not miss an already completed init")
+        .expect("init should be complete");
+
+        assert_eq!(cached.id, response.id);
+        assert_eq!(cached.result, response.result);
+    }
+
+    #[tokio::test]
+    async fn test_init_state_wait_after_failure_returns_none() {
+        let init_state = InitState::new();
+
+        assert!(matches!(
+            init_state
+                .begin(Value::String("proxy_init".to_string()))
+                .await,
+            BeginInit::Start
+        ));
+        init_state.fail().await;
+
+        let failed = tokio::time::timeout(tokio::time::Duration::from_millis(100), async {
+            init_state.wait_for_completion().await
+        })
+        .await
+        .expect("wait should not hang after init failure");
+
+        assert!(failed.is_none());
     }
 
     // ============================================================================
