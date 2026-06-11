@@ -1804,10 +1804,17 @@ async fn handle_disconnected_client_response(
                 let session_state = session_state.clone();
                 let _ = session_state
                     .add_to_buffer(
-                        JsonRpcMessage::Response(client_response),
+                        JsonRpcMessage::Response(client_response.clone()),
                         client_id.to_string(),
                     )
                     .await;
+
+                if let Some(current_channel_id) = state.session_to_channel.get(&session_id) {
+                    let current_channel_id = *current_channel_id;
+                    if let Some(sender) = state.channel_senders.get(&current_channel_id) {
+                        push_jsonrpc(&sender, &JsonRpcMessage::Response(client_response));
+                    }
+                }
             }
         }
 
@@ -2399,6 +2406,63 @@ mod tests {
         // Verify mappings are removed
         assert!(process.resolve_proxy_id_to_client(&proxy_id).is_none());
         assert!(!process.proxy_to_session_ids.contains_key(&proxy_id));
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_response_sent_if_session_reconnects_while_buffering() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+        let session_id = "sess_reconnect".to_string();
+        let session = Arc::new(SessionState::new(process.key.clone()));
+        state.sessions.insert(session_id.clone(), session.clone());
+
+        let original_channel_id = Uuid::new_v4();
+        let reconnected_channel_id = Uuid::new_v4();
+        let client_id = Value::String("session/prompt!sess_reconnect!!prompt_1".to_string());
+        let proxy_id = process.map_client_id_to_proxy(
+            original_channel_id,
+            client_id.clone(),
+            Some(session_id.clone()),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.channel_senders.insert(
+            reconnected_channel_id,
+            ChannelSender {
+                tx,
+                topic: "acp:test".to_string(),
+                join_ref: Some("j2".to_string()),
+            },
+        );
+
+        let buffer_guard = session.message_buffer.write().await;
+        let process_clone = process.clone();
+        let state_clone = state.clone();
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: proxy_id.clone(),
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+        };
+        let response_task = tokio::spawn(async move {
+            handle_disconnected_client_response(&process_clone, &state_clone, &response).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        state
+            .session_to_channel
+            .insert(session_id.clone(), reconnected_channel_id);
+        drop(buffer_guard);
+        response_task.await.expect("response task panicked");
+
+        let sent = tokio::time::timeout(tokio::time::Duration::from_millis(250), rx.recv())
+            .await
+            .expect("Expected response to be sent to reconnected channel")
+            .expect("Channel sender closed");
+        assert_eq!(sent.event, "jsonrpc");
+        let payload = sent.payload.as_json();
+        assert_eq!(payload["id"], client_id);
+        assert_eq!(payload["result"]["stopReason"], "end_turn");
     }
 
     #[tokio::test]
