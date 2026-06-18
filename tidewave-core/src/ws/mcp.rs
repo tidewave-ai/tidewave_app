@@ -15,7 +15,10 @@ use axum::{
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -35,10 +38,20 @@ pub struct McpParams {
 
 #[derive(Clone)]
 pub struct McpChannelState {
-    /// Registry mapping session_id to channel sender
-    pub sessions: Arc<DashMap<String, ChannelSender>>,
+    /// Registry mapping session_id to the current channel for that session.
+    pub sessions: Arc<DashMap<String, McpSession>>,
     /// Pending responses waiting for answers from the browser
-    pub awaiting_answers: Arc<DashMap<(String, Value), oneshot::Sender<Value>>>,
+    pub awaiting_answers: Arc<DashMap<(String, ChannelId, Value), oneshot::Sender<Value>>>,
+    /// Monotonic channel id generator for distinguishing reconnect ownership.
+    pub next_channel_id: Arc<AtomicU64>,
+}
+
+pub type ChannelId = u64;
+
+#[derive(Clone)]
+pub struct McpSession {
+    pub channel_id: ChannelId,
+    pub sender: ChannelSender,
 }
 
 impl McpChannelState {
@@ -46,6 +59,7 @@ impl McpChannelState {
         Self {
             sessions: Arc::new(DashMap::new()),
             awaiting_answers: Arc::new(DashMap::new()),
+            next_channel_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -80,7 +94,12 @@ pub async fn init(
         }
     };
 
-    debug!("MCP channel join for session_id: {}", session_id);
+    let channel_id = state.next_channel_id.fetch_add(1, Ordering::SeqCst);
+
+    debug!(
+        "MCP channel join for session_id: {}, channel_id: {}",
+        session_id, channel_id
+    );
 
     let sender = ChannelSender {
         tx: outgoing_tx.clone(),
@@ -89,7 +108,9 @@ pub async fn init(
     };
 
     // Register this channel's sender for the session
-    state.sessions.insert(session_id.clone(), sender);
+    state
+        .sessions
+        .insert(session_id.clone(), McpSession { channel_id, sender });
 
     // Send success reply
     let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({})));
@@ -103,7 +124,7 @@ pub async fn init(
 
                     // Check if this is a reply to a pending request
                     if let Some(id) = json_rpc_message.get("id") {
-                        let key = (session_id.clone(), id.clone());
+                        let key = (session_id.clone(), channel_id, id.clone());
                         if let Some((_, response_tx)) = state.awaiting_answers.remove(&key) {
                             if response_tx.send(json_rpc_message.clone()).is_err() {
                                 warn!("Failed to send response to waiting request");
@@ -132,14 +153,19 @@ pub async fn init(
         }
     }
 
-    debug!("MCP channel terminating for session_id: {}", session_id);
-    state.sessions.remove(&session_id);
+    debug!(
+        "MCP channel terminating for session_id: {}, channel_id: {}",
+        session_id, channel_id
+    );
+    state
+        .sessions
+        .remove_if(&session_id, |_, session| session.channel_id == channel_id);
 
     // Clean up any pending responses for this session
     let keys_to_remove: Vec<_> = state
         .awaiting_answers
         .iter()
-        .filter(|entry| entry.key().0 == session_id)
+        .filter(|entry| entry.key().0 == session_id && entry.key().1 == channel_id)
         .map(|entry| entry.key().clone())
         .collect();
 
@@ -184,9 +210,9 @@ pub async fn mcp_channel_client_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Look up the session's sender in the registry
-    let sender = match state.sessions.get(&session_id) {
-        Some(sender) => sender.clone(),
+    // Look up the current session channel in the registry.
+    let session = match state.sessions.get(&session_id) {
+        Some(session) => session.clone(),
         None => {
             error!("Session not found: {}", session_id);
             let error_response = json!({
@@ -204,7 +230,7 @@ pub async fn mcp_channel_client_handler(
     // Create response channel if this is a request (has "id")
     let response_rx = if let Some(id) = json_rpc_message.get("id") {
         let (tx, rx) = oneshot::channel();
-        let key = (session_id.clone(), id.clone());
+        let key = (session_id.clone(), session.channel_id, id.clone());
         state.awaiting_answers.insert(key, tx);
         Some(rx)
     } else {
@@ -212,7 +238,7 @@ pub async fn mcp_channel_client_handler(
     };
 
     // Push the message directly to the browser
-    sender.push("mcp_message", json_rpc_message.clone());
+    session.sender.push("mcp_message", json_rpc_message.clone());
 
     // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {
