@@ -19,7 +19,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{mpsc::error::SendError, mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::phoenix::{InitResult, PhxMessage};
@@ -162,23 +162,17 @@ pub async fn init(
         .remove_if(&session_id, |_, session| session.channel_id == channel_id);
 
     // Clean up any pending responses for this session
-    let keys_to_remove: Vec<_> = state
-        .awaiting_answers
-        .iter()
-        .filter(|entry| entry.key().0 == session_id && entry.key().1 == channel_id)
-        .map(|entry| entry.key().clone())
-        .collect();
-
-    for key in keys_to_remove {
-        if let Some((_, tx)) = state.awaiting_answers.remove(&key) {
-            let _ = tx.send(json!({
-                "error": {
-                    "code": -32000,
-                    "message": "Channel connection closed"
-                }
-            }));
-        }
-    }
+    cleanup_pending_answers(
+        state,
+        &session_id,
+        channel_id,
+        json!({
+            "error": {
+                "code": -32000,
+                "message": "Channel connection closed"
+            }
+        }),
+    );
 
     InitResult::Done
 }
@@ -210,35 +204,47 @@ pub async fn mcp_channel_client_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Look up the current session channel in the registry.
-    let session = match state.sessions.get(&session_id) {
-        Some(session) => session.clone(),
-        None => {
-            error!("Session not found: {}", session_id);
-            let error_response = json!({
-                "jsonrpc": "2.0",
-                "id": json_rpc_message.get("id"),
-                "error": {
-                    "code": -32000,
-                    "message": "Browser is not connected. Abort any generation until a manual user retry."
-                }
-            });
-            return Ok(Json(error_response).into_response());
+    let mut pending_key = None;
+    let mut response_rx = None;
+    let mut failed_channel_id = None;
+
+    {
+        // Keep the session entry borrowed until after the send. This prevents a
+        // reconnect from swapping the registered channel between lookup and push.
+        let session = match state.sessions.get(&session_id) {
+            Some(session) => session,
+            None => {
+                error!("Session not found: {}", session_id);
+                return Ok(
+                    browser_disconnected_response(json_rpc_message.get("id")).into_response()
+                );
+            }
+        };
+
+        // Create response channel if this is a request (has "id")
+        if let Some(id) = json_rpc_message.get("id") {
+            let key = (session_id.clone(), session.channel_id, id.clone());
+            let (tx, rx) = oneshot::channel();
+            state.awaiting_answers.insert(key.clone(), tx);
+            pending_key = Some(key);
+            response_rx = Some(rx);
         }
-    };
 
-    // Create response channel if this is a request (has "id")
-    let response_rx = if let Some(id) = json_rpc_message.get("id") {
-        let (tx, rx) = oneshot::channel();
-        let key = (session_id.clone(), session.channel_id, id.clone());
-        state.awaiting_answers.insert(key, tx);
-        Some(rx)
-    } else {
-        None
-    };
+        // Push the message directly to the browser
+        if try_push_mcp_message(&session, json_rpc_message.clone()).is_err() {
+            failed_channel_id = Some(session.channel_id);
+        }
+    }
 
-    // Push the message directly to the browser
-    session.sender.push("mcp_message", json_rpc_message.clone());
+    if let Some(channel_id) = failed_channel_id {
+        if let Some(key) = &pending_key {
+            state.awaiting_answers.remove(key);
+        }
+        state
+            .sessions
+            .remove_if(&session_id, |_, current| current.channel_id == channel_id);
+        return Ok(browser_disconnected_response(json_rpc_message.get("id")).into_response());
+    }
 
     // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {
@@ -258,5 +264,42 @@ pub async fn mcp_channel_client_handler(
             .status(StatusCode::ACCEPTED)
             .body(axum::body::Body::empty())
             .unwrap())
+    }
+}
+
+fn browser_disconnected_response(request_id: Option<&Value>) -> Json<Value> {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": request_id.cloned().unwrap_or(Value::Null),
+        "error": {
+            "code": -32000,
+            "message": "Browser is not connected. Abort any generation until a manual user retry."
+        }
+    }))
+}
+
+fn try_push_mcp_message(session: &McpSession, payload: Value) -> Result<(), SendError<PhxMessage>> {
+    let mut phx = PhxMessage::new(&session.sender.topic, "mcp_message", payload);
+    phx.join_ref = session.sender.join_ref.clone();
+    session.sender.tx.send(phx)
+}
+
+fn cleanup_pending_answers(
+    state: &McpChannelState,
+    session_id: &str,
+    channel_id: ChannelId,
+    response: Value,
+) {
+    let keys_to_remove: Vec<_> = state
+        .awaiting_answers
+        .iter()
+        .filter(|entry| entry.key().0 == session_id && entry.key().1 == channel_id)
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    for key in keys_to_remove {
+        if let Some((_, tx)) = state.awaiting_answers.remove(&key) {
+            let _ = tx.send(response.clone());
+        }
     }
 }

@@ -6,8 +6,9 @@ use common::{create_fake_phoenix_socket, recv_phoenix_msg, send_phoenix_msg, wai
 use serde_json::{json, Value};
 use tidewave_core::phoenix::PhxMessage;
 use tidewave_core::ws::connection::unit_testable_ws_handler;
-use tidewave_core::ws::mcp::{mcp_channel_client_handler, McpChannelState, McpParams};
-use tidewave_core::ws::WsState;
+use tidewave_core::ws::mcp::{mcp_channel_client_handler, McpChannelState, McpParams, McpSession};
+use tidewave_core::ws::{ChannelSender, WsState};
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_old_mcp_channel_disconnect_does_not_remove_reconnected_session() {
@@ -100,4 +101,56 @@ async fn test_old_mcp_channel_disconnect_does_not_remove_reconnected_session() {
         .expect("response body should be readable");
     let response_json: Value = serde_json::from_slice(&body).expect("response should be JSON");
     assert_eq!(response_json["result"]["tools"], json!([]));
+}
+
+#[tokio::test]
+async fn test_mcp_http_request_returns_error_when_registered_sender_is_closed() {
+    let mcp_state = McpChannelState::new();
+    let session_id = "sess_closed_sender";
+    let topic = format!("mcp:{session_id}");
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+
+    mcp_state.sessions.insert(
+        session_id.to_string(),
+        McpSession {
+            channel_id: 1,
+            sender: ChannelSender {
+                tx,
+                topic,
+                join_ref: Some("closed".to_string()),
+            },
+        },
+    );
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list"
+    });
+
+    let response = tokio::time::timeout(
+        tokio::time::Duration::from_millis(250),
+        mcp_channel_client_handler(
+            Query(McpParams {
+                session_id: Some(session_id.to_string()),
+            }),
+            State(mcp_state.clone()),
+            Bytes::from(serde_json::to_vec(&request).unwrap()),
+        ),
+    )
+    .await
+    .expect("handler should not hang when channel sender is closed")
+    .expect("handler should return JSON-RPC error");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    let response_json: Value = serde_json::from_slice(&body).expect("response should be JSON");
+    assert_eq!(response_json["id"], 1);
+    assert_eq!(response_json["error"]["code"], -32000);
+    assert!(
+        mcp_state.awaiting_answers.is_empty(),
+        "closed sender should not leave pending answers behind"
+    );
 }
