@@ -118,7 +118,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -333,6 +333,10 @@ pub struct ProcessState {
     /// Epoch counter bumped each time a client connects. Used to invalidate
     /// pending inactivity timers when a new client arrives.
     pub connect_epoch: AtomicU64,
+
+    /// Channels currently connected to this process. Used to broadcast
+    /// process messages that are not scoped to a particular session.
+    pub channels: RwLock<HashSet<ChannelId>>,
 }
 
 pub struct SessionState {
@@ -444,6 +448,7 @@ impl ProcessState {
             stdout_buffer: RwLock::new(Vec::new()),
             stderr_buffer: RwLock::new(Vec::new()),
             connect_epoch: AtomicU64::new(0),
+            channels: RwLock::new(HashSet::new()),
         }
     }
 
@@ -510,6 +515,18 @@ impl ProcessState {
         self.inflight_requests
             .remove(proxy_id)
             .map(|(_, request)| request)
+    }
+
+    pub async fn add_channel(&self, channel_id: ChannelId) {
+        self.channels.write().await.insert(channel_id);
+    }
+
+    pub async fn remove_channel(&self, channel_id: ChannelId) {
+        self.channels.write().await.remove(&channel_id);
+    }
+
+    pub async fn connected_channels(&self) -> Vec<ChannelId> {
+        self.channels.read().await.iter().copied().collect()
     }
 
     pub async fn session_state(&self, session_id: &str) -> Option<Arc<SessionState>> {
@@ -954,6 +971,10 @@ pub async fn init(
         }
     };
 
+    // Track this channel so process messages without a sessionId can be
+    // broadcast to all connected clients.
+    process_state.add_channel(channel_id).await;
+
     // Send success reply
     let _ = outgoing_tx.send(PhxMessage::ok_reply(msg, json!({})));
 
@@ -1032,6 +1053,7 @@ pub async fn init(
     drop(exit_rx);
 
     state.channel_senders.remove(&channel_id);
+    process_state.remove_channel(channel_id).await;
 
     // Capture sessions for this channel and remove channel ownership.
     let sessions_for_channel = process_state.unmap_sessions_for_channel(channel_id).await;
@@ -2303,10 +2325,17 @@ async fn handle_process_notification_or_request(
             warn!("Session not found for sessionId: {}", session_id);
         }
     } else {
-        warn!(
-            "Message from process missing sessionId, ignoring: {:?}",
+        // No sessionId: forward to every client connected to this process.
+        debug!(
+            "Message from process missing sessionId, forwarding to all connected clients: {:?}",
             message
         );
+
+        for channel_id in process_state.connected_channels().await {
+            if let Some(sender) = state.channel_senders.get(&channel_id) {
+                push_jsonrpc(&sender, &message);
+            }
+        }
     }
 
     Ok(())
@@ -3021,6 +3050,75 @@ mod tests {
         };
         assert_eq!(buffered_response.id, client_id);
         assert_eq!(buffered_response.result, response.result);
+    }
+
+    #[tokio::test]
+    async fn test_message_without_session_id_broadcast_to_connected_channels() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+
+        // Two clients connected to this process.
+        let channel_a = Uuid::new_v4();
+        let channel_b = Uuid::new_v4();
+        process.add_channel(channel_a).await;
+        process.add_channel(channel_b).await;
+
+        // A third channel that exists globally but belongs to another process
+        // (never registered on this process_state).
+        let channel_other = Uuid::new_v4();
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_other, mut rx_other) = mpsc::unbounded_channel();
+        state.channel_senders.insert(
+            channel_a,
+            ChannelSender {
+                tx: tx_a,
+                topic: "acp:test".to_string(),
+                join_ref: Some("ja".to_string()),
+            },
+        );
+        state.channel_senders.insert(
+            channel_b,
+            ChannelSender {
+                tx: tx_b,
+                topic: "acp:test".to_string(),
+                join_ref: Some("jb".to_string()),
+            },
+        );
+        state.channel_senders.insert(
+            channel_other,
+            ChannelSender {
+                tx: tx_other,
+                topic: "acp:other".to_string(),
+                join_ref: Some("jo".to_string()),
+            },
+        );
+
+        // A notification from the process that is not scoped to a session.
+        let message = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "some/global_notification".to_string(),
+            params: Some(json!({ "data": "no_session" })),
+        });
+
+        handle_process_notification_or_request(&process, &state, message)
+            .await
+            .expect("message should be handled");
+
+        for rx in [&mut rx_a, &mut rx_b] {
+            let sent = rx.recv().await.expect("Expected message to be forwarded");
+            assert_eq!(sent.event, "jsonrpc");
+            let payload = sent.payload.as_json();
+            assert_eq!(payload["method"], "some/global_notification");
+            assert_eq!(payload["params"]["data"], "no_session");
+        }
+
+        // A channel not connected to this process must not receive the message.
+        assert!(
+            rx_other.try_recv().is_err(),
+            "channel from another process should not receive the broadcast"
+        );
     }
 
     #[tokio::test]
