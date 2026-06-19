@@ -12,7 +12,39 @@ permissions:
   contents: write
 
 jobs:
+  check-build:
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.recent-commit.outputs.should-build }}
+    steps:
+      - name: Checkout repository
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+
+      - name: Check for recent commits
+        id: recent-commit
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" != "schedule" ]]; then
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cutoff="$(date -u -d '36 hours ago' +%s)"
+          latest_commit="$(git log -1 --format=%ct)"
+
+          if [[ "$latest_commit" -ge "$cutoff" ]]; then
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No commits in the last 36 hours; skipping nightly build."
+            echo "should-build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   ensure-release:
+    needs: [check-build]
+    if: needs.check-build.outputs.should-build == 'true'
     runs-on: ubuntu-latest
     outputs:
       release-name: ${{ steps.ensure-release.outputs.release-name }}
@@ -59,7 +91,8 @@ jobs:
 
   build:
     name: ${{ matrix.gui_target && format('GUI ({0})', matrix.gui_target) || format('CLI ({0})', matrix.cli_targets) }}
-    needs: [ensure-release]
+    needs: [check-build, ensure-release]
+    if: needs.check-build.outputs.should-build == 'true'
     outputs:
       app-version: ${{ steps.app-version.outputs.version }}
     strategy:
