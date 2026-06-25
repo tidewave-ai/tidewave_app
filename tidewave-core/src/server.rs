@@ -264,6 +264,8 @@ struct ServerConfig {
     allowed_origins: Vec<String>,
     port: u16,
     https_port: Option<u16>,
+    // Whether this config belongs to the development server (the dev port).
+    dev: bool,
 }
 
 pub async fn start_http_server(
@@ -279,6 +281,28 @@ fn get_bind_addr(port: u16, allow_remote_access: bool) -> std::net::SocketAddr {
         std::net::Ipv4Addr::LOCALHOST
     };
     std::net::SocketAddr::from((ip, port))
+}
+
+fn with_server_config(router: Router, server_config: ServerConfig) -> Router {
+    router.layer(middleware::from_fn(move |mut req: Request, next| {
+        req.extensions_mut().insert(server_config.clone());
+        verify_origin(req, next)
+    }))
+}
+
+fn with_client_proxy(mut router: Router, client: &Client, client_url: String) -> Router {
+    // Proxy /tidewave to the client dev server.
+    for route_path in ["/tidewave", "/tidewave/{*path}"] {
+        let client = client.clone();
+        let client_url = client_url.clone();
+        router = router.route(
+            route_path,
+            axum::routing::any(move |req| {
+                client_proxy_handler(req, client.clone(), client_url.clone())
+            }),
+        );
+    }
+    router
 }
 
 pub async fn serve_http_server_with_shutdown(
@@ -321,6 +345,12 @@ async fn serve_http_server_inner(
     };
 
     let https_port = config.https_port;
+
+    // Optional development port - serves the same app on an additional HTTP port
+    let dev_port = env::var("TIDEWAVE_DEV_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok());
+
     let download_state = DownloadState::new();
 
     // Build allowed origins for both HTTP and HTTPS
@@ -334,10 +364,16 @@ async fn serve_http_server_inner(
         allowed_origins.push(format!("https://127.0.0.1:{}", https_port));
     }
 
+    if let Some(dev_port) = dev_port {
+        allowed_origins.push(format!("http://localhost:{}", dev_port));
+        allowed_origins.push(format!("http://127.0.0.1:{}", dev_port));
+    }
+
     let server_config = ServerConfig {
         allowed_origins,
         port,
         https_port,
+        dev: false,
     };
 
     // Create download routes
@@ -372,7 +408,7 @@ async fn serve_http_server_inner(
 
     // Create the main app without state
     let client_for_proxy = client.clone();
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/", get(root_handler))
         .route("/manifest.json", get(manifest_json_handler))
         .route("/sw.js", get(service_worker_handler))
@@ -405,29 +441,23 @@ async fn serve_http_server_inner(
         .merge(ws_routes)
         .merge(mcp_channel_post_routes);
 
-    // Add dev mode proxy routes if TIDEWAVE_CLIENT_PROXY=1 and
-    // TIDEWAVE_CLIENT_URL is set
-    if env::var("TIDEWAVE_CLIENT_PROXY").as_deref() == Ok("1") {
+    // The dev server mirrors the main app, with the following differences:
+    //   * it exposes /tidewave proxying to the local TS, so the app is
+    //     Tidewave-enabled
+    //   * it disables CSP, so it can be embedded in Tidewave
+    let dev_app = dev_port.map(|_| {
+        let mut dev_app = app.clone();
         if let Ok(client_url) = env::var("TIDEWAVE_CLIENT_URL") {
-            for route_path in ["/tidewave", "/tidewave/{*path}"] {
-                let client_url_clone = client_url.clone();
-                let client_clone = client.clone();
-                app = app.route(
-                    route_path,
-                    axum::routing::any(move |req| {
-                        let client = client_clone.clone();
-                        let dev_url = client_url_clone.clone();
-                        client_proxy_handler(req, client, dev_url)
-                    }),
-                );
-            }
+            dev_app = with_client_proxy(dev_app, &client, client_url);
         }
-    }
+        let dev_config = ServerConfig {
+            dev: true,
+            ..server_config.clone()
+        };
+        with_server_config(dev_app, dev_config)
+    });
 
-    let app = app.layer(middleware::from_fn(move |mut req: Request, next| {
-        req.extensions_mut().insert(server_config.clone());
-        verify_origin(req, next)
-    }));
+    let app = with_server_config(app, server_config);
 
     // Optionally set up HTTPS server
     let (https_handle, https_task) = if let Some(https_port) = https_port {
@@ -463,6 +493,27 @@ async fn serve_http_server_inner(
         (None, None)
     };
 
+    // Optionally start an additional HTTP server on the development port
+    let (dev_handle, dev_task) = match (dev_port, dev_app) {
+        (Some(dev_port), Some(dev_app)) => {
+            info!("Starting dev HTTP server on port {}", dev_port);
+
+            let dev_addr = get_bind_addr(dev_port, config.allow_remote_access);
+            let dev_handle = axum_server::Handle::new();
+            let dev_handle_clone = dev_handle.clone();
+
+            let task = tokio::spawn(async move {
+                axum_server::bind(dev_addr)
+                    .handle(dev_handle_clone)
+                    .serve(dev_app.into_make_service())
+                    .await
+            });
+
+            (Some(dev_handle), Some(task))
+        }
+        _ => (None, None),
+    };
+
     // Start HTTP server
     let http_handle_clone = http_handle.clone();
     let http_task = if let Some(listener) = listener {
@@ -486,6 +537,7 @@ async fn serve_http_server_inner(
     tokio::spawn({
         let http_handle = http_handle.clone();
         let https_handle = https_handle.clone();
+        let dev_handle = dev_handle.clone();
         async move {
             shutdown_signal.await;
             info!("Shutdown signal received, initiating graceful shutdown with 10s timeout");
@@ -493,14 +545,21 @@ async fn serve_http_server_inner(
             if let Some(handle) = https_handle {
                 handle.graceful_shutdown(Some(Duration::from_secs(10)));
             }
+            if let Some(handle) = dev_handle {
+                handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            }
         }
     });
 
-    // Wait for both servers
+    // Wait for all servers
     let http_result = http_task.await;
     if let Some(https_task) = https_task {
         let https_result = https_task.await;
         https_result??;
+    }
+    if let Some(dev_task) = dev_task {
+        let dev_result = dev_task.await;
+        dev_result??;
     }
     http_result??;
 
@@ -1352,7 +1411,13 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-async fn root_handler(_req: Request) -> Response<Body> {
+async fn root_handler(req: Request) -> Response<Body> {
+    let dev = req
+        .extensions()
+        .get::<ServerConfig>()
+        .map(|config| config.dev)
+        .unwrap_or(false);
+
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
@@ -1383,14 +1448,18 @@ async fn root_handler(_req: Request) -> Response<Body> {
         client_url,
     );
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(
+    let mut builder = Response::builder().header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+
+    // We skip the frame restriction on the dev port, so the app can
+    // be embedded in Tidewave itself.
+    if !dev {
+        builder = builder.header(
             header::CONTENT_SECURITY_POLICY,
             "base-uri 'self'; frame-ancestors 'self'",
-        )
-        .body(Body::from(html))
-        .unwrap()
+        );
+    }
+
+    builder.body(Body::from(html)).unwrap()
 }
 
 async fn manifest_json_handler() -> Response<Body> {
