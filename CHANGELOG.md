@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.5 (2026-06-30)
+
+* Strip PYTHONHOME AND PYTHONPATH from AppImage
+* Forward messages without sessionId to all connected clients
+* Use `wsl_distro` instead of `is_wsl`
+* Address race conditions on ACP and MCP after Codex review
+
 ## v0.4.4 (2026-05-05)
 
 * Add port information to `/about` route
