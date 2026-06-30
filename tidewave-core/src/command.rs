@@ -103,6 +103,8 @@ pub fn cleanup_appimage_env(cmd: &mut std::process::Command) {
             "LIBVA_DRIVERS_PATH",
             "PERLLIB",
             "PIPEWIRE_MODULE_DIR",
+            "PYTHONHOME",
+            "PYTHONPATH",
             "QT_PLUGIN_PATH",
             "SPA_PLUGIN_DIR",
             "TCL_LIBRARY",
