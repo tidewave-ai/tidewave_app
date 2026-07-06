@@ -2362,10 +2362,12 @@ fn check_supports_resuming(response: &JsonRpcResponse) -> bool {
         return true;
     }
 
-    // session: { fork: {}, resume: {} }
-    if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
-        if session.contains_key("fork") || session.contains_key("resume") {
-            return true;
+    // sessionCapabilities: { fork: {}, resume: {} } ("session" is a legacy key)
+    for key in ["sessionCapabilities", "session"] {
+        if let Some(session) = caps.get(key).and_then(|v| v.as_object()) {
+            if session.contains_key("fork") || session.contains_key("resume") {
+                return true;
+            }
         }
     }
 
@@ -2373,7 +2375,8 @@ fn check_supports_resuming(response: &JsonRpcResponse) -> bool {
 }
 
 /// Check if the agent supports session/close by examining agentCapabilities
-/// in the init response. Checks for session.close.
+/// in the init response. Checks for sessionCapabilities.close ("session" is
+/// a legacy key).
 fn check_supports_session_close(response: &JsonRpcResponse) -> bool {
     let caps = response
         .result
@@ -2384,9 +2387,11 @@ fn check_supports_session_close(response: &JsonRpcResponse) -> bool {
         return false;
     };
 
-    if let Some(session) = caps.get("session").and_then(|v| v.as_object()) {
-        if session.contains_key("close") {
-            return true;
+    for key in ["sessionCapabilities", "session"] {
+        if let Some(session) = caps.get(key).and_then(|v| v.as_object()) {
+            if session.contains_key("close") {
+                return true;
+            }
         }
     }
 
@@ -3367,6 +3372,18 @@ mod tests {
     }
 
     #[test]
+    fn test_supports_resuming_with_session_capabilities_fork() {
+        let response = make_init_response(json!({ "sessionCapabilities": { "fork": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
+    fn test_supports_resuming_with_session_capabilities_resume() {
+        let response = make_init_response(json!({ "sessionCapabilities": { "resume": {} } }));
+        assert!(check_supports_resuming(&response));
+    }
+
+    #[test]
     fn test_supports_resuming_empty_capabilities() {
         let response = make_init_response(json!({}));
         assert!(!check_supports_resuming(&response));
@@ -3403,6 +3420,32 @@ mod tests {
     fn test_supports_session_close_with_multiple_capabilities() {
         let response =
             make_init_response(json!({ "session": { "fork": {}, "resume": {}, "close": {} } }));
+        assert!(check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_supports_session_close_with_session_capabilities_close() {
+        let response = make_init_response(json!({ "sessionCapabilities": { "close": {} } }));
+        assert!(check_supports_session_close(&response));
+    }
+
+    #[test]
+    fn test_capabilities_from_claude_agent_acp_response() {
+        // agentCapabilities exactly as advertised by claude-agent-acp v0.51.0
+        let response = make_init_response(json!({
+            "promptCapabilities": { "image": true, "embeddedContext": true },
+            "mcpCapabilities": { "http": true, "sse": true },
+            "loadSession": true,
+            "sessionCapabilities": {
+                "additionalDirectories": {},
+                "close": {},
+                "delete": {},
+                "fork": {},
+                "list": {},
+                "resume": {}
+            }
+        }));
+        assert!(check_supports_resuming(&response));
         assert!(check_supports_session_close(&response));
     }
 

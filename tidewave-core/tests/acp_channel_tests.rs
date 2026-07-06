@@ -1380,6 +1380,184 @@ async fn test_late_session_new_response_does_not_claim_disconnected_channel() {
     assert_eq!(response["result"]["cancelled"], false);
 }
 
+// agentCapabilities exactly as advertised by claude-agent-acp (>= v0.44.0)
+fn claude_agent_capabilities() -> Value {
+    json!({
+        "loadSession": true,
+        "sessionCapabilities": {
+            "additionalDirectories": {},
+            "close": {},
+            "delete": {},
+            "fork": {},
+            "list": {},
+            "resume": {}
+        }
+    })
+}
+
+/// Joins a channel and drives initialize with the given agentCapabilities.
+/// Returns the process state and the socket handles.
+async fn setup_initialized_channel(
+    state: &AcpChannelState,
+    test_stdin: &mut DuplexStream,
+    test_stdout: &mut DuplexStream,
+    process_started: tokio::sync::oneshot::Receiver<()>,
+    agent_capabilities: Value,
+) -> (
+    Arc<ProcessState>,
+    futures::channel::mpsc::UnboundedSender<Result<axum::extract::ws::Message, axum::Error>>,
+    futures::channel::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+) {
+    let ws_state = WsState::new().with_acp_state(state.clone());
+    let (out_tx, mut out_rx, in_tx, in_rx) = create_fake_phoenix_socket();
+
+    tokio::spawn(async move {
+        unit_testable_ws_handler(out_tx, in_rx, ws_state, uuid::Uuid::new_v4()).await;
+    });
+
+    let join_msg = PhxMessage::new("acp:test", "phx_join", spawn_opts())
+        .with_ref("1")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &join_msg);
+    let reply = recv_phoenix_msg(&mut out_rx)
+        .await
+        .expect("Expected join reply");
+    assert_eq!(reply.payload.as_json()["status"], "ok");
+
+    process_started.await.expect("Process failed to start");
+
+    let process_state = state
+        .processes
+        .get("test_acp:.")
+        .expect("Expected process to exist")
+        .clone();
+
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {}
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", init_request)
+        .with_ref("2")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let init_req = read_json_line(test_stdout).await;
+    write_json_line(
+        test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": init_req["id"],
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": agent_capabilities
+            }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(&mut out_rx).await;
+
+    (process_state, in_tx, out_rx)
+}
+
+/// Sends session/new on an initialized channel and completes it with the
+/// given session_id. Leaves the session mapped to the channel.
+async fn create_session_on_channel(
+    process_state: &ProcessState,
+    test_stdin: &mut DuplexStream,
+    test_stdout: &mut DuplexStream,
+    in_tx: &futures::channel::mpsc::UnboundedSender<
+        Result<axum::extract::ws::Message, axum::Error>,
+    >,
+    out_rx: &mut futures::channel::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+    session_id: &str,
+) {
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_1",
+        "method": "session/new",
+        "params": { "cwd": "/tmp", "mcpServers": [] }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", session_new)
+        .with_ref("3")
+        .with_join_ref("j1");
+    send_phoenix_msg(in_tx, &push_msg);
+
+    let new_req = read_json_line(test_stdout).await;
+    write_json_line(
+        test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_req["id"],
+            "result": { "sessionId": session_id }
+        }),
+    )
+    .await;
+    let _ = recv_phoenix_msg(out_rx).await;
+
+    assert!(
+        process_state.session_channel(session_id).await.is_some(),
+        "Session should be mapped to the channel after session/new"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_disconnect_reaps_session_with_close_for_session_capabilities_agent() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let (process_state, in_tx, mut out_rx) = setup_initialized_channel(
+        &state,
+        &mut test_stdin,
+        &mut test_stdout,
+        process_started,
+        claude_agent_capabilities(),
+    )
+    .await;
+    create_session_on_channel(
+        &process_state,
+        &mut test_stdin,
+        &mut test_stdout,
+        &in_tx,
+        &mut out_rx,
+        "sess_reap_me",
+    )
+    .await;
+
+    // Disconnect the channel; the 10s grace reaper should send session/close
+    // (NOT session/cancel) because claude-agent-acp advertises
+    // sessionCapabilities.close.
+    drop(in_tx);
+
+    let reap_request = tokio::time::timeout(
+        tokio::time::Duration::from_secs(60),
+        read_json_line(&mut test_stdout),
+    )
+    .await
+    .expect("Expected the reaper to send a message to the process after the grace period");
+
+    assert_eq!(
+        reap_request["method"], "session/close",
+        "Reaper must send session/close for agents that support it, got: {}",
+        reap_request
+    );
+    assert_eq!(reap_request["params"]["sessionId"], "sess_reap_me");
+
+    // Session must be removed from the books after the close.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+    loop {
+        if process_state.session_state("sess_reap_me").await.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Session should be removed from the books after session/close"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_same_session_id_routes_within_each_process() {
     let (starter, mut processes_rx) = create_multi_process_starter();
