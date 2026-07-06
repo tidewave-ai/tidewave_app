@@ -1558,6 +1558,91 @@ async fn test_disconnect_reaps_session_with_close_for_session_capabilities_agent
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_late_session_new_response_reaps_abandoned_session_after_grace() {
+    let (starter, mut test_stdin, mut test_stdout, process_started) = create_fake_process_starter();
+    let state = AcpChannelState::with_process_starter(starter);
+
+    let (process_state, in_tx, mut out_rx) = setup_initialized_channel(
+        &state,
+        &mut test_stdin,
+        &mut test_stdout,
+        process_started,
+        claude_agent_capabilities(),
+    )
+    .await;
+
+    // Send session/new, then disconnect BEFORE the agent responds. The
+    // channel's disconnect cleanup finds no session to unmap (it doesn't
+    // exist yet), so only the late-response path can reap it.
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": "new_1",
+        "method": "session/new",
+        "params": { "cwd": "/tmp", "mcpServers": [] }
+    });
+    let push_msg = PhxMessage::new("acp:test", "jsonrpc", session_new)
+        .with_ref("3")
+        .with_join_ref("j1");
+    send_phoenix_msg(&in_tx, &push_msg);
+
+    let new_req = read_json_line(&mut test_stdout).await;
+    assert_eq!(new_req["method"], "session/new");
+
+    drop(in_tx);
+    assert!(
+        wait_for_event(&mut out_rx, "jsonrpc", 100).await.is_none(),
+        "Disconnected client should not receive the late session/new response"
+    );
+
+    write_json_line(
+        &mut test_stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_req["id"],
+            "result": { "sessionId": "sess_late_reap" }
+        }),
+    )
+    .await;
+
+    assert!(
+        wait_for_inactive_session(&process_state, "sess_late_reap").await,
+        "Late session/new response should register the session as inactive"
+    );
+
+    // Nobody reclaims the session, so after the grace period the proxy must
+    // send session/close instead of leaking the agent-side session forever.
+    let reap_request = tokio::time::timeout(
+        tokio::time::Duration::from_secs(60),
+        read_json_line(&mut test_stdout),
+    )
+    .await
+    .expect("Expected the reaper to close the abandoned late-response session");
+
+    assert_eq!(
+        reap_request["method"], "session/close",
+        "Reaper must close the abandoned session, got: {}",
+        reap_request
+    );
+    assert_eq!(reap_request["params"]["sessionId"], "sess_late_reap");
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+    loop {
+        if process_state
+            .session_state("sess_late_reap")
+            .await
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Session should be removed from the books after session/close"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_same_session_id_routes_within_each_process() {
     let (starter, mut processes_rx) = create_multi_process_starter();

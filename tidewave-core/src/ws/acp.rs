@@ -1058,20 +1058,8 @@ pub async fn init(
     // Capture sessions for this channel and remove channel ownership.
     let sessions_for_channel = process_state.unmap_sessions_for_channel(channel_id).await;
 
-    // Spawn a task to send session/cancel or session/close after 10 seconds
-    let process_state_clone = process_state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-        for (session_id, counter) in sessions_for_channel {
-            stop_unmapped_session_if_still_disconnected(
-                process_state_clone.clone(),
-                session_id,
-                counter,
-            )
-            .await;
-        }
-    });
+    // Send session/cancel or session/close after the grace period.
+    schedule_unmapped_sessions_reap(process_state.clone(), sessions_for_channel);
 
     // If this was the last connected client, spawn a 1-minute inactivity timer
     // that stops the process if the agent supports resuming sessions.
@@ -1116,6 +1104,28 @@ pub async fn init(
     }
 
     result
+}
+
+/// Schedules the grace-period reaper for sessions that just lost their
+/// channel. After the grace period, each session that is still unmapped (and
+/// whose cancel counter is unchanged) is closed or cancelled so agent-side
+/// sessions are never leaked.
+fn schedule_unmapped_sessions_reap(
+    process_state: Arc<ProcessState>,
+    sessions: Vec<(SessionId, u64)>,
+) {
+    if sessions.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        for (session_id, counter) in sessions {
+            stop_unmapped_session_if_still_disconnected(process_state.clone(), session_id, counter)
+                .await;
+        }
+    });
 }
 
 async fn stop_unmapped_session_if_still_disconnected(
@@ -2186,12 +2196,29 @@ async fn create_session_from_agent_response(
             "Created session {} from late agent response without active channel",
             session_id
         );
+        schedule_reap_if_unmapped(&process_state, &session_id).await;
     }
 
     if !inserted && process_state.session_channel(&session_id).await != Some(channel_id) {
         warn!(
             "Unexpectedly got new/fork session response for already known session! {}",
             session_id
+        );
+    }
+}
+
+/// Schedules the grace-period reaper for a session that was unmapped outside
+/// the regular channel-disconnect cleanup (e.g. a session/new or session/load
+/// response arriving after its channel died). Without this, such sessions
+/// would stay alive on the agent side forever.
+async fn schedule_reap_if_unmapped(process_state: &Arc<ProcessState>, session_id: &str) {
+    if let Some(session_state) = process_state.session_state(session_id).await {
+        schedule_unmapped_sessions_reap(
+            process_state.clone(),
+            vec![(
+                session_id.to_string(),
+                session_state.cancel_counter.load(Ordering::Relaxed),
+            )],
         );
     }
 }
@@ -2211,6 +2238,7 @@ async fn confirm_claimed_session_response(
             "Confirmed session {} from late load/resume response without active channel",
             session_id
         );
+        schedule_reap_if_unmapped(process_state, &session_id).await;
         return;
     }
 
@@ -3329,6 +3357,96 @@ mod tests {
 
         // Should add notification ID
         assert_eq!(meta.get("tidewave.ai/notificationId").unwrap(), "notif_99");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_late_load_response_reaps_session_unmapped_after_disconnect_cleanup() {
+        let state = AcpChannelState::new();
+        let process = Arc::new(ProcessState::new("test_key".to_string(), test_spawn_opts()));
+
+        // Agent supports session/close.
+        let init_id = Value::Number(serde_json::Number::from(0));
+        let _ = process.init_state.begin(init_id.clone()).await;
+        process
+            .init_state
+            .complete_if_current(
+                &init_id,
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: init_id.clone(),
+                    result: Some(json!({})),
+                    error: None,
+                },
+                AgentCapabilities {
+                    supports_resuming: true,
+                    supports_session_close: true,
+                },
+            )
+            .await;
+
+        // Observe messages sent to the process.
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+        *process.stdin_tx.write().await = Some(stdin_tx);
+
+        // Session claimed by a channel with no registered sender, simulating a
+        // load response racing ahead of the channel's disconnect cleanup (which
+        // has already removed the sender but not yet unmapped the session).
+        let dead_channel = Uuid::new_v4();
+        process
+            .claim_or_insert_session_channel("sess_race".to_string(), dead_channel, &process.key)
+            .await
+            .expect("claim should succeed");
+
+        let load_response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Value::String("load_1".to_string()),
+            result: Some(json!({})),
+            error: None,
+        };
+        maybe_handle_pending_request(
+            &process,
+            &state,
+            dead_channel,
+            Some(PendingRequest::SessionLoad {
+                session_id: "sess_race".to_string(),
+                created_session: true,
+            }),
+            &load_response,
+        )
+        .await
+        .expect("pending request handling should succeed");
+
+        assert!(
+            process.session_channel("sess_race").await.is_none(),
+            "Session must be unmapped after a late response for a dead channel"
+        );
+
+        // After the grace period the session must be reaped, not leaked.
+        let reap_message =
+            tokio::time::timeout(tokio::time::Duration::from_secs(60), stdin_rx.recv())
+                .await
+                .expect("Expected the reaper to close the abandoned session")
+                .expect("stdin channel closed unexpectedly");
+
+        match reap_message {
+            JsonRpcMessage::Request(request) => {
+                assert_eq!(request.method, "session/close");
+                assert_eq!(request.params.unwrap()["sessionId"], "sess_race");
+            }
+            other => panic!("Expected session/close request, got: {:?}", other),
+        }
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+        loop {
+            if process.session_state("sess_race").await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Session should be removed from the books after session/close"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
     }
 
     // ============================================================================
