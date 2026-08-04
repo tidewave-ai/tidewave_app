@@ -167,7 +167,7 @@ pub fn run() {
             let restart_i = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let separator2 = PredefinedMenuItem::separator(app)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave", true, maybe_hotkey("Command+Q"))?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Tidewave IDE", true, maybe_hotkey("Command+Q"))?;
             let menu = Menu::with_items(app, &[&open_tidewave_i, &separator, &open_config_i, &view_logs_i, &separator2, &launch_at_login_i, &check_for_updates_i, &restart_i, &quit_i])?;
 
             let launch_at_login_item = launch_at_login_i.clone();

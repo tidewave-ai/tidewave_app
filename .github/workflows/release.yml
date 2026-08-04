@@ -241,7 +241,7 @@ jobs:
         if: runner.os == 'macOS' && matrix.gui_target != ''
         shell: bash
         run: |
-          app_path="target/${{ matrix.gui_target }}/release/bundle/macos/tidewave.app"
+          app_path="target/${{ matrix.gui_target }}/release/bundle/macos/Tidewave IDE.app"
           echo "Verifying $app_path"
           spctl -a -t exec -vvv "$app_path"
 
