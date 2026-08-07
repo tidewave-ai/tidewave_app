@@ -96,17 +96,6 @@ pub async fn wslpath_to_windows(
     }
 }
 
-pub fn recordings_dir() -> PathBuf {
-    dirs::video_dir()
-        .map(|d| d.join("Tidewave"))
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("tidewave")
-                .join("recordings")
-        })
-}
-
 /// Normalizes a path, converting WSL paths to Windows paths if needed.
 #[allow(unused_variables)]
 pub async fn normalize_path(path: &str, wsl_distro: Option<&str>) -> Result<String, String> {

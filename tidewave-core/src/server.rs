@@ -1,9 +1,7 @@
 use crate::command::{create_cmd_command, create_shell_command, spawn_command, ChildProcess};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{
-    load_tls_config_from_paths, normalize_path, recordings_dir, wslpath_to_windows,
-};
+use crate::utils::{load_tls_config_from_paths, normalize_path, wslpath_to_windows};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
@@ -25,7 +23,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
 
@@ -248,7 +245,6 @@ struct AboutResponse {
     version: String,
     system: SystemInfo,
     cache_dir: String,
-    recordings_dir: String,
     http_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     https_port: Option<u16>,
@@ -436,7 +432,6 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
-        .nest_service("/recordings", ServeDir::new(recordings_dir()))
         .merge(download_routes)
         .merge(ws_routes)
         .merge(mcp_channel_post_routes);
@@ -1345,8 +1340,6 @@ async fn about_handler(
         .to_string_lossy()
         .into_owned();
 
-    let recordings_dir = recordings_dir().to_string_lossy().into_owned();
-
     #[cfg(target_os = "windows")]
     {
         if let Some(distro) = params.wsl_distro.as_deref() {
@@ -1371,7 +1364,6 @@ async fn about_handler(
                         wsl: true,
                     },
                     cache_dir,
-                    recordings_dir,
                     http_port: port,
                     https_port,
                 }));
@@ -1394,7 +1386,6 @@ async fn about_handler(
             wsl: false,
         },
         cache_dir,
-        recordings_dir,
         http_port: port,
         https_port,
     }))
