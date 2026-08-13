@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.6 (2026-08-13)
+
+* Fix session/close handling
+* Namespace proxy request IDs in relay to avoid conflict in browser requests
+* Rename Tidewave to Tidewave IDE
+* Remove recording routes
+
 ## v0.4.5 (2026-06-30)
 
 * Strip PYTHONHOME AND PYTHONPATH from AppImage
