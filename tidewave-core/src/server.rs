@@ -119,6 +119,13 @@ struct WhichParams {
 }
 
 #[derive(Deserialize)]
+struct ShellEnvParams {
+    path: String,
+    #[serde(default)]
+    wsl_distro: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct OpenParams {
     path: String,
     #[serde(default)]
@@ -231,6 +238,19 @@ struct WhichResponse {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum ShellEnvResponse {
+    ShellEnvResponseOk {
+        success: bool,
+        env: HashMap<String, String>,
+    },
+    ShellEnvResponseErr {
+        success: bool,
+        error: String,
+    },
+}
+
+#[derive(Serialize)]
 struct SystemInfo {
     os: &'static str,
     arch: String,
@@ -247,6 +267,16 @@ struct AboutResponse {
     cache_dir: String,
     http_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
+    https_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+struct CliInfo {
+    version: String,
+    system: SystemInfo,
+    cache_dir: String,
+    home_dir: Option<String>,
+    http_port: u16,
     https_port: Option<u16>,
 }
 
@@ -424,6 +454,7 @@ async fn serve_http_server_inner(
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
+        .route("/shell-env", post(shell_env_handler))
         .route("/open", post(open_handler))
         .route(
             "/proxy",
@@ -1324,6 +1355,39 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
+async fn shell_env_handler(Json(params): Json<ShellEnvParams>) -> Json<ShellEnvResponse> {
+    match crate::shell_env::capture_shell_env(&params.path, params.wsl_distro.as_deref()).await {
+        Ok(env) => Json(ShellEnvResponse::ShellEnvResponseOk { success: true, env }),
+        Err(error) => Json(ShellEnvResponse::ShellEnvResponseErr {
+            success: false,
+            error,
+        }),
+    }
+}
+
+fn tidewave_cache_dir() -> String {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tidewave")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn html_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 async fn about_handler(
     Query(params): Query<AboutParams>,
     req: Request,
@@ -1334,11 +1398,7 @@ async fn about_handler(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     let (port, https_port) = (config.port, config.https_port);
 
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::env::temp_dir())
-        .join("tidewave")
-        .to_string_lossy()
-        .into_owned();
+    let cache_dir = tidewave_cache_dir();
 
     #[cfg(target_os = "windows")]
     {
@@ -1402,15 +1462,34 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-async fn root_handler(req: Request) -> Response<Body> {
-    let dev = req
-        .extensions()
-        .get::<ServerConfig>()
-        .map(|config| config.dev)
-        .unwrap_or(false);
+async fn root_handler(req: Request) -> Result<Response<Body>, StatusCode> {
+    let config = req.extensions().get::<ServerConfig>().ok_or_else(|| {
+        error!("ServerConfig not found in request extensions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let dev = config.dev;
 
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
+
+    let cli_info = CliInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        system: SystemInfo {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH.to_string(),
+            family: std::env::consts::FAMILY,
+            target: env!("TARGET"),
+            wsl: false,
+        },
+        cache_dir: tidewave_cache_dir(),
+        home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
+        http_port: config.port,
+        https_port: config.https_port,
+    };
+    let cli_info_json = serde_json::to_string(&cli_info).map_err(|e| {
+        error!("Failed to serialize CLI info: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1420,6 +1499,7 @@ async fn root_handler(req: Request) -> Response<Body> {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="tidewave:source" content="cli" />
     <meta name="tidewave:version" content="{}" />
+    <meta name="tidewave:cli:info" content="{}" />
     <script type="module" src="{}/tc/tc.js"></script>
     <script>
       if ('serviceWorker' in navigator) {{
@@ -1435,7 +1515,8 @@ async fn root_handler(req: Request) -> Response<Body> {
   </head>
   <body></body>
 </html>"#,
-        env!("CARGO_PKG_VERSION").to_string(),
+        env!("CARGO_PKG_VERSION"),
+        html_escape(&cli_info_json),
         client_url,
     );
 
@@ -1450,7 +1531,7 @@ async fn root_handler(req: Request) -> Response<Body> {
         );
     }
 
-    builder.body(Body::from(html)).unwrap()
+    Ok(builder.body(Body::from(html)).unwrap())
 }
 
 async fn manifest_json_handler() -> Response<Body> {

@@ -4,6 +4,7 @@ pub mod config;
 mod http_handlers;
 pub mod phoenix;
 pub mod server;
+mod shell_env;
 pub mod utils;
 pub mod ws;
 

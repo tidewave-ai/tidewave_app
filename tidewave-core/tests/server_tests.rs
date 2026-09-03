@@ -575,6 +575,53 @@ async fn test_about_includes_system_info() {
 }
 
 #[tokio::test]
+async fn test_root_includes_cli_info_meta() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://127.0.0.1:{}/", port))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = response.text().await.unwrap();
+
+    let prefix = r#"<meta name="tidewave:cli:info" content=""#;
+    let start = html.find(prefix).expect("cli info meta tag present") + prefix.len();
+    let end = start + html[start..].find('"').unwrap();
+    let content = &html[start..end];
+
+    // The content is HTML-escaped JSON
+    assert!(content.contains("&quot;"));
+    let json = content
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let info: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert!(info["version"].is_string());
+    assert!(info["cache_dir"].is_string());
+    assert!(info["home_dir"].is_string());
+    assert_eq!(info["http_port"], port);
+    assert!(info["https_port"].is_null());
+
+    let system = &info["system"];
+    assert!(system.is_object());
+    assert!(system["os"].is_string());
+    assert!(system["arch"].is_string());
+    assert!(system["family"].is_string());
+    assert!(system["target"].is_string());
+    assert_eq!(system["wsl"], false);
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
 async fn test_which_finds_common_command() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 
@@ -1999,5 +2046,40 @@ async fn test_download_with_extract_all_from_zip() {
     );
 
     file_shutdown_tx.send(()).ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_shell_env_endpoint() {
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+    let client = reqwest::Client::new();
+
+    let cwd = std::env::temp_dir();
+    let response = client
+        .post(format!("http://localhost:{}/shell-env", port))
+        .json(&serde_json::json!({ "path": cwd.to_str().unwrap() }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["env"]["PATH"].is_string());
+    assert!(body["env"]["HOME"].is_string());
+
+    let response = client
+        .post(format!("http://localhost:{}/shell-env", port))
+        .json(&serde_json::json!({ "path": "/definitely/not/a/dir" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].as_str().unwrap().contains("does not exist"));
+
     shutdown_tx.send(()).ok();
 }
