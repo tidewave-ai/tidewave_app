@@ -194,6 +194,8 @@ enum ReadFileResponse {
     ReadFileResponseErr {
         success: bool,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -839,6 +841,7 @@ async fn read_file_handler(
             return Ok(Json(ReadFileResponse::ReadFileResponseErr {
                 success: false,
                 error,
+                reason: None,
             }));
         }
     };
@@ -848,11 +851,15 @@ async fn read_file_handler(
     }
 
     let result = async {
-        let content = tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| e.kind().to_string())?;
-        let mtime = fetch_mtime(file_path)?;
-        Ok::<_, String>((content, mtime))
+        let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+            let reason = match e.kind() {
+                std::io::ErrorKind::NotFound => Some("not_found".to_string()),
+                _ => None,
+            };
+            (e.kind().to_string(), reason)
+        })?;
+        let mtime = fetch_mtime(file_path).map_err(|e| (e, None))?;
+        Ok::<_, (String, Option<String>)>((content, mtime))
     }
     .await;
 
@@ -862,9 +869,10 @@ async fn read_file_handler(
             content,
             mtime,
         })),
-        Err(error) => Ok(Json(ReadFileResponse::ReadFileResponseErr {
+        Err((error, reason)) => Ok(Json(ReadFileResponse::ReadFileResponseErr {
             success: false,
             error,
+            reason,
         })),
     }
 }
