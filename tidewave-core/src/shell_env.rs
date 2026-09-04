@@ -178,13 +178,32 @@ async fn run_in_pty(cmd: CommandBuilder, input: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to write to PTY: {}", e))?;
 
     // Drain the shell's output so a large interactive banner cannot fill the
-    // PTY buffer and block the shell before it dumps and exits. This is
+    // PTY buffer and block the shell before it dumps and exits, and answer the
+    // queries ConPTY sends on startup (see `conpty`). This is
     // best-effort cleanup, not the completion signal: it is detached and never
     // joined, and it ends once the process group is killed below closes the
     // slave. PTY reads are blocking, so it runs on a blocking thread.
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
-        while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        #[cfg(windows)]
+        let mut queries = conpty::QueryScanner::default();
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            #[cfg(windows)]
+            {
+                let replies = queries.replies(&buf[..n]);
+                if !replies.is_empty() {
+                    // Best effort: if this fails the shell is most likely gone
+                    // already, and draining is still worthwhile
+                    let _ = writer.write_all(&replies).and_then(|()| writer.flush());
+                }
+            }
+        }
+        // The writer lives here so the queries can be answered. It goes away
+        // together with the reader, once the PTY is closed.
+        drop(writer);
     });
 
     // Wait for the shell process itself to exit, rather than for PTY EOF: a
@@ -211,6 +230,74 @@ async fn run_in_pty(cmd: CommandBuilder, input: &str) -> Result<(), String> {
             "Shell did not exit within {} seconds",
             CAPTURE_TIMEOUT.as_secs()
         )),
+    }
+}
+
+/// The handshake ConPTY performs with the terminal on startup.
+///
+/// portable-pty creates its pseudoconsoles with `PSEUDOCONSOLE_INHERIT_CURSOR`,
+/// which makes conhost query the terminal as soon as the PTY opens and hold
+/// the child's console until it gets an answer: older builds send a cursor
+/// position query and wait for its report indefinitely, newer ones also send
+/// a primary device attributes query and wait up to a second for its response.
+/// Everywhere else in the app a terminal emulator is on the other end of the
+/// PTY and answers (xterm.js, for the app's own terminal), but here the only
+/// reader is the drain task, so it has to answer itself or the shell never
+/// starts up and every capture ends in `CAPTURE_TIMEOUT`. The answers are made
+/// up, but nothing here draws to the terminal, so nothing depends on them.
+///
+/// Unix PTYs never originate output, so on other platforms none of this is
+/// used.
+mod conpty {
+    #![cfg_attr(not(windows), allow(dead_code))]
+
+    /// The queries conhost sends, each with the reply we answer it with:
+    ///
+    ///   * Device Status Report asking for the cursor position, answered with
+    ///     a Cursor Position Report of row 1, column 1.
+    ///   * Primary Device Attributes, answered with the same plain VT100
+    ///     response xterm.js gives. conhost only records the reply; a
+    ///     conformance level this low advertises no extra features.
+    pub const QUERIES: [(&[u8], &[u8]); 2] =
+        [(b"\x1b[6n", b"\x1b[1;1R"), (b"\x1b[c", b"\x1b[?1;2c")];
+
+    /// Finds [`QUERIES`] across successive chunks of PTY output, keeping the
+    /// end of the previous chunk so a query split across two reads is still
+    /// found.
+    #[derive(Default)]
+    pub struct QueryScanner {
+        tail: Vec<u8>,
+    }
+
+    impl QueryScanner {
+        /// Returns the replies to the queries `chunk` completes, in order.
+        pub fn replies(&mut self, chunk: &[u8]) -> Vec<u8> {
+            let previous_len = self.tail.len();
+            self.tail.extend_from_slice(chunk);
+
+            let mut replies = Vec::new();
+            for start in 0..self.tail.len() {
+                for (query, reply) in QUERIES {
+                    // Only a query ending in this chunk is new; one ending in
+                    // the kept tail was already answered with the previous one
+                    if self.tail[start..].starts_with(query) && start + query.len() > previous_len {
+                        replies.extend_from_slice(reply);
+                    }
+                }
+            }
+
+            // Keep only what could still be the start of a query
+            let keep = QUERIES
+                .iter()
+                .map(|(query, _)| query.len())
+                .max()
+                .unwrap_or(1)
+                - 1;
+            let excess = self.tail.len().saturating_sub(keep);
+            self.tail.drain(..excess);
+
+            replies
+        }
     }
 }
 
@@ -263,5 +350,27 @@ mod tests {
         assert_eq!(env.get("EMPTY"), Some(&"".to_string()));
         assert_eq!(env.get("EQ"), Some(&"a=b".to_string()));
         assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn query_scanner_answers_queries_across_chunks() {
+        let mut scanner = conpty::QueryScanner::default();
+        assert_eq!(scanner.replies(b"no query here"), b"");
+        // The startup handshake: cursor position, then device attributes
+        assert_eq!(
+            scanner.replies(b"\x1b[6n\x1b[c\x1b[?1004h\x1b[?9001h"),
+            b"\x1b[1;1R\x1b[?1;2c"
+        );
+        // The queries just matched must not be answered again with the next
+        // chunk, even the short one that fits in the kept tail whole
+        assert_eq!(scanner.replies(b"more output"), b"");
+        assert_eq!(scanner.replies(b"banner\x1b[c"), b"\x1b[?1;2c");
+        assert_eq!(scanner.replies(b"prompt"), b"");
+
+        // A query split across two reads is still answered, once
+        let mut scanner = conpty::QueryScanner::default();
+        assert_eq!(scanner.replies(b"output\x1b["), b"");
+        assert_eq!(scanner.replies(b"6n"), b"\x1b[1;1R");
+        assert_eq!(scanner.replies(b"n"), b"");
     }
 }
