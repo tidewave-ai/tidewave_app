@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.0 (2026-07-07)
+
+* Add endpoint for local directories and cli info meta tag
+
 ## v0.4.6 (2026-08-13)
 
 * Fix session/close handling
