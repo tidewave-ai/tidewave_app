@@ -954,6 +954,116 @@ async fn test_write_file_exclusive_fails_if_exists() {
 }
 
 #[tokio::test]
+async fn test_write_file_expected_hash_succeeds_if_matching() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("write_hash_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("file.txt");
+    fs::write(&file_path, "original content").expect("Failed to write file");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/write", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new content",
+            // SHA-256 of "original content"
+            "expected_hash": "bf573149b23303cac63c2a359b53760d919770c5d070047e76de42e2184f1046"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    let content = fs::read_to_string(&file_path).expect("Failed to read file");
+    assert_eq!(content, "new content");
+
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_write_file_expected_hash_fails_if_not_matching() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("write_hash_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("file.txt");
+    fs::write(&file_path, "original content").expect("Failed to write file");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/write", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new content",
+            // SHA-256 of "other content"
+            "expected_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["reason"], "hash_mismatch");
+
+    // Verify the original content is unchanged
+    let content = fs::read_to_string(&file_path).expect("Failed to read file");
+    assert_eq!(content, "original content");
+
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn test_write_file_expected_hash_fails_if_not_exists() {
+    use std::fs;
+
+    let (port, shutdown_tx) = start_test_server(vec![]).await;
+
+    let temp_dir = std::env::temp_dir().join(format!("write_hash_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+    let file_path = temp_dir.join("file.txt");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://127.0.0.1:{}/write", port))
+        .json(&serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new content",
+            "expected_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["reason"], "hash_mismatch");
+    assert!(!file_path.exists());
+
+    fs::remove_dir_all(&temp_dir).ok();
+
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
 async fn test_read_file() {
     let (port, shutdown_tx) = start_test_server(vec![]).await;
 

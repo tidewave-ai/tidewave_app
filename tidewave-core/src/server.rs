@@ -16,6 +16,7 @@ use reqwest::{Client, Url};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
@@ -80,6 +81,9 @@ struct WriteFileParams {
     content: String,
     #[serde(default)]
     exclusive: bool,
+    /// SHA-256 (hex) that the file contents on disk must match
+    #[serde(default)]
+    expected_hash: Option<String>,
     #[serde(default)]
     wsl_distro: Option<String>,
 }
@@ -210,6 +214,8 @@ enum WriteFileResponse {
     WriteFileResponseErr {
         success: bool,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -877,6 +883,14 @@ async fn read_file_handler(
     }
 }
 
+enum WriteFileError {
+    /// The file already exists and the write is exclusive
+    Conflict,
+    /// The file contents do not match the expected hash
+    HashMismatch(String),
+    Other(String),
+}
+
 async fn write_file_handler(
     Json(payload): Json<WriteFileParams>,
 ) -> Result<Json<WriteFileResponse>, StatusCode> {
@@ -886,6 +900,7 @@ async fn write_file_handler(
             return Ok(Json(WriteFileResponse::WriteFileResponseErr {
                 success: false,
                 error,
+                reason: None,
             }));
         }
     };
@@ -896,16 +911,21 @@ async fn write_file_handler(
 
     let content = payload.content.clone();
     let exclusive = payload.exclusive;
+    let expected_hash = payload.expected_hash.clone();
     let bytes_written = content.len();
 
     let result = async {
         let path = Path::new(&file_path);
 
+        if let Some(expected_hash) = &expected_hash {
+            check_file_hash(path, expected_hash).await?;
+        }
+
         let parent_path = path.parent().unwrap_or(path);
         if !parent_path.exists() {
             tokio::fs::create_dir_all(parent_path)
                 .await
-                .map_err(|e| (false, e.kind().to_string()))?;
+                .map_err(|e| WriteFileError::Other(e.kind().to_string()))?;
         }
 
         if exclusive {
@@ -917,22 +937,23 @@ async fn write_file_handler(
                 .open(&path)
                 .await
                 .map_err(|e| {
-                    (
-                        e.kind() == std::io::ErrorKind::AlreadyExists,
-                        e.kind().to_string(),
-                    )
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        WriteFileError::Conflict
+                    } else {
+                        WriteFileError::Other(e.kind().to_string())
+                    }
                 })?;
             file.write_all(content.as_bytes())
                 .await
-                .map_err(|e| (false, e.kind().to_string()))?;
+                .map_err(|e| WriteFileError::Other(e.kind().to_string()))?;
         } else {
             tokio::fs::write(&path, content)
                 .await
-                .map_err(|e| (false, e.kind().to_string()))?;
+                .map_err(|e| WriteFileError::Other(e.kind().to_string()))?;
         }
 
-        let mtime = fetch_mtime(file_path).map_err(|e| (false, e))?;
-        Ok::<_, (bool, String)>(mtime)
+        let mtime = fetch_mtime(file_path).map_err(WriteFileError::Other)?;
+        Ok::<_, WriteFileError>(mtime)
     }
     .await;
 
@@ -942,11 +963,61 @@ async fn write_file_handler(
             bytes_written,
             mtime,
         })),
-        Err((true, _)) => Err(StatusCode::CONFLICT),
-        Err((false, error)) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
+        Err(WriteFileError::Conflict) => Err(StatusCode::CONFLICT),
+        Err(WriteFileError::HashMismatch(error)) => {
+            Ok(Json(WriteFileResponse::WriteFileResponseErr {
+                success: false,
+                error,
+                reason: Some("hash_mismatch".to_string()),
+            }))
+        }
+        Err(WriteFileError::Other(error)) => Ok(Json(WriteFileResponse::WriteFileResponseErr {
             success: false,
             error,
+            reason: None,
         })),
+    }
+}
+
+/// Fails unless the file contents hash to `expected_hash`.
+///
+/// A missing file counts as a mismatch, since the caller expects
+/// specific contents to be there.
+async fn check_file_hash(path: &Path, expected_hash: &str) -> Result<(), WriteFileError> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WriteFileError::HashMismatch(
+                "the file does not exist".to_string(),
+            ));
+        }
+        Err(e) => return Err(WriteFileError::Other(e.kind().to_string())),
+    };
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| WriteFileError::Other(e.kind().to_string()))?;
+
+        if count == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..count]);
+    }
+
+    let actual_hash = format!("{:x}", hasher.finalize());
+
+    if actual_hash.eq_ignore_ascii_case(expected_hash) {
+        Ok(())
+    } else {
+        Err(WriteFileError::HashMismatch(
+            "the file has been modified since it was last read".to_string(),
+        ))
     }
 }
 
