@@ -954,7 +954,7 @@ async fn test_write_file_exclusive_fails_if_exists() {
 }
 
 #[tokio::test]
-async fn test_write_file_expected_hash_succeeds_if_matching() {
+async fn test_write_file_expected_sha256_succeeds_if_matching() {
     use std::fs;
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
@@ -972,7 +972,7 @@ async fn test_write_file_expected_hash_succeeds_if_matching() {
             "path": file_path.to_str().unwrap(),
             "content": "new content",
             // SHA-256 of "original content"
-            "expected_hash": "bf573149b23303cac63c2a359b53760d919770c5d070047e76de42e2184f1046"
+            "expected_sha256": "bf573149b23303cac63c2a359b53760d919770c5d070047e76de42e2184f1046"
         }))
         .send()
         .await
@@ -991,7 +991,7 @@ async fn test_write_file_expected_hash_succeeds_if_matching() {
 }
 
 #[tokio::test]
-async fn test_write_file_expected_hash_fails_if_not_matching() {
+async fn test_write_file_expected_sha256_fails_if_not_matching() {
     use std::fs;
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
@@ -1009,7 +1009,7 @@ async fn test_write_file_expected_hash_fails_if_not_matching() {
             "path": file_path.to_str().unwrap(),
             "content": "new content",
             // SHA-256 of "other content"
-            "expected_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
         }))
         .send()
         .await
@@ -1030,7 +1030,7 @@ async fn test_write_file_expected_hash_fails_if_not_matching() {
 }
 
 #[tokio::test]
-async fn test_write_file_expected_hash_fails_if_not_exists() {
+async fn test_write_file_expected_sha256_fails_if_not_exists() {
     use std::fs;
 
     let (port, shutdown_tx) = start_test_server(vec![]).await;
@@ -1046,7 +1046,7 @@ async fn test_write_file_expected_hash_fails_if_not_exists() {
         .json(&serde_json::json!({
             "path": file_path.to_str().unwrap(),
             "content": "new content",
-            "expected_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
         }))
         .send()
         .await

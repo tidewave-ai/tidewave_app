@@ -83,7 +83,7 @@ struct WriteFileParams {
     exclusive: bool,
     /// SHA-256 (hex) that the file contents on disk must match
     #[serde(default)]
-    expected_hash: Option<String>,
+    expected_sha256: Option<String>,
     #[serde(default)]
     wsl_distro: Option<String>,
 }
@@ -911,14 +911,14 @@ async fn write_file_handler(
 
     let content = payload.content.clone();
     let exclusive = payload.exclusive;
-    let expected_hash = payload.expected_hash.clone();
+    let expected_sha256 = payload.expected_sha256.clone();
     let bytes_written = content.len();
 
     let result = async {
         let path = Path::new(&file_path);
 
-        if let Some(expected_hash) = &expected_hash {
-            check_file_hash(path, expected_hash).await?;
+        if let Some(expected_sha256) = &expected_sha256 {
+            check_file_hash(path, expected_sha256).await?;
         }
 
         let parent_path = path.parent().unwrap_or(path);
@@ -979,11 +979,11 @@ async fn write_file_handler(
     }
 }
 
-/// Fails unless the file contents hash to `expected_hash`.
+/// Fails unless the file contents hash to `expected_sha256`.
 ///
 /// A missing file counts as a mismatch, since the caller expects
 /// specific contents to be there.
-async fn check_file_hash(path: &Path, expected_hash: &str) -> Result<(), WriteFileError> {
+async fn check_file_hash(path: &Path, expected_sha256: &str) -> Result<(), WriteFileError> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1012,7 +1012,7 @@ async fn check_file_hash(path: &Path, expected_hash: &str) -> Result<(), WriteFi
 
     let actual_hash = format!("{:x}", hasher.finalize());
 
-    if actual_hash.eq_ignore_ascii_case(expected_hash) {
+    if actual_hash.eq_ignore_ascii_case(expected_sha256) {
         Ok(())
     } else {
         Err(WriteFileError::HashMismatch(
