@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.0 (2026-09-15)
+
+* Support content hash check on write endpoint
+
 ## v1.0.0 (2026-07-07)
 
 * Add endpoint for local directories and cli info meta tag
