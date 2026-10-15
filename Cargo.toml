@@ -10,5 +10,5 @@ members = [
 version = "1.1.0"
 
 [patch.crates-io]
-# TODO: upstream
+# TODO: https://github.com/tauri-apps/tao/pull/1369
 tao = { git = "https://github.com/wojtekmach/tao.git", branch = "wm-bundled-activation-policy" }
