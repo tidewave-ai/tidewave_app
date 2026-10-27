@@ -59,7 +59,10 @@ async fn capture_unix_env(cwd: &str) -> Result<HashMap<String, String>, String> 
     let dump_path = std::env::temp_dir().join(format!("tidewave-env-{}", uuid::Uuid::new_v4()));
     let dump_path_str = dump_path.to_string_lossy().into_owned();
 
+    // Clean the environment before spawning, so rc files and the hooks they
+    // run (direnv, mise) see the host environment rather than the AppImage's
     let mut cmd = CommandBuilder::new_default_prog();
+    crate::command::cleanup_appimage_pty_env(&mut cmd);
     cmd.cwd(cwd);
 
     let pty_result = run_in_pty(cmd, &dump_script(&dump_path_str)).await;

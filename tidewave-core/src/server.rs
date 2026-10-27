@@ -692,7 +692,9 @@ async fn shell_handler(
     Json(payload): Json<ShellParams>,
 ) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let cwd = payload.cwd.unwrap_or(".".to_string());
-    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    // Without an explicit env the command inherits the process environment,
+    // minus the AppImage variables command_with_limited_env removes
+    let env = payload.env.unwrap_or_default();
 
     let mut command =
         create_shell_command(&payload.command, env, &cwd, payload.wsl_distro.as_deref());
@@ -711,7 +713,9 @@ async fn cmd_handler(
     Json(payload): Json<CmdParams>,
 ) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let cwd = payload.cwd.unwrap_or(".".to_string());
-    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    // Without an explicit env the command inherits the process environment,
+    // minus the AppImage variables command_with_limited_env removes
+    let env = payload.env.unwrap_or_default();
     let args = payload.args.unwrap_or_default();
 
     let mut command = create_cmd_command(

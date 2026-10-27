@@ -99,6 +99,7 @@ fn build_shell_command(payload: &JoinPayload) -> CommandBuilder {
     }
 
     let mut cmd = CommandBuilder::new_default_prog();
+    crate::command::cleanup_appimage_pty_env(&mut cmd);
     cmd.cwd(&payload.cwd);
 
     for (k, v) in &payload.env {
