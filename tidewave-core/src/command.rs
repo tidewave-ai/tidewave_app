@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use tokio::process::{Child, Command};
 use tracing::debug;
@@ -70,64 +71,93 @@ pub(crate) fn command_with_limited_env(program: &str) -> Command {
 /// When running inside an AppImage, the runtime injects paths pointing into
 /// the mounted AppImage that break external programs. This strips all known
 /// problematic variables and filters the AppImage mount from PATH.
+pub fn cleanup_appimage_env(cmd: &mut std::process::Command) {
+    for (var, value) in appimage_env_fixups() {
+        match value {
+            Some(value) => cmd.env(var, value),
+            None => cmd.env_remove(var),
+        };
+    }
+}
+
+/// Same as [`cleanup_appimage_env`], for commands spawned in a PTY.
+pub(crate) fn cleanup_appimage_pty_env(cmd: &mut portable_pty::CommandBuilder) {
+    for (var, value) in appimage_env_fixups() {
+        match value {
+            Some(value) => cmd.env(var, value),
+            None => cmd.env_remove(var),
+        }
+    }
+}
+
+/// The environment changes that undo the AppImage runtime's injections: a
+/// variable mapped to `None` is removed, one mapped to a value is overridden.
+/// Empty when not running inside an AppImage.
 ///
 /// See https://github.com/VHSgunzo/sharun/blob/9ced775c762193ab525acfb9a9497b17945db8de/lib4bin#L67-L73
-pub fn cleanup_appimage_env(cmd: &mut std::process::Command) {
-    let is_appimage = std::env::var_os("APPIMAGE").is_some();
+fn appimage_env_fixups() -> Vec<(&'static str, Option<OsString>)> {
+    let mut fixups = Vec::new();
 
-    if is_appimage {
-        for var in [
-            "APPDIR",
-            "APPIMAGE",
-            "BABL_PATH",
-            "__EGL_VENDOR_LIBRARY_DIRS",
-            "GBM_BACKENDS_PATH",
-            "GCONV_PATH",
-            "GDK_PIXBUF_MODULEDIR",
-            "GDK_PIXBUF_MODULE_FILE",
-            "GEGL_PATH",
-            "GIO_MODULE_DIR",
-            "GI_TYPELIB_PATH",
-            "GSETTINGS_SCHEMA_DIR",
-            "GST_PLUGIN_PATH",
-            "GST_PLUGIN_SCANNER",
-            "GST_PLUGIN_SYSTEM_PATH",
-            "GST_PLUGIN_SYSTEM_PATH_1_0",
-            "GTK_DATA_PREFIX",
-            "GTK_EXE_PREFIX",
-            "GTK_IM_MODULE_FILE",
-            "GTK_PATH",
-            "LD_LIBRARY_PATH",
-            "LIBDECOR_PLUGIN_DIR",
-            "LIBGL_DRIVERS_PATH",
-            "LIBVA_DRIVERS_PATH",
-            "PERLLIB",
-            "PIPEWIRE_MODULE_DIR",
-            "PYTHONHOME",
-            "PYTHONPATH",
-            "QT_PLUGIN_PATH",
-            "SPA_PLUGIN_DIR",
-            "TCL_LIBRARY",
-            "TK_LIBRARY",
-            "XTABLES_LIBDIR",
-        ] {
-            cmd.env_remove(var);
-        }
+    if std::env::var_os("APPIMAGE").is_none() {
+        return fixups;
+    }
 
-        // Strip entries under the AppImage mount point from PATH and
-        // XDG_DATA_DIRS so bundled binaries (like xdg-open) and data files
-        // don't shadow the host system's versions.
-        if let Ok(cwd) = std::env::current_dir() {
-            for var in ["PATH", "XDG_DATA_DIRS"] {
-                if let Some(val) = std::env::var_os(var) {
-                    let filtered: Vec<_> = std::env::split_paths(&val)
-                        .filter(|p| !p.starts_with(&cwd))
-                        .collect();
-                    cmd.env(var, std::env::join_paths(filtered).unwrap_or_default());
-                }
+    for var in [
+        "APPDIR",
+        "APPIMAGE",
+        "BABL_PATH",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+        "GBM_BACKENDS_PATH",
+        "GCONV_PATH",
+        "GDK_PIXBUF_MODULEDIR",
+        "GDK_PIXBUF_MODULE_FILE",
+        "GEGL_PATH",
+        "GIO_MODULE_DIR",
+        "GI_TYPELIB_PATH",
+        "GSETTINGS_SCHEMA_DIR",
+        "GST_PLUGIN_PATH",
+        "GST_PLUGIN_SCANNER",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GTK_DATA_PREFIX",
+        "GTK_EXE_PREFIX",
+        "GTK_IM_MODULE_FILE",
+        "GTK_PATH",
+        "LD_LIBRARY_PATH",
+        "LIBDECOR_PLUGIN_DIR",
+        "LIBGL_DRIVERS_PATH",
+        "LIBVA_DRIVERS_PATH",
+        "PERLLIB",
+        "PIPEWIRE_MODULE_DIR",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "QT_PLUGIN_PATH",
+        "SPA_PLUGIN_DIR",
+        "TCL_LIBRARY",
+        "TK_LIBRARY",
+        "XTABLES_LIBDIR",
+    ] {
+        fixups.push((var, None));
+    }
+
+    // Strip entries under the AppImage mount point from PATH and
+    // XDG_DATA_DIRS so bundled binaries (like xdg-open) and data files
+    // don't shadow the host system's versions.
+    if let Ok(cwd) = std::env::current_dir() {
+        for var in ["PATH", "XDG_DATA_DIRS"] {
+            if let Some(val) = std::env::var_os(var) {
+                let filtered: Vec<_> = std::env::split_paths(&val)
+                    .filter(|p| !p.starts_with(&cwd))
+                    .collect();
+                fixups.push((
+                    var,
+                    Some(std::env::join_paths(filtered).unwrap_or_default()),
+                ));
             }
         }
     }
+
+    fixups
 }
 
 pub fn create_shell_command(
